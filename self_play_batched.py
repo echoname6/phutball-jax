@@ -189,41 +189,69 @@ def play_games_batched(
         # Clamp move_count to valid range for indexing
         safe_move_idx = jnp.minimum(move_count, max_moves - 1)
         
-        # Update each game's trajectory at its current move index
-        all_states = jax.vmap(lambda s, obs, idx, act: 
-            s.at[idx].set(jnp.where(act, obs, s[idx]))
-        )(all_states, current_obs, safe_move_idx, active)
+        # Update trajectories - iterate over batch dimension manually inside vmap
+        # For states: (batch, max_moves, channels, rows, cols)
+        def update_state(s, obs, idx, act):
+            # s: (max_moves, channels, rows, cols)
+            # obs: (channels, rows, cols)  
+            # idx: scalar
+            # act: scalar bool
+            return lax.cond(
+                act,
+                lambda: s.at[idx].set(obs),
+                lambda: s
+            )
         
-        all_policies = jax.vmap(lambda s, pol, idx, act:
-            s.at[idx].set(jnp.where(act, pol, s[idx]))
-        )(all_policies, policies, safe_move_idx, active)
+        all_states = jax.vmap(update_state)(all_states, current_obs, safe_move_idx, active)
         
-        all_players = jax.vmap(lambda s, pl, idx, act:
-            s.at[idx].set(jnp.where(act, pl, s[idx]))
-        )(all_players, current_players, safe_move_idx, active)
+        # For policies: (batch, max_moves, action_space)
+        def update_policy(s, pol, idx, act):
+            return lax.cond(act, lambda: s.at[idx].set(pol), lambda: s)
         
-        valid_mask = jax.vmap(lambda s, idx, act:
-            s.at[idx].set(act)
-        )(valid_mask, safe_move_idx, active)
+        all_policies = jax.vmap(update_policy)(all_policies, policies, safe_move_idx, active)
         
-        # Step environments (only active games take real steps)
+        # For players: (batch, max_moves)
+        def update_player(s, pl, idx, act):
+            return lax.cond(act, lambda: s.at[idx].set(pl), lambda: s)
+        
+        all_players = jax.vmap(update_player)(all_players, current_players, safe_move_idx, active)
+        
+        # For valid_mask: (batch, max_moves)
+        def update_valid(s, idx, act):
+            return lax.cond(act, lambda: s.at[idx].set(True), lambda: s)
+        
+        valid_mask = jax.vmap(update_valid)(valid_mask, safe_move_idx, active)
+        
+        # Step environments
         new_env_states = batched_step(env_states, actions)
         
         # For terminated games, keep old state
         def select_state(new, old):
-            # Handle different array dimensions
+            # Handle different array dimensions properly
             if new.ndim == 0:
+                # Scalar per game - but after vmap this is (batch,)
                 return jnp.where(effectively_done, old, new)
             elif new.ndim == 1:
+                # (batch,) array
                 return jnp.where(effectively_done, old, new)
             elif new.ndim == 2:
+                # (batch, x) array
                 return jnp.where(effectively_done[:, None], old, new)
             elif new.ndim == 3:
+                # (batch, x, y) array  
                 return jnp.where(effectively_done[:, None, None], old, new)
             else:
-                raise ValueError(f"Unexpected ndim: {new.ndim}")
+                return new  # shouldn't happen
         
         new_env_states = jax.tree.map(select_state, new_env_states, env_states)
+        
+        # Update termination status (from actual game end, not turn limit)
+        new_terminated = terminated | new_env_states.terminated
+        new_move_count = move_count + active.astype(jnp.int32)
+        
+        carry = (new_env_states, new_terminated, new_move_count, 
+                all_states, all_policies, all_players, valid_mask, rng)
+        return carry, None
         
         # Update termination status (from actual game end, not turn limit)
         new_terminated = terminated | new_env_states.terminated
