@@ -148,9 +148,10 @@ def play_games_batched(
     """
     action_space_size = 2 * env_config.rows * env_config.cols + 1
     num_channels = 6
+    rows, cols = env_config.rows, env_config.cols
     
     # Initialize storage for trajectories
-    all_states = jnp.zeros((batch_size, max_moves, num_channels, env_config.rows, env_config.cols))
+    all_states = jnp.zeros((batch_size, max_moves, num_channels, rows, cols))
     all_policies = jnp.zeros((batch_size, max_moves, action_space_size))
     all_players = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
     valid_mask = jnp.zeros((batch_size, max_moves), dtype=jnp.bool_)
@@ -160,98 +161,117 @@ def play_games_batched(
     terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
     move_count = jnp.zeros(batch_size, dtype=jnp.int32)
     
-    # Get batched functions
-    batched_step = make_batched_step(env_config)
-    batched_to_input = make_batched_network_input(env_config)
+    # Pre-create batched functions outside the loop
+    def single_step(state, action):
+        return step(state, action, env_config)
     
-    # Play loop - continue until all games hit max_turns or terminate
+    def single_to_input(state):
+        board = state.board.astype(jnp.float32)
+        jump_layers = jnp.zeros((5, rows, cols), dtype=jnp.float32)
+        return jnp.concatenate([board[None, :, :], jump_layers], axis=0)
+    
+    def single_legal(state):
+        return get_legal_actions(state, env_config)
+    
+    # Play loop
     def game_step(carry, _):
         env_states, terminated, move_count, all_states, all_policies, all_players, valid_mask, rng = carry
         
-        rng, step_rng = jax.random.split(rng)
+        rng, step_rng, sample_rng = jax.random.split(rng, 3)
         
         # Check if games have exceeded max_turns
         turns_exceeded = env_states.num_turns >= max_turns
         effectively_done = terminated | turns_exceeded
+        active = ~effectively_done
         
-        # Get current observations
-        current_obs = batched_to_input(env_states)
+        # Get current observations: (batch, 6, rows, cols)
+        current_obs = jax.vmap(single_to_input)(env_states)
         current_players = env_states.current_player
         
-        # Get actions from network
-        actions, policies, values = batched_network_policy(
-            params, env_states, step_rng, network, env_config, temperature
-        )
+        # Get network predictions
+        variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
+        policy_logits, values = network.apply(variables, current_obs, train=False)
         
-        # Only record and step for non-terminated games
-        active = ~effectively_done
+        # Get legal action mask
+        legal_mask = jax.vmap(single_legal)(env_states)
+        
+        # Mask illegal actions
+        masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+        
+        # Convert to probabilities
+        policies = jax.nn.softmax(masked_logits / temperature)
+        
+        # Sample actions
+        sample_rngs = jax.random.split(sample_rng, batch_size)
+        actions = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies)
         
         # Clamp move_count to valid range for indexing
         safe_move_idx = jnp.minimum(move_count, max_moves - 1)
         
-        # Update trajectories - iterate over batch dimension manually inside vmap
-        # For states: (batch, max_moves, channels, rows, cols)
-        def update_state(s, obs, idx, act):
-            # s: (max_moves, channels, rows, cols)
-            # obs: (channels, rows, cols)  
-            # idx: scalar
-            # act: scalar bool
-            return lax.cond(
-                act,
-                lambda: s.at[idx].set(obs),
-                lambda: s
-            )
+        # Update trajectories using scatter
+        batch_idx = jnp.arange(batch_size)
         
-        all_states = jax.vmap(update_state)(all_states, current_obs, safe_move_idx, active)
-        
-        # For policies: (batch, max_moves, action_space)
-        def update_policy(s, pol, idx, act):
-            return lax.cond(act, lambda: s.at[idx].set(pol), lambda: s)
-        
-        all_policies = jax.vmap(update_policy)(all_policies, policies, safe_move_idx, active)
-        
-        # For players: (batch, max_moves)
-        def update_player(s, pl, idx, act):
-            return lax.cond(act, lambda: s.at[idx].set(pl), lambda: s)
-        
-        all_players = jax.vmap(update_player)(all_players, current_players, safe_move_idx, active)
-        
-        # For valid_mask: (batch, max_moves)
-        def update_valid(s, idx, act):
-            return lax.cond(act, lambda: s.at[idx].set(True), lambda: s)
-        
-        valid_mask = jax.vmap(update_valid)(valid_mask, safe_move_idx, active)
+        # Only update where active
+        all_states = all_states.at[batch_idx, safe_move_idx].set(
+            jnp.where(active[:, None, None, None], current_obs, all_states[batch_idx, safe_move_idx])
+        )
+        all_policies = all_policies.at[batch_idx, safe_move_idx].set(
+            jnp.where(active[:, None], policies, all_policies[batch_idx, safe_move_idx])
+        )
+        all_players = all_players.at[batch_idx, safe_move_idx].set(
+            jnp.where(active, current_players, all_players[batch_idx, safe_move_idx])
+        )
+        valid_mask = valid_mask.at[batch_idx, safe_move_idx].set(active)
         
         # Step environments
-        new_env_states = batched_step(env_states, actions)
+        new_env_states = jax.vmap(single_step)(env_states, actions)
         
-        # For terminated games, keep old state
-        def select_state(new, old):
-            # Handle different array dimensions properly
-            if new.ndim == 0:
-                # Scalar per game - but after vmap this is (batch,)
-                return jnp.where(effectively_done, old, new)
-            elif new.ndim == 1:
-                # (batch,) array
-                return jnp.where(effectively_done, old, new)
-            elif new.ndim == 2:
-                # (batch, x) array
-                return jnp.where(effectively_done[:, None], old, new)
-            elif new.ndim == 3:
-                # (batch, x, y) array  
-                return jnp.where(effectively_done[:, None, None], old, new)
-            else:
-                return new  # shouldn't happen
+        # For terminated games, keep old state using proper broadcasting
+        new_board = jnp.where(effectively_done[:, None, None], env_states.board, new_env_states.board)
+        new_ball_pos = jnp.where(effectively_done[:, None], env_states.ball_pos, new_env_states.ball_pos)
+        new_current_player = jnp.where(effectively_done, env_states.current_player, new_env_states.current_player)
+        new_is_jumping = jnp.where(effectively_done, env_states.is_jumping, new_env_states.is_jumping)
+        new_terminated_flag = jnp.where(effectively_done, env_states.terminated, new_env_states.terminated)
+        new_winner = jnp.where(effectively_done, env_states.winner, new_env_states.winner)
+        new_num_turns = jnp.where(effectively_done, env_states.num_turns, new_env_states.num_turns)
         
-        new_env_states = jax.tree.map(select_state, new_env_states, env_states)
+        new_env_states = PhutballState(
+            board=new_board,
+            ball_pos=new_ball_pos,
+            current_player=new_current_player,
+            is_jumping=new_is_jumping,
+            terminated=new_terminated_flag,
+            winner=new_winner,
+            num_turns=new_num_turns,
+        )
         
-        # Update termination status (from actual game end, not turn limit)
+        # Update termination status
         new_terminated = terminated | new_env_states.terminated
         new_move_count = move_count + active.astype(jnp.int32)
         
         carry = (new_env_states, new_terminated, new_move_count, 
                 all_states, all_policies, all_players, valid_mask, rng)
         return carry, None
+    
+    # Run the game loop
+    initial_carry = (env_states, terminated, move_count, 
+                    all_states, all_policies, all_players, valid_mask, rng)
+    
+    final_carry, _ = lax.scan(game_step, initial_carry, None, length=max_moves)
+    
+    (final_env_states, _, _, 
+     all_states, all_policies, all_players, valid_mask, _) = final_carry
+    
+    # Get winners
+    winners = final_env_states.winner
+    
+    return TrajectoryData(
+        states=all_states,
+        policies=all_policies,
+        players=all_players,
+        valid_mask=valid_mask,
+        winners=winners,
+    )
         
         # Update termination status (from actual game end, not turn limit)
         new_terminated = terminated | new_env_states.terminated
