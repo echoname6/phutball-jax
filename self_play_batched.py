@@ -126,7 +126,8 @@ def play_games_batched(
     network: PhutballNetwork,
     env_config: EnvConfig,
     batch_size: int = 64,
-    max_moves: int = 500,
+    max_turns: int = 7200,
+    max_moves: int = 50000,  # Safety cap on total moves (for memory)
     temperature: float = 1.0,
 ) -> TrajectoryData:
     """
@@ -138,7 +139,8 @@ def play_games_batched(
         network: Neural network
         env_config: Environment config
         batch_size: Number of games to play in parallel
-        max_moves: Maximum moves per game
+        max_turns: Maximum turns per game (placement or halt = 1 turn)
+        max_moves: Maximum moves to store (memory cap)
         temperature: Sampling temperature
         
     Returns:
@@ -162,11 +164,15 @@ def play_games_batched(
     batched_step = make_batched_step(env_config)
     batched_to_input = make_batched_network_input(env_config)
     
-    # Play loop
+    # Play loop - continue until all games hit max_turns or terminate
     def game_step(carry, _):
         env_states, terminated, move_count, all_states, all_policies, all_players, valid_mask, rng = carry
         
         rng, step_rng = jax.random.split(rng)
+        
+        # Check if games have exceeded max_turns
+        turns_exceeded = env_states.num_turns >= max_turns
+        effectively_done = terminated | turns_exceeded
         
         # Get current observations
         current_obs = batched_to_input(env_states)
@@ -177,44 +183,39 @@ def play_games_batched(
             params, env_states, step_rng, network, env_config, temperature
         )
         
-        # Store data (only for non-terminated games)
-        active = ~terminated
+        # Only record and step for non-terminated games
+        active = ~effectively_done
         
-        # Update storage using dynamic indexing
-        def update_at_move(storage, new_data, move_idx, active_mask):
-            # For each batch element, update at its move_idx if active
-            batch_indices = jnp.arange(batch_size)
-            return storage.at[batch_indices, move_idx].set(
-                jnp.where(active_mask[:, None] if new_data.ndim > 1 else active_mask, 
-                         new_data, 
-                         storage[batch_indices, move_idx])
-            )
-        
-        # Simpler approach: use a fixed move index for all
-        # This wastes some space but is simpler
-        move_idx = move_count  # (batch,) array
+        # Clamp move_count to valid range for indexing
+        safe_move_idx = jnp.minimum(move_count, max_moves - 1)
         
         # Update each game's trajectory at its current move index
         all_states = jax.vmap(lambda s, obs, idx, act: 
             s.at[idx].set(jnp.where(act, obs, s[idx]))
-        )(all_states, current_obs, move_idx, active)
+        )(all_states, current_obs, safe_move_idx, active)
         
         all_policies = jax.vmap(lambda s, pol, idx, act:
             s.at[idx].set(jnp.where(act, pol, s[idx]))
-        )(all_policies, policies, move_idx, active)
+        )(all_policies, policies, safe_move_idx, active)
         
         all_players = jax.vmap(lambda s, pl, idx, act:
             s.at[idx].set(jnp.where(act, pl, s[idx]))
-        )(all_players, current_players, move_idx, active)
+        )(all_players, current_players, safe_move_idx, active)
         
         valid_mask = jax.vmap(lambda s, idx, act:
             s.at[idx].set(act)
-        )(valid_mask, move_idx, active)
+        )(valid_mask, safe_move_idx, active)
         
-        # Step environments
+        # Step environments (only active games take real steps)
         new_env_states = batched_step(env_states, actions)
         
-        # Update termination status
+        # For terminated games, keep old state
+        new_env_states = jax.tree.map(
+            lambda new, old: jnp.where(effectively_done[:, None] if new.ndim > 1 else effectively_done, old, new),
+            new_env_states, env_states
+        )
+        
+        # Update termination status (from actual game end, not turn limit)
         new_terminated = terminated | new_env_states.terminated
         new_move_count = move_count + active.astype(jnp.int32)
         
@@ -222,7 +223,8 @@ def play_games_batched(
                 all_states, all_policies, all_players, valid_mask, rng)
         return carry, None
     
-    # Run the game loop
+    # Run the game loop for max_moves iterations
+    # Games will stop contributing when they hit max_turns
     initial_carry = (env_states, terminated, move_count, 
                     all_states, all_policies, all_players, valid_mask, rng)
     
@@ -231,7 +233,7 @@ def play_games_batched(
     (final_env_states, _, _, 
      all_states, all_policies, all_players, valid_mask, _) = final_carry
     
-    # Get winners
+    # Get winners (0 if hit turn limit without winner)
     winners = final_env_states.winner
     
     return TrajectoryData(
@@ -410,7 +412,8 @@ def test_batched_games():
         network=network,
         env_config=env_config,
         batch_size=16,
-        max_moves=50,
+        max_turns=30,     # 30 turns per game
+        max_moves=200,    # Memory cap
         temperature=1.0,
     )
     
@@ -468,13 +471,14 @@ def benchmark_batched_games():
     
     # Warmup
     rng, game_rng = jax.random.split(rng)
-    _ = play_games_batched(params, game_rng, network, env_config, batch_size=8, max_moves=10)
+    _ = play_games_batched(params, game_rng, network, env_config, batch_size=8, max_turns=5, max_moves=20)
     
     # Benchmark
     import time
     
     batch_sizes = [16, 64, 256]
-    max_moves = 100
+    max_turns = 50
+    max_moves = 300  # Rough estimate of moves for 50 turns
     
     print("\nBenchmark: Batched Self-Play")
     print("-" * 40)
@@ -485,7 +489,7 @@ def benchmark_batched_games():
         start = time.time()
         trajectory = play_games_batched(
             params, game_rng, network, env_config,
-            batch_size=batch_size, max_moves=max_moves
+            batch_size=batch_size, max_turns=max_turns, max_moves=max_moves
         )
         # Force computation
         _ = trajectory.winners.block_until_ready()

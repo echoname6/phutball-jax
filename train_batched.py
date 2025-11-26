@@ -37,7 +37,8 @@ class TrainConfig:
     
     # Self-play (batched)
     batch_size_games: int = 64       # Games played in parallel
-    max_moves_per_game: int = 300    # Max moves before game ends
+    max_turns_per_game: int = 7200   # Max turns before game ends (safety cap)
+    max_moves_per_game: int = 50000  # Memory cap on moves stored
     temperature: float = 1.0          # Sampling temperature
     
     # Training
@@ -140,6 +141,7 @@ class AlphaZeroTrainer:
                 network=self.network,
                 env_config=self.env_config,
                 batch_size=self.config.batch_size_games,
+                max_turns=self.config.max_turns_per_game,
                 max_moves=self.config.max_moves_per_game,
                 temperature=self.config.temperature,
             )
@@ -361,7 +363,8 @@ def test_training_loop():
         num_res_blocks=2,
         # Batched self-play
         batch_size_games=8,
-        max_moves_per_game=50,
+        max_turns_per_game=30,   # 30 turns max
+        max_moves_per_game=200,  # Memory cap
         games_per_iteration=16,  # 2 batches of 8
         # Minimal training
         train_steps_per_iteration=5,
