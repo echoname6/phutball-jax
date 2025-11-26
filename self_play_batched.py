@@ -210,10 +210,20 @@ def play_games_batched(
         new_env_states = batched_step(env_states, actions)
         
         # For terminated games, keep old state
-        new_env_states = jax.tree.map(
-            lambda new, old: jnp.where(effectively_done[:, None] if new.ndim > 1 else effectively_done, old, new),
-            new_env_states, env_states
-        )
+        def select_state(new, old):
+            # Handle different array dimensions
+            if new.ndim == 0:
+                return jnp.where(effectively_done, old, new)
+            elif new.ndim == 1:
+                return jnp.where(effectively_done, old, new)
+            elif new.ndim == 2:
+                return jnp.where(effectively_done[:, None], old, new)
+            elif new.ndim == 3:
+                return jnp.where(effectively_done[:, None, None], old, new)
+            else:
+                raise ValueError(f"Unexpected ndim: {new.ndim}")
+        
+        new_env_states = jax.tree.map(select_state, new_env_states, env_states)
         
         # Update termination status (from actual game end, not turn limit)
         new_terminated = terminated | new_env_states.terminated
