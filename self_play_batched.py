@@ -272,35 +272,6 @@ def play_games_batched(
         valid_mask=valid_mask,
         winners=winners,
     )
-        
-        # Update termination status (from actual game end, not turn limit)
-        new_terminated = terminated | new_env_states.terminated
-        new_move_count = move_count + active.astype(jnp.int32)
-        
-        carry = (new_env_states, new_terminated, new_move_count, 
-                all_states, all_policies, all_players, valid_mask, rng)
-        return carry, None
-    
-    # Run the game loop for max_moves iterations
-    # Games will stop contributing when they hit max_turns
-    initial_carry = (env_states, terminated, move_count, 
-                    all_states, all_policies, all_players, valid_mask, rng)
-    
-    final_carry, _ = lax.scan(game_step, initial_carry, None, length=max_moves)
-    
-    (final_env_states, _, _, 
-     all_states, all_policies, all_players, valid_mask, _) = final_carry
-    
-    # Get winners (0 if hit turn limit without winner)
-    winners = final_env_states.winner
-    
-    return TrajectoryData(
-        states=all_states,
-        policies=all_policies,
-        players=all_players,
-        valid_mask=valid_mask,
-        winners=winners,
-    )
 
 
 def trajectory_to_training_examples(
