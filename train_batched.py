@@ -37,8 +37,8 @@ class TrainConfig:
     
     # Self-play (batched)
     batch_size_games: int = 64       # Games played in parallel
-    max_turns_per_game: int = 7200   # Max turns before game ends (safety cap)
-    max_moves_per_game: int = 50000  # Memory cap on moves stored
+    max_turns_per_game: int = 2048   # Max turns before game ends (safety cap)
+    max_moves_per_game: int = 4096 # Memory cap on moves stored
     temperature: float = 1.0          # Sampling temperature
     num_simulations: int = 50         # MCTS simulations per move (0 = raw network)
     
