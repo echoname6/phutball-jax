@@ -439,7 +439,7 @@ def play_games_batched(
     # This makes runtime scale with actual game length instead of the cap.
 
     def cond_fn(carry):
-        (env_states, terminated, move_count, all_states, all_policies, all_players, all_actions, valid_mask, rng) = carry
+        (env_states, terminated, move_count, all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
 
         # Same notion of "done" as inside game_step
         turns_exceeded = env_states.num_turns >= max_turns
