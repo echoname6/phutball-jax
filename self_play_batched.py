@@ -455,13 +455,13 @@ def play_games_batched(
          all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
 
         inner_carry = (env_states, terminated, move_count,
-                       all_states, all_policies, all_players, valid_mask, rng)
+                       all_states, all_policies, all_players, all_actions, valid_mask, rng)
 
         # Re-use the existing game_step logic
         inner_carry, _ = game_step(inner_carry, None)
 
         (env_states, terminated, move_count,
-         all_states, all_policies, all_players, valid_mask, rng) = inner_carry
+         all_states, all_policies, all_players, all_actions, valid_mask, rng) = inner_carry
 
         return (env_states, terminated, move_count,
                 all_states, all_policies, all_players, all_actions, valid_mask, rng,
