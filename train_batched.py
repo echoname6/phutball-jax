@@ -40,6 +40,7 @@ class TrainConfig:
     max_turns_per_game: int = 7200   # Max turns before game ends (safety cap)
     max_moves_per_game: int = 50000  # Memory cap on moves stored
     temperature: float = 1.0          # Sampling temperature
+    num_simulations: int = 50         # MCTS simulations per move (0 = raw network)
     
     # Training
     batch_size_train: int = 256
@@ -144,6 +145,7 @@ class AlphaZeroTrainer:
                 max_turns=self.config.max_turns_per_game,
                 max_moves=self.config.max_moves_per_game,
                 temperature=self.config.temperature,
+                num_simulations=self.config.num_simulations,
             )
             
             # Convert to training examples
