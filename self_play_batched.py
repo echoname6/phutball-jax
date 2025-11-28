@@ -69,6 +69,166 @@ def make_batched_network_input(env_config: EnvConfig):
     return batched_to_input
 
 
+import mctx
+
+
+def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
+    """Create recurrent function for mctx that uses real env dynamics."""
+    
+    rows, cols = env_config.rows, env_config.cols
+    action_space_size = 2 * rows * cols + 1
+    
+    def recurrent_fn(params, rng, action, embedding):
+        """
+        Args:
+            params: Network params dict
+            rng: Random key (unused - env is deterministic)
+            action: Actions to take, shape (batch_size,)
+            embedding: Current PhutballState (batched)
+        
+        Returns:
+            RecurrentFnOutput, new_embedding
+        """
+        # Step the environment
+        def single_step(state, act):
+            return step(state, act, env_config)
+        
+        next_states = jax.vmap(single_step)(embedding, action)
+        
+        # Convert to network input
+        def single_to_input(state):
+            board = state.board.astype(jnp.float32)
+            jump_layers = jnp.zeros((5, rows, cols), dtype=jnp.float32)
+            return jnp.concatenate([board[None, :, :], jump_layers], axis=0)
+        
+        network_inputs = jax.vmap(single_to_input)(next_states)
+        
+        # Get network predictions
+        variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
+        policy_logits, values = network.apply(variables, network_inputs, train=False)
+        
+        # Get legal action mask
+        def single_legal(state):
+            return get_legal_actions(state, env_config)
+        
+        legal_mask = jax.vmap(single_legal)(next_states)
+        
+        # Mask illegal actions
+        masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+        
+        # Check for terminal states
+        terminated = next_states.terminated
+        
+        # Discount: 1 for ongoing, 0 for terminal
+        discount = jnp.where(terminated, 0.0, 1.0)
+        
+        # For terminal states, set value based on winner
+        # Winner from perspective of player who just moved
+        # This is tricky - winner=1 means P1 won, winner=2 means P2 won
+        # The "current_player" after the move is the OTHER player
+        # So if winner == current_player, the player who just moved LOST
+        terminal_value = jnp.where(
+            next_states.winner == next_states.current_player,
+            -1.0,  # Current player won = previous player (who moved) lost
+            jnp.where(next_states.winner == 0, 0.0, 1.0)  # Draw or previous player won
+        )
+        values = jnp.where(terminated, terminal_value, values)
+        
+        recurrent_output = mctx.RecurrentFnOutput(
+            reward=jnp.zeros_like(values),  # AlphaZero doesn't use intermediate rewards
+            discount=discount,
+            prior_logits=masked_logits,
+            value=values,
+        )
+        
+        return recurrent_output, next_states
+    
+    return recurrent_fn
+
+
+def batched_mcts_policy(
+    params: dict,
+    states: PhutballState,
+    rng: jnp.ndarray,
+    network: PhutballNetwork,
+    env_config: EnvConfig,
+    num_simulations: int = 50,
+    temperature: float = 1.0,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Get MCTS-improved policy for a batch of states.
+    
+    Returns:
+        actions: (batch,) selected actions
+        policies: (batch, action_space) MCTS visit count policies
+        values: (batch,) root value estimates
+    """
+    rows, cols = env_config.rows, env_config.cols
+    action_space_size = 2 * rows * cols + 1
+    batch_size = states.board.shape[0]
+    
+    # Convert states to network input for root evaluation
+    def single_to_input(state):
+        board = state.board.astype(jnp.float32)
+        jump_layers = jnp.zeros((5, rows, cols), dtype=jnp.float32)
+        return jnp.concatenate([board[None, :, :], jump_layers], axis=0)
+    
+    network_inputs = jax.vmap(single_to_input)(states)
+    
+    # Get root network predictions
+    variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
+    policy_logits, values = network.apply(variables, network_inputs, train=False)
+    
+    # Get legal action mask
+    def single_legal(state):
+        return get_legal_actions(state, env_config)
+    
+    legal_mask = jax.vmap(single_legal)(states)
+    masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+    
+    # Create root for MCTS
+    root = mctx.RootFnOutput(
+        prior_logits=masked_logits,
+        value=values,
+        embedding=states,
+    )
+    
+    # Create recurrent function
+    recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+    
+    # Run MCTS
+    rng, mcts_rng = jax.random.split(rng)
+    policy_output = mctx.gumbel_muzero_policy(
+        params=params,
+        rng_key=mcts_rng,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        max_num_considered_actions=32,
+        gumbel_scale=1.0,
+    )
+    
+    # Get MCTS policy (visit counts normalized)
+    mcts_policy = policy_output.action_weights
+    
+    # Get root value from search
+    root_values = policy_output.search_tree.node_values[:, 0]
+    
+    # Sample action based on temperature
+    rng, sample_rng = jax.random.split(rng)
+    
+    if temperature < 0.01:
+        # Greedy
+        actions = jnp.argmax(mcts_policy, axis=-1)
+    else:
+        # Sample with temperature
+        logits = jnp.log(mcts_policy + 1e-8) / temperature
+        sample_rngs = jax.random.split(sample_rng, batch_size)
+        actions = jax.vmap(lambda r, l: jax.random.categorical(r, l))(sample_rngs, logits)
+    
+    return actions, mcts_policy, root_values
+
+
 @partial(jax.jit, static_argnums=(3, 4, 5))
 def batched_network_policy(
     params: dict,
@@ -129,6 +289,7 @@ def play_games_batched(
     max_turns: int = 7200,
     max_moves: int = 50000,  # Safety cap on total moves (for memory)
     temperature: float = 1.0,
+    num_simulations: int = 0,  # 0 = no MCTS, >0 = use MCTS with this many sims
 ) -> TrajectoryData:
     """
     Play multiple games in parallel.
@@ -142,6 +303,7 @@ def play_games_batched(
         max_turns: Maximum turns per game (placement or halt = 1 turn)
         max_moves: Maximum moves to store (memory cap)
         temperature: Sampling temperature
+        num_simulations: MCTS simulations per move (0 = raw network policy)
         
     Returns:
         TrajectoryData with all game trajectories
@@ -149,6 +311,7 @@ def play_games_batched(
     action_space_size = 2 * env_config.rows * env_config.cols + 1
     num_channels = 6
     rows, cols = env_config.rows, env_config.cols
+    use_mcts = num_simulations > 0
     
     # Initialize storage for trajectories
     all_states = jnp.zeros((batch_size, max_moves, num_channels, rows, cols))
@@ -188,22 +351,30 @@ def play_games_batched(
         current_obs = jax.vmap(single_to_input)(env_states)
         current_players = env_states.current_player
         
-        # Get network predictions
-        variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
-        policy_logits, values = network.apply(variables, current_obs, train=False)
-        
-        # Get legal action mask
-        legal_mask = jax.vmap(single_legal)(env_states)
-        
-        # Mask illegal actions
-        masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
-        
-        # Convert to probabilities
-        policies = jax.nn.softmax(masked_logits / temperature)
-        
-        # Sample actions
-        sample_rngs = jax.random.split(sample_rng, batch_size)
-        actions = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies)
+        if use_mcts:
+            # Use MCTS to get improved policy
+            actions, policies, values = batched_mcts_policy(
+                params, env_states, step_rng, network, env_config,
+                num_simulations=num_simulations, temperature=temperature
+            )
+        else:
+            # Use raw network policy
+            # Get network predictions
+            variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
+            policy_logits, values = network.apply(variables, current_obs, train=False)
+            
+            # Get legal action mask
+            legal_mask = jax.vmap(single_legal)(env_states)
+            
+            # Mask illegal actions
+            masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+            
+            # Convert to probabilities
+            policies = jax.nn.softmax(masked_logits / temperature)
+            
+            # Sample actions
+            sample_rngs = jax.random.split(sample_rng, batch_size)
+            actions = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies)
         
         # Clamp move_count to valid range for indexing
         safe_move_idx = jnp.minimum(move_count, max_moves - 1)
