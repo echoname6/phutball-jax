@@ -253,18 +253,57 @@ def play_games_batched(
                 all_states, all_policies, all_players, valid_mask, rng)
         return carry, None
     
-    # Run the game loop
-    initial_carry = (env_states, terminated, move_count, 
-                    all_states, all_policies, all_players, valid_mask, rng)
-    
-    final_carry, _ = lax.scan(game_step, initial_carry, None, length=max_moves)
-    
-    (final_env_states, _, _, 
-     all_states, all_policies, all_players, valid_mask, _) = final_carry
-    
-    # Get winners
+    # Run the game loop with early stopping.
+    #
+    # We keep the big max_moves / max_turns caps for safety, but we do NOT
+    # always run max_moves steps. Instead we stop once:
+    #   - all games are effectively done (terminated or turns_exceeded), OR
+    #   - we hit max_moves.
+    #
+    # This makes runtime scale with actual game length instead of the cap.
+
+    def cond_fn(carry):
+        (env_states, terminated, move_count,
+         all_states, all_policies, all_players, valid_mask, rng, step_idx) = carry
+
+        # Same notion of "done" as inside game_step
+        turns_exceeded = env_states.num_turns >= max_turns
+        effectively_done = terminated | turns_exceeded
+        any_active = jnp.any(~effectively_done)
+
+        # Continue while we still have active games and haven't hit max_moves
+        return (step_idx < max_moves) & any_active
+
+    def body_fn(carry):
+        (env_states, terminated, move_count,
+         all_states, all_policies, all_players, valid_mask, rng, step_idx) = carry
+
+        inner_carry = (env_states, terminated, move_count,
+                       all_states, all_policies, all_players, valid_mask, rng)
+
+        # Re-use the existing game_step logic
+        inner_carry, _ = game_step(inner_carry, None)
+
+        (env_states, terminated, move_count,
+         all_states, all_policies, all_players, valid_mask, rng) = inner_carry
+
+        return (env_states, terminated, move_count,
+                all_states, all_policies, all_players, valid_mask, rng,
+                step_idx + jnp.int32(1))
+
+    # Add a step index to the carry (starts at 0)
+    step0 = jnp.int32(0)
+    initial_carry = (env_states, terminated, move_count,
+                     all_states, all_policies, all_players, valid_mask, rng, step0)
+
+    final_carry = lax.while_loop(cond_fn, body_fn, initial_carry)
+
+    (final_env_states, _, _,
+     all_states, all_policies, all_players, valid_mask, _, _) = final_carry
+
+    # Get winners from the final env states
     winners = final_env_states.winner
-    
+
     return TrajectoryData(
         states=all_states,
         policies=all_policies,
