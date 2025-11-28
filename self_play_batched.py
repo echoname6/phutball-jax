@@ -340,7 +340,7 @@ def play_games_batched(
     
     # Play loop
     def game_step(carry, _):
-        env_states, terminated, move_count, all_states, all_policies, all_players, valid_mask, rng = carry
+        env_states, terminated, move_count, all_states, all_policies, all_players, all_actions, valid_mask, rng = carry
         
         rng, step_rng, sample_rng = jax.random.split(rng, 3)
         
@@ -440,7 +440,7 @@ def play_games_batched(
 
     def cond_fn(carry):
         (env_states, terminated, move_count,
-         all_states, all_policies, all_players, valid_mask, rng, step_idx) = carry
+         all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
 
         # Same notion of "done" as inside game_step
         turns_exceeded = env_states.num_turns >= max_turns
@@ -452,7 +452,7 @@ def play_games_batched(
 
     def body_fn(carry):
         (env_states, terminated, move_count,
-         all_states, all_policies, all_players, valid_mask, rng, step_idx) = carry
+         all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
 
         inner_carry = (env_states, terminated, move_count,
                        all_states, all_policies, all_players, valid_mask, rng)
@@ -464,7 +464,7 @@ def play_games_batched(
          all_states, all_policies, all_players, valid_mask, rng) = inner_carry
 
         return (env_states, terminated, move_count,
-                all_states, all_policies, all_players, valid_mask, rng,
+                all_states, all_policies, all_players, all_actions, valid_mask, rng,
                 step_idx + jnp.int32(1))
 
     initial_carry = (env_states, terminated, move_count,
