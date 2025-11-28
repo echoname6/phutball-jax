@@ -63,6 +63,13 @@ class TrainConfig:
     # Logging
     log_every: int = 1
 
+    eval_enable: bool = False
+    eval_max_prev_checkpoints: int = 5
+    eval_games_per_color: int = 5      # 5 as P1 + 5 as P2 per opponent
+    eval_num_simulations: int = 128    # MCTS sims per move during eval
+    eval_max_moves: int = 2048         # cutoff to avoid marathon eval games
+    eval_temperature: float = 0.0 
+
 
 class AlphaZeroTrainer:
     """Main training class with batched self-play."""
@@ -290,17 +297,165 @@ class AlphaZeroTrainer:
             # Checkpoint
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
-            
-            iter_time = time.time() - iter_start
-            print(f"  Iteration time: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)} examples")
-            print()
+
+                if self.config.eval_enable:
+                    self.evaluate_current_checkpoint_vs_recent()
+                    
+                    iter_time = time.time() - iter_start
+                    print(f"  Iteration time: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)} examples")
+                    print()
         
         # Final checkpoint
         self.save_checkpoint()
         print("Training complete!")
         print(f"Total games: {self.total_games}")
-        print(f"Total examples: {self.total_examples}")
+        print(f"Total examples: {self.total_examples}") 
 
+    def _eval_play_one_game(self, params_p1, params_p2, mcts_config, max_moves, temperature, seed: int) -> float:
+        """
+        Single evaluation game between params_p1 (player 1) and params_p2 (player 2).
+
+        Returns:
+            +1.0 if player 1 wins
+            -1.0 if player 1 loses
+             0.0 on draw / max-move cutoff
+        """
+        from mcts import select_action
+
+        rng = jax.random.PRNGKey(seed)
+        state = reset(self.env_config)
+        move = 0
+
+        while (not bool(state.terminated)) and (move < max_moves):
+            current_player = int(state.current_player)
+            agent_params = params_p1 if current_player == 1 else params_p2
+
+            rng, mcts_rng = jax.random.split(rng)
+            action, _, _ = select_action(
+                agent_params,
+                mcts_rng,
+                state,
+                self.network,
+                self.env_config,
+                mcts_config,
+                temperature=temperature,
+            )
+            state = step(state, jnp.array(action, dtype=jnp.int32), self.env_config)
+            move += 1
+
+        winner = int(state.winner)
+        if winner == 0 or move >= max_moves:
+            return 0.0
+        elif winner == 1:
+            return 1.0
+        else:
+            return -1.0
+
+    def evaluate_current_checkpoint_vs_recent(self):
+        """
+        After saving the *current* checkpoint, pit it against up to the
+        last K previous checkpoints.
+
+        For each opponent:
+          - play eval_games_per_color games with current as P1
+          - play eval_games_per_color games with current as P2
+        So at most:
+          K opponents * 2 * eval_games_per_color games.
+
+        This pauses training briefly for up to 50 games (if
+        K=5 and eval_games_per_color=5).
+        """
+        if not self.config.eval_enable:
+            return
+
+        import glob
+        from mcts import MCTSConfig
+
+        max_prev = self.config.eval_max_prev_checkpoints
+        games_per_color = self.config.eval_games_per_color
+        if max_prev <= 0 or games_per_color <= 0:
+            return
+
+        pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
+        ckpt_paths = sorted(glob.glob(pattern))
+        if len(ckpt_paths) < 2:
+            return  # need at least current + one opponent
+
+        # Current is the most recently saved
+        current_path = ckpt_paths[-1]
+        # Up to 5 most recent previous checkpoints, most recent first
+        prev_paths = ckpt_paths[-(max_prev + 1):-1]
+        prev_paths = list(reversed(prev_paths))  # newest first
+
+        # Load current params once
+        with open(current_path, "rb") as f:
+            current_ckpt = pickle.load(f)
+        current_params = {
+            "network_params": current_ckpt["params"],
+            "batch_stats": current_ckpt["batch_stats"],
+        }
+        current_name = os.path.basename(current_path)
+
+        # Shared MCTS config for eval
+        mcts_config = MCTSConfig(
+            num_simulations=self.config.eval_num_simulations,
+            max_num_considered_actions=32,
+            dirichlet_alpha=0.3,
+            root_exploration_fraction=0.25,
+        )
+
+        max_moves = self.config.eval_max_moves
+        temperature = self.config.eval_temperature
+
+        print(f"  [eval] Evaluating {current_name} vs up to {len(prev_paths)} recent checkpoints...")
+        seed_counter = 0
+
+        for opp_path in prev_paths:
+            opp_name = os.path.basename(opp_path)
+            with open(opp_path, "rb") as f:
+                opp_ckpt = pickle.load(f)
+            opp_params = {
+                "network_params": opp_ckpt["params"],
+                "batch_stats": opp_ckpt["batch_stats"],
+            }
+
+            score_current = 0.0
+            total_games = 0
+
+            # current as P1, opponent as P2
+            for g in range(games_per_color):
+                seed_counter += 1
+                res = self._eval_play_one_game(
+                    current_params,
+                    opp_params,
+                    mcts_config,
+                    max_moves,
+                    temperature,
+                    seed=1000 + seed_counter,
+                )
+                score_current += res
+                total_games += 1
+
+            # opponent as P1, current as P2 (flip perspective)
+            for g in range(games_per_color):
+                seed_counter += 1
+                res_opp = self._eval_play_one_game(
+                    opp_params,
+                    current_params,
+                    mcts_config,
+                    max_moves,
+                    temperature,
+                    seed=2000 + seed_counter,
+                )
+                score_current -= res_opp  # flip perspective back to "current"
+                total_games += 1
+
+            avg_score = score_current / total_games if total_games > 0 else 0.0
+            print(
+                f"    [eval] {current_name} vs {opp_name}: "
+                f"{score_current:+.1f} over {total_games} games "
+                f"(avg {avg_score:+.3f})"
+            )
 
 def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
     """Evaluate trained model against random play."""
