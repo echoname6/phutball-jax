@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import time
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from typing import Optional
 import pickle
 
@@ -20,8 +20,18 @@ from network import (
     create_optimizer, make_train_step_fn, predict
 )
 from self_play_batched import (
-    play_games_batched, trajectory_to_training_examples, ReplayBuffer
+    play_games_batched,
+    trajectory_to_training_examples,
+    ReplayBuffer,
+    compute_phutball_stats,
 )
+
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 
 @dataclass
@@ -70,6 +80,11 @@ class TrainConfig:
     eval_max_moves: int = 2048         # cutoff to avoid marathon eval games
     eval_temperature: float = 0.0 
 
+    use_wandb: bool = False
+    wandb_project: str = "phutball-az"
+    wandb_run_name: Optional[str] = None
+    wandb_mode: str = "online"
+
 
 class AlphaZeroTrainer:
     """Main training class with batched self-play."""
@@ -111,6 +126,26 @@ class AlphaZeroTrainer:
         self.total_games = 0
         self.total_examples = 0
         self.metrics_history = []
+        self.last_self_play_stats = None
+
+        self.wandb_run = None
+        if self.config.use_wandb:
+            if wandb is None:
+                print("WARNING: use_wandb=True but wandb is not installed; disabling wandb.")
+                self.config.use_wandb = False
+            else:
+                run_name = (
+                    self.config.wandb_run_name
+                    or f"phutball_az_{int(time.time())}"
+                )
+                cfg = asdict(self.config)
+                # asdict(config) is all simple types, so fine for wandb
+                self.wandb_run = wandb.init(
+                    project=self.config.wandb_project,
+                    name=run_name,
+                    config=cfg,
+                    mode=self.config.wandb_mode,
+                )
         
     def _init_network(self):
         """Initialize network parameters."""
@@ -135,6 +170,18 @@ class AlphaZeroTrainer:
         total_states = []
         total_policies = []
         total_values = []
+
+        stats_totals = {
+            "num_games": 0,
+            "total_moves": 0,
+            "total_placements": 0,
+            "total_jumps": 0,
+            "num_jump_sequences": 0,
+            "sum_jump_sequence_lengths": 0,
+            "sum_jump_removed_tiles": 0,
+            "adjacency_opportunities": 0,
+            "adjacency_conversions": 0,
+        }
         
         # Run multiple batches to get desired number of games
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
@@ -154,6 +201,10 @@ class AlphaZeroTrainer:
                 temperature=self.config.temperature,
                 num_simulations=self.config.num_simulations,
             )
+
+            batch_stats = compute_phutball_stats(trajectory, self.env_config)
+            for k in stats_totals:
+                stats_totals[k] += batch_stats[k]
             
             # Convert to training examples
             states, policies, values = trajectory_to_training_examples(trajectory)
@@ -177,11 +228,55 @@ class AlphaZeroTrainer:
         games_total = num_batches * self.config.batch_size_games
         self.total_games += games_total
         self.total_examples += num_examples
+
+        # ---- derive averages from stats_totals ----
+        if stats_totals["num_games"] > 0:
+            ng = stats_totals["num_games"]
+            total_moves = stats_totals["total_moves"]
+            total_placements = stats_totals["total_placements"]
+            total_jumps = stats_totals["total_jumps"]
+            num_seq = stats_totals["num_jump_sequences"]
+            seq_len_sum = stats_totals["sum_jump_sequence_lengths"]
+            removed_sum = stats_totals["sum_jump_removed_tiles"]
+            adj_ops = stats_totals["adjacency_opportunities"]
+            adj_conv = stats_totals["adjacency_conversions"]
+
+            avg_moves_per_game = total_moves / ng
+            avg_placements_per_jump = (
+                float(total_placements) / total_jumps if total_jumps > 0 else 0.0
+            )
+            avg_jump_seq_len = (
+                float(seq_len_sum) / num_seq if num_seq > 0 else 0.0
+            )
+            avg_jump_length = (
+                float(removed_sum) / total_jumps if total_jumps > 0 else 0.0
+            )
+            adj_conv_rate = (
+                float(adj_conv) / adj_ops if adj_ops > 0 else 0.0
+            )
+        else:
+            avg_moves_per_game = avg_placements_per_jump = 0.0
+            avg_jump_seq_len = avg_jump_length = adj_conv_rate = 0.0
+
+        self.last_self_play_stats = {
+            "games_total": games_total,
+            "avg_moves_per_game": avg_moves_per_game,
+            "avg_placements_per_jump": avg_placements_per_jump,
+            "avg_jump_sequence_len": avg_jump_seq_len,
+            "avg_jump_length": avg_jump_length,
+            "adjacent_conversion_rate": adj_conv_rate,
+        }
         
         games_per_sec = games_total / elapsed if elapsed > 0 else 0
-        print(f"  Self-play: {num_examples} examples from {games_total} games "
-              f"({games_per_sec:.1f} games/sec, {elapsed:.1f}s)")
-        
+        print(
+            f"  Self-play: {num_examples} examples from {games_total} games "
+            f"({games_per_sec:.1f} games/sec, {elapsed:.1f}s) | "
+            f"avg_moves/game={avg_moves_per_game:.1f}, "
+            f"avg_jump_seq={avg_jump_seq_len:.2f}, "
+            f"avg_jump_len={avg_jump_length:.2f}, "
+            f"adj_conv={adj_conv_rate*100:.1f}%"
+        )
+
         return num_examples
     
     def run_training(self) -> dict:
@@ -300,10 +395,34 @@ class AlphaZeroTrainer:
 
                 if self.config.eval_enable:
                     self.evaluate_current_checkpoint_vs_recent()
-                    
-                    iter_time = time.time() - iter_start
-                    print(f"  Iteration time: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)} examples")
-                    print()
+
+            # iteration timing + wandb logging
+            iter_time = time.time() - iter_start
+            print(f"  Iteration time: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)} examples")
+            print()
+
+            if metrics and self.config.use_wandb and self.wandb_run is not None:
+                global_step = (iteration + 1) * self.config.train_steps_per_iteration
+
+                log_data = {
+                    "iteration": iteration,
+                    "total_games": self.total_games,
+                    "total_examples": self.total_examples,
+                    "buffer_size": len(self.replay_buffer),
+                    "selfplay/examples_per_iter": num_examples,
+                    "train/policy_loss": metrics["policy_loss"],
+                    "train/value_loss": metrics["value_loss"],
+                    "train/total_loss": metrics["total_loss"],
+                    "time/iteration_sec": iter_time,
+                }
+
+                # Phutball-specific stats if available
+                if self.last_self_play_stats is not None:
+                    for k, v in self.last_self_play_stats.items():
+                        log_data[f"selfplay/{k}"] = v
+
+                wandb.log(log_data, step=global_step)
+
         
         # Final checkpoint
         self.save_checkpoint()

@@ -7,7 +7,7 @@ Runs multiple games in parallel using vmap for TPU efficiency.
 import jax
 import jax.numpy as jnp
 from jax import lax
-from typing import NamedTuple, Tuple
+from typing import NamedTuple, Tuple, Dict
 from functools import partial
 import numpy as np
 
@@ -33,6 +33,7 @@ class TrajectoryData(NamedTuple):
     players: jnp.ndarray         # (batch, max_moves) which player moved
     valid_mask: jnp.ndarray      # (batch, max_moves) which moves are real
     winners: jnp.ndarray         # (batch,) game outcomes
+    actions: jnp.ndarray         # (batch, max_moves) chosen action ids
 
 
 def batched_reset(env_config: EnvConfig, batch_size: int) -> PhutballState:
@@ -317,6 +318,7 @@ def play_games_batched(
     all_states = jnp.zeros((batch_size, max_moves, num_channels, rows, cols))
     all_policies = jnp.zeros((batch_size, max_moves, action_space_size))
     all_players = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
+    all_actions = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
     valid_mask = jnp.zeros((batch_size, max_moves), dtype=jnp.bool_)
     
     # Initialize game states
@@ -393,6 +395,9 @@ def play_games_batched(
             jnp.where(active, current_players, all_players[batch_idx, safe_move_idx])
         )
         valid_mask = valid_mask.at[batch_idx, safe_move_idx].set(active)
+
+        stored_actions = jnp.where(active, actions, all_actions[batch_idx, safe_move_idx])
+        all_actions = all_actions.at[batch_idx, safe_move_idx].set(stored_actions)
         
         # Step environments
         new_env_states = jax.vmap(single_step)(env_states, actions)
@@ -421,7 +426,7 @@ def play_games_batched(
         new_move_count = move_count + active.astype(jnp.int32)
         
         carry = (new_env_states, new_terminated, new_move_count, 
-                all_states, all_policies, all_players, valid_mask, rng)
+                all_states, all_policies, all_players, all_actions, valid_mask, rng)
         return carry, None
     
     # Run the game loop with early stopping.
@@ -462,15 +467,13 @@ def play_games_batched(
                 all_states, all_policies, all_players, valid_mask, rng,
                 step_idx + jnp.int32(1))
 
-    # Add a step index to the carry (starts at 0)
-    step0 = jnp.int32(0)
     initial_carry = (env_states, terminated, move_count,
-                     all_states, all_policies, all_players, valid_mask, rng, step0)
+                     all_states, all_policies, all_players, all_actions, valid_mask, rng)
 
     final_carry = lax.while_loop(cond_fn, body_fn, initial_carry)
 
     (final_env_states, _, _,
-     all_states, all_policies, all_players, valid_mask, _, _) = final_carry
+     all_states, all_policies, all_players, all_actions, valid_mask, _, _) = final_carry
 
     # Get winners from the final env states
     winners = final_env_states.winner
@@ -481,6 +484,7 @@ def play_games_batched(
         players=all_players,
         valid_mask=valid_mask,
         winners=winners,
+        actions=all_actions,
     )
 
 
@@ -546,6 +550,138 @@ def trajectory_to_training_examples(
         np.stack(all_policies).astype(np.float32),
         np.array(all_values, dtype=np.float32),
     )
+
+def compute_phutball_stats(
+    trajectory: TrajectoryData,
+    env_config: EnvConfig,
+) -> Dict[str, float]:
+    """
+    Compute high-level Phutball stats from a batch of self-play games.
+
+    Returns *totals* which you can aggregate across batches:
+      - num_games
+      - total_moves
+      - total_placements
+      - total_jumps
+      - num_jump_sequences
+      - sum_jump_sequence_lengths
+      - sum_jump_removed_tiles
+      - adjacency_opportunities
+      - adjacency_conversions
+    """
+    states_np = np.asarray(trajectory.states)      # (B, M, C, R, C)
+    actions_np = np.asarray(trajectory.actions)    # (B, M)
+    valid_np = np.asarray(trajectory.valid_mask)   # (B, M)
+
+    batch_size, max_moves = valid_np.shape
+    rows, cols = env_config.rows, env_config.cols
+    total_positions = rows * cols
+
+    # From phutball_env_jax
+    BALL = -1
+    MAN = 1
+
+    total_moves = 0
+    total_placements = 0
+    total_jumps = 0
+    num_jump_sequences = 0
+    sum_jump_sequence_lengths = 0
+    sum_jump_removed_tiles = 0
+    adjacency_opportunities = 0
+    adjacency_conversions = 0
+
+    for g in range(batch_size):
+        prev_action_was_jump = False
+        current_seq_len = 0
+
+        for t in range(max_moves):
+            if not valid_np[g, t]:
+                continue
+
+            total_moves += 1
+            a = int(actions_np[g, t])
+            board_before = states_np[g, t, 0]  # channel 0 is board
+
+            is_placement = a < total_positions
+            is_jump = (total_positions <= a < 2 * total_positions)
+            # halt = 2*total_positions, we don't need it explicitly here
+
+            if is_placement:
+                # --- % occupying-adjacent-tile conversion ---
+                ball_pos = np.argwhere(board_before == BALL)
+                if ball_pos.size > 0:
+                    br, bc = ball_pos[0]
+
+                    r0 = max(br - 1, 0)
+                    r1 = min(br + 1, rows - 1)
+                    c0 = max(bc - 1, 0)
+                    c1 = min(bc + 1, cols - 1)
+                    neighborhood = board_before[r0:r1 + 1, c0:c1 + 1]
+                    has_adjacent_man = np.any(neighborhood == MAN)
+
+                    pr = a // cols
+                    pc = a % cols
+                    is_adjacent = (
+                        abs(pr - br) <= 1
+                        and abs(pc - bc) <= 1
+                        and not (pr == br and pc == bc)
+                    )
+
+                    # "Opportunity" = ball currently has no adjacent men
+                    if not has_adjacent_man:
+                        adjacency_opportunities += 1
+                        if is_adjacent:
+                            adjacency_conversions += 1
+
+                total_placements += 1
+
+            if is_jump:
+                total_jumps += 1
+
+                # --- jump length (tiles removed) ---
+                if t + 1 < max_moves and valid_np[g, t + 1]:
+                    board_after = states_np[g, t + 1, 0]
+                    men_before = np.sum(board_before == MAN)
+                    men_after = np.sum(board_after == MAN)
+                    removed = max(0, int(men_before - men_after))
+                else:
+                    removed = 0
+                sum_jump_removed_tiles += removed
+
+                # --- jump sequence length (contiguous jump run) ---
+                if prev_action_was_jump:
+                    current_seq_len += 1
+                else:
+                    if current_seq_len > 0:
+                        num_jump_sequences += 1
+                        sum_jump_sequence_lengths += current_seq_len
+                    current_seq_len = 1
+                prev_action_was_jump = True
+            else:
+                # placement / halt ends a jump sequence
+                if prev_action_was_jump and current_seq_len > 0:
+                    num_jump_sequences += 1
+                    sum_jump_sequence_lengths += current_seq_len
+                    current_seq_len = 0
+                prev_action_was_jump = False
+
+        # flush if game ended mid-sequence
+        if prev_action_was_jump and current_seq_len > 0:
+            num_jump_sequences += 1
+            sum_jump_sequence_lengths += current_seq_len
+
+    return {
+        "num_games": batch_size,
+        "total_moves": total_moves,
+        "total_placements": total_placements,
+        "total_jumps": total_jumps,
+        "num_jump_sequences": num_jump_sequences,
+        "sum_jump_sequence_lengths": sum_jump_sequence_lengths,
+        "sum_jump_removed_tiles": sum_jump_removed_tiles,
+        "adjacency_opportunities": adjacency_opportunities,
+        "adjacency_conversions": adjacency_conversions,
+    }
+
 
 
 class ReplayBuffer:
