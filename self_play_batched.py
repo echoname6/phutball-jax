@@ -14,6 +14,7 @@ import numpy as np
 from phutball_env_jax import (
     PhutballState, EnvConfig,
     reset, step, get_legal_actions,
+    calculate_jumped_men
 )
 from network import PhutballNetwork, predict
 from mcts import state_to_network_input
@@ -639,15 +640,33 @@ def compute_phutball_stats(
             if is_jump:
                 total_jumps += 1
 
-                # --- jump length (tiles removed) ---
-                if t + 1 < max_moves and valid_np[g, t + 1]:
-                    board_after = states_np[g, t + 1, 0]
-                    men_before = np.sum(board_before == MAN)
-                    men_after = np.sum(board_after == MAN)
-                    removed = max(0, int(men_before - men_after))
+                # --- jump length (tiles removed) using env helper ---
+                # Decode landing position from action index
+                jump_idx = a - total_positions           # 0 .. total_positions-1
+                land_r = jump_idx // cols
+                land_c = jump_idx % cols
+                landing_pos = np.array([land_r, land_c], dtype=np.int32)
+
+                # Ball position from board_before
+                ball_pos_arr = np.argwhere(board_before == BALL)
+                if ball_pos_arr.size > 0:
+                    ball_pos = ball_pos_arr[0]
+
+                    jumped = calculate_jumped_men(
+                        jnp.array(ball_pos, dtype=jnp.int32),
+                        jnp.array(landing_pos, dtype=jnp.int32),
+                        jnp.array(board_before),
+                    )
+                    jumped_np = np.asarray(jumped)
+                    # Filter out the (-1, -1) padding
+                    valid_jumped = jumped_np[jumped_np[:, 0] >= 0]
+                    removed = int(valid_jumped.shape[0])
                 else:
+                    # Shouldn't really happen, but be defensive
                     removed = 0
+
                 sum_jump_removed_tiles += removed
+
 
                 # --- jump sequence length (contiguous jump run) ---
                 if prev_action_was_jump:
