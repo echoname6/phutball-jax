@@ -23,6 +23,7 @@ from self_play_batched import (
     play_games_batched,
     trajectory_to_training_examples,
     ReplayBuffer,
+    compute_phutball_stats,
     batched_mcts_policy,
     batched_reset,
 )
