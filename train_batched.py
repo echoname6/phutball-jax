@@ -24,6 +24,7 @@ from self_play_batched import (
     trajectory_to_training_examples,
     ReplayBuffer,
     compute_phutball_stats,
+    play_match_batched,
     batched_mcts_policy,
     batched_reset,
 )
@@ -434,22 +435,14 @@ class AlphaZeroTrainer:
 
     def evaluate_current_checkpoint_vs_recent(self):
         """
-        Batched evaluation:
+        After saving the *current* checkpoint, pit it against up to the last
+        K previous checkpoints.
 
-        - Current checkpoint = most recent saved.
-        - Up to K previous checkpoints as opponents.
-        - For each opponent:
-            * eval_games_per_color games with current as P1, opponent as P2
-            * eval_games_per_color games with opponent as P1, current as P2
-
-        All of these games are packed into a single batched rollout, so the batch
-        can contain heterogeneous pairs like:
-            - current(P1) vs ckpt_09(P2)
-            - current(P2) vs ckpt_09(P1)
-            - current(P1) vs ckpt_19(P2)
-            - current(P2) vs ckpt_19(P1)
-            - ...
-        and all active games are stepped in parallel.
+        For each opponent:
+          - play eval_games_per_color games with current as P1
+          - play eval_games_per_color games with current as P2
+        All 2 * eval_games_per_color games vs that opponent are batched and
+        stepped in parallel via play_match_batched.
 
         Score is reported from the current checkpoint's perspective.
         """
@@ -457,15 +450,13 @@ class AlphaZeroTrainer:
             return
 
         import glob
-        import numpy as np
 
-        # Find checkpoints
         pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
         ckpt_paths = sorted(glob.glob(pattern))
         if len(ckpt_paths) < 2:
             return  # need at least current + one opponent
 
-        # Current = latest
+        # Current is the most recent
         current_path = ckpt_paths[-1]
         prev_paths_all = ckpt_paths[:-1]
 
@@ -473,200 +464,60 @@ class AlphaZeroTrainer:
         prev_paths_all = list(reversed(prev_paths_all))
         max_prev = self.config.eval_max_prev_checkpoints
         prev_paths = prev_paths_all[:max_prev]
-        num_opps = len(prev_paths)
-        if num_opps == 0:
-            return
 
         games_per_color = self.config.eval_games_per_color
         if games_per_color <= 0:
             return
 
-        # ---------------------------
-        # Load current + opponent params
-        # ---------------------------
+        # Load current params once
         with open(current_path, "rb") as f:
             current_ckpt = pickle.load(f)
-
-        agents_params = []
-        agents_names = []
-
-        # Agent 0 = current checkpoint
-        agents_params.append({
+        current_params = {
             "network_params": current_ckpt["params"],
             "batch_stats": current_ckpt["batch_stats"],
-        })
-        agents_names.append(os.path.basename(current_path))
-        current_name = agents_names[0]
+        }
+        current_name = os.path.basename(current_path)
 
-        # Agents 1..N = previous checkpoints
-        opp_names = []
-        for p in prev_paths:
-            with open(p, "rb") as f:
+        print(
+            f"  [eval] Batched evaluation for {current_name} "
+            f"vs {len(prev_paths)} recent checkpoints..."
+        )
+
+        for opp_path in prev_paths:
+            opp_name = os.path.basename(opp_path)
+            with open(opp_path, "rb") as f:
                 opp_ckpt = pickle.load(f)
-            agents_params.append({
+            opp_params = {
                 "network_params": opp_ckpt["params"],
                 "batch_stats": opp_ckpt["batch_stats"],
-            })
-            opp_names.append(os.path.basename(p))
+            }
 
-        num_agents = len(agents_params)  # 1 + num_opps
-        assert num_agents == 1 + num_opps
+            # Use a deterministic but separate RNG stream for eval
+            self.rng, eval_rng = jax.random.split(self.rng)
 
-        # ---------------------------
-        # Build game batch metadata
-        # ---------------------------
-        # For each opponent:
-        #   - games_per_color games with current as P1 (sign=+1)
-        #   - games_per_color games with current as P2 (sign=-1)
-        total_games_per_opp = 2 * games_per_color
-        total_games = num_opps * total_games_per_opp
-
-        # agent_p1_idx[i] = which agent plays as player 1 in game i (0 = current)
-        # agent_p2_idx[i] = which agent plays as player 2 in game i
-        # opp_idx[i]     = which opponent index this game belongs to (0..num_opps-1)
-        # sign[i]        = +1 if "current" is P1 in this game, -1 if "current" is P2
-        agent_p1_idx = np.zeros(total_games, dtype=np.int32)
-        agent_p2_idx = np.zeros(total_games, dtype=np.int32)
-        opp_idx = np.zeros(total_games, dtype=np.int32)
-        sign = np.zeros(total_games, dtype=np.float32)
-
-        g = 0
-        for oi in range(num_opps):
-            # current (agent 0) as P1, opp (agent oi+1) as P2
-            for _ in range(games_per_color):
-                agent_p1_idx[g] = 0           # current
-                agent_p2_idx[g] = oi + 1      # opponent
-                opp_idx[g] = oi
-                sign[g] = +1.0                # current is P1
-                g += 1
-
-            # opponent as P1, current as P2
-            for _ in range(games_per_color):
-                agent_p1_idx[g] = oi + 1      # opponent
-                agent_p2_idx[g] = 0           # current
-                opp_idx[g] = oi
-                sign[g] = -1.0                # current is P2 → flip sign
-                g += 1
-
-        assert g == total_games
-
-        # ---------------------------
-        # Batched rollout loop
-        # ---------------------------
-        env_config = self.env_config
-        batch_size = total_games
-
-        # Create batched initial states
-        states = batched_reset(env_config, batch_size)   # PhutballState with batch dim
-        terminated_host = np.zeros(batch_size, dtype=bool)
-
-        max_moves = self.config.eval_max_moves
-        num_sims = self.config.eval_num_simulations
-        temperature = self.config.eval_temperature
-
-        # Scoreboard from current's POV
-        score_per_opp = np.zeros(num_opps, dtype=np.float32)
-        games_per_opp = np.zeros(num_opps, dtype=np.int32)
-
-        # RNG for eval (separate from training RNG)
-        rng = jax.random.PRNGKey(987654)
-
-        print(f"  [eval] Batched evaluation for {current_name} "
-              f"vs {num_opps} recent checkpoints, total {total_games} games...")
-
-        step_idx = 0
-        while (not terminated_host.all()) and (step_idx < max_moves):
-            # Host view of current_player / terminated
-            current_player = np.array(states.current_player)  # shape (B,)
-            terminated_host = np.array(states.terminated)
-            active = ~terminated_host
-
-            if not active.any():
-                break
-
-            # Which agent controls each active game this move?
-            # 0..num_agents-1; uses agent_p1_idx / agent_p2_idx and current_player
-            current_agent_idx = np.where(
-                current_player == 1,
-                agent_p1_idx,
-                agent_p2_idx,
+            total_score_A, total_games = play_match_batched(
+                current_params,
+                opp_params,
+                eval_rng,
+                self.network,
+                self.env_config,
+                games_per_color=self.config.eval_games_per_color,
+                max_moves=self.config.eval_max_moves,
+                num_simulations=self.config.eval_num_simulations,
+                temperature=self.config.eval_temperature,
             )
 
-            actions_host = np.zeros(batch_size, dtype=np.int32)
-
-            # For each agent, gather the games where this agent is to move
-            for a_idx, params in enumerate(agents_params):
-                mask = active & (current_agent_idx == a_idx)
-                if not mask.any():
-                    continue
-
-                mask_jnp = jnp.array(mask)
-                # Sub-batch of states for this agent
-                sub_states = jax.tree.map(lambda x: x[mask_jnp], states)
-
-                rng, subkey = jax.random.split(rng)
-                sub_actions, _, _ = batched_mcts_policy(
-                    params,
-                    sub_states,
-                    subkey,
-                    self.network,
-                    env_config,
-                    num_simulations=num_sims,
-                    temperature=temperature,
-                )
-                actions_host[mask] = np.array(sub_actions)
-
-            # Step all envs in parallel, but freeze already-terminated games
-            j_actions = jnp.array(actions_host, dtype=jnp.int32)
-            new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, j_actions)
-
-            done_mask = jnp.array(terminated_host)
-
-            new_states = type(states)(
-                board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
-                ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
-                current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
-                is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
-                terminated=jnp.where(done_mask, states.terminated, new_states_raw.terminated),
-                winner=jnp.where(done_mask, states.winner, new_states_raw.winner),
-                num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
-            )
-
-            states = new_states
-            terminated_host = np.array(states.terminated)
-            step_idx += 1
-
-        # ---------------------------
-        # Aggregate results by opponent
-        # ---------------------------
-        winners = np.array(states.winner, dtype=np.int32)  # 0,1,2
-        # From current's POV:
-        #   game_score = +1 for a current win, -1 for a loss, 0 for draw
-        win1 = (winners == 1).astype(np.float32)
-        win2 = (winners == 2).astype(np.float32)
-        # For P1= current, sign=+1 → score = (win1 - win2)
-        # For P2= current, sign=-1 → score = -(win1 - win2)
-        game_scores = sign * (win1 - win2)
-
-        for i in range(batch_size):
-            oi = opp_idx[i]
-            score_per_opp[oi] += game_scores[i]
-            games_per_opp[oi] += 1  # count all games (including draws / cutoffs)
-
-        # ---------------------------
-        # Print results in the old style
-        # ---------------------------
-        for oi in range(num_opps):
-            opp_name = opp_names[oi]
-            total_score = float(score_per_opp[oi])
-            total_games = int(games_per_opp[oi])
-            avg_score = total_score / total_games if total_games > 0 else 0.0
+            # Bring small scalars back to host
+            score = float(total_score_A)
+            n_games = int(total_games)
+            avg_score = score / n_games if n_games > 0 else 0.0
 
             print(
                 f"    [eval] {current_name} vs {opp_name}: "
-                f"{total_score:+.1f} over {total_games} games "
+                f"{score:+.1f} over {n_games} games "
                 f"(avg {avg_score:+.3f})"
             )
+
 
 
 def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
