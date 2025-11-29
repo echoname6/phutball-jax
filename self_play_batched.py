@@ -489,7 +489,7 @@ def play_games_batched(
         actions=all_actions,
     )
 
-@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7))
+@partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def play_match_batched(
     params_A: dict,
     params_B: dict,
@@ -506,23 +506,22 @@ def play_match_batched(
 
     We launch 2 * games_per_color games:
 
-      - games 0..(g-1): A as Player 1, B as Player 2
-      - games g..(2g-1): B as Player 1, A as Player 2
+      - games [0 .. g-1]:   A is Player 1, B is Player 2
+      - games [g .. 2g-1]:  B is Player 1, A is Player 2
 
-    All these games are stepped in parallel. Returns:
+    All games are stepped in parallel using a JAX while_loop.
 
-      total_score_A: sum of game scores from A's POV
-                     (+1 win, -1 loss, 0 draw/cutoff)
-      total_games:   number of games played (= 2 * games_per_color)
+    Returns:
+        total_score_A: sum of scores (+1 win, -1 loss, 0 draw/cutoff) from A's POV
+        total_games:   number of games played (= 2 * games_per_color)
     """
     batch_size = 2 * games_per_color
-    rows, cols = env_config.rows, env_config.cols
 
-    # Which agent controls P1/P2 in each game? (True = A, False = B)
+    # Which agent is P1/P2 in each game? (True = A, False = B)
     agent_p1_is_A = jnp.concatenate(
         [
-            jnp.ones((games_per_color,), dtype=jnp.bool_),   # A as P1
-            jnp.zeros((games_per_color,), dtype=jnp.bool_),  # B as P1
+            jnp.ones((games_per_color,), dtype=jnp.bool_),   # first block: A as P1
+            jnp.zeros((games_per_color,), dtype=jnp.bool_),  # second block: B as P1
         ],
         axis=0,
     )
@@ -534,33 +533,39 @@ def play_match_batched(
 
     def cond_fn(carry):
         states, terminated, rng, step_idx = carry
-        any_active = jnp.any(~terminated)
-        return (step_idx < max_moves) & any_active
+        any_active = jnp.any(~terminated)          # bool scalar (traced)
+        return jnp.logical_and(step_idx < max_moves, any_active)
 
     def body_fn(carry):
         states, terminated, rng, step_idx = carry
 
         current_player = states.current_player  # (batch,)
-        # is A to move in each game?
+        # For each game, decide whether A is to move
         use_A = jnp.where(
             current_player == 1,
-            agent_p1_is_A,
-            agent_p2_is_A,
+            agent_p1_is_A,   # if P1 to move, use mapping for P1
+            agent_p2_is_A,   # if P2 to move, use mapping for P2
         )
 
         rng, rngA, rngB = jax.random.split(rng, 3)
 
-        # We call batched_mcts_policy for ALL games with A's params,
-        # and again with B's params, then select per-game outputs
-        # based on use_A. This is slightly redundant but keeps everything
-        # nicely batched/JAXed.
+        # Run MCTS for ALL games with A, and ALL games with B,
+        # then select per-game outputs based on use_A.
         actions_A, _, _ = batched_mcts_policy(
-            params_A, states, rngA, network, env_config,
+            params_A,
+            states,
+            rngA,
+            network,
+            env_config,
             num_simulations=num_simulations,
             temperature=temperature,
         )
         actions_B, _, _ = batched_mcts_policy(
-            params_B, states, rngB, network, env_config,
+            params_B,
+            states,
+            rngB,
+            network,
+            env_config,
             num_simulations=num_simulations,
             temperature=temperature,
         )
@@ -570,10 +575,10 @@ def play_match_batched(
         # Step all envs in parallel
         new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
 
-        # Once a game is terminated, we freeze it
+        # Once a game is terminated, we freeze it and stop evolving it
         done_mask = terminated | new_states_raw.terminated
 
-        new_states = type(states)(
+        new_states = PhutballState(
             board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
             ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
             current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
@@ -583,32 +588,28 @@ def play_match_batched(
             num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
         )
 
-        return (new_states, done_mask, rng, step_idx + 1)
+        return (new_states, done_mask, rng, step_idx + jnp.int32(1))
 
-    # Run the while loop
     init_carry = (states, terminated, rng, jnp.int32(0))
     final_states, final_terminated, _, _ = lax.while_loop(cond_fn, body_fn, init_carry)
 
     winners = final_states.winner  # (batch,) in {0,1,2}
-
-    # Compute score per game from A's perspective.
-    # For games 0..g-1, A is P1. For g..2g-1, A is P2.
     idx = jnp.arange(batch_size)
     A_is_P1 = idx < games_per_color
 
+    # From env: winner==1 ⇒ P1 won, winner==2 ⇒ P2 won, 0 ⇒ draw/cutoff
     win1 = (winners == 1).astype(jnp.float32)
     win2 = (winners == 2).astype(jnp.float32)
 
-    # score if A is P1: +1 if winner==1, -1 if winner==2
+    # Score if A is P1: +1 if P1 wins, -1 if P2 wins
     score_if_P1 = win1 - win2
-    # score if A is P2: +1 if winner==2, -1 if winner==1
+    # Score if A is P2: +1 if P2 wins, -1 if P1 wins
     score_if_P2 = win2 - win1
 
     per_game_score = jnp.where(A_is_P1, score_if_P1, score_if_P2)
     total_score_A = jnp.sum(per_game_score)
 
     return total_score_A, jnp.int32(batch_size)
-
 
 def trajectory_to_training_examples(
     trajectory: TrajectoryData,
