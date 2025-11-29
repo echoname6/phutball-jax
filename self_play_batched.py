@@ -438,6 +438,8 @@ def play_games_batched(
     #
     # This makes runtime scale with actual game length instead of the cap.
 
+    step0 = jnp.int32(0)
+
     def cond_fn(carry):
         (env_states, terminated, move_count, all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
 
@@ -467,7 +469,7 @@ def play_games_batched(
                 step_idx + jnp.int32(1))
 
     initial_carry = (env_states, terminated, move_count,
-                     all_states, all_policies, all_players, all_actions, valid_mask, rng)
+                     all_states, all_policies, all_players, all_actions, valid_mask, rng, step0)
 
     final_carry = lax.while_loop(cond_fn, body_fn, initial_carry)
 
