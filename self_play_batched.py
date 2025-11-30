@@ -823,8 +823,6 @@ def compute_phutball_stats(
         "adjacency_conversions": adjacency_conversions,
     }
 
-
-
 class ReplayBuffer:
     """Simple replay buffer for training examples."""
     
@@ -841,6 +839,12 @@ class ReplayBuffer:
         n = len(states)
         if n == 0:
             return
+
+        if n >= self.max_size:
+            states = states[-self.max_size:]
+            policies = policies[-self.max_size:]
+            values = values[-self.max_size:]
+            n = self.max_size
             
         if self.states is None:
             # Initialize buffers
@@ -848,24 +852,27 @@ class ReplayBuffer:
             self.policies = np.zeros((self.max_size,) + policies.shape[1:], dtype=np.float32)
             self.values = np.zeros(self.max_size, dtype=np.float32)
         
-        # Add data
+        # Case 1: no wrap needed
         if self.idx + n <= self.max_size:
             self.states[self.idx:self.idx + n] = states
             self.policies[self.idx:self.idx + n] = policies
             self.values[self.idx:self.idx + n] = values
             self.idx += n
         else:
-            # Wrap around
+            # Case 2: wrap around the circular buffer
             first_part = self.max_size - self.idx
-            self.states[self.idx:] = states[:first_part]
-            self.policies[self.idx:] = policies[:first_part]
-            self.values[self.idx:] = values[:first_part]
+            if first_part > 0:
+                self.states[self.idx:] = states[:first_part]
+                self.policies[self.idx:] = policies[:first_part]
+                self.values[self.idx:] = values[:first_part]
             
-            second_part = n - first_part
-            self.states[:second_part] = states[first_part:]
-            self.policies[:second_part] = policies[first_part:]
-            self.values[:second_part] = values[first_part:]
-            self.idx = second_part
+            remaining = n - first_part
+            if remaining > 0:
+                self.states[:remaining] = states[first_part:first_part + remaining]
+                self.policies[:remaining] = policies[first_part:first_part + remaining]
+                self.values[:remaining] = values[first_part:first_part + remaining]
+            
+            self.idx = (self.idx + n) % self.max_size
         
         self.size = min(self.size + n, self.max_size)
     
