@@ -826,7 +826,7 @@ def compute_phutball_stats(
 class ReplayBuffer:
     """Simple replay buffer for training examples."""
     
-    def __init__(self, max_size: int = 100000):
+    def __init__(self, max_size: int = 500000):
         self.max_size = max_size
         self.states = None
         self.policies = None
