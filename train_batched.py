@@ -62,7 +62,7 @@ class TrainConfig:
     train_steps_per_iteration: int = 100
     
     # Replay buffer
-    buffer_size: int = 100000
+    buffer_size: int = 500000
     min_buffer_size: int = 1000  # Min examples before training starts
     
     # Iterations
