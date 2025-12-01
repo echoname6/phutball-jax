@@ -22,6 +22,7 @@ BALL = -1
 MAN = 1
 END_HI = 2    # Row 0 - beyond goal for P2
 END_LO = -2   # Row -1 - beyond goal for P1
+OUT_OF_BOUNDS = jnp.array(3, dtype=jnp.int32)
 
 # ============================================================================
 # State Definition
@@ -153,9 +154,8 @@ def get_tile(board: Array, row: Array, col: Array) -> Array:
     return lax.cond(
         in_bounds,
         lambda: board[row, col],
-        lambda: jnp.array(0, dtype=jnp.int32)
+        lambda: OUT_OF_BOUNDS,
     )
-
 
 def is_empty(board: Array, row: Array, col: Array) -> Array:
     """Check if position is empty (can place a man there)."""
@@ -383,6 +383,38 @@ def get_legal_actions(state: PhutballState, config: EnvConfig) -> Array:
 # Step Function - Execute Actions
 # ============================================================================
 
+def apply_turn_limit(state: PhutballState, config: EnvConfig) -> PhutballState:
+    """
+    Apply the max_turns limit from config.
+
+    If max_turns > 0 and state.num_turns >= max_turns, mark the game as
+    terminated with a draw (winner = 0). Otherwise, return the state unchanged.
+    """
+    # Treat max_turns <= 0 as "no limit"
+    if config.max_turns <= 0:
+        return state
+
+    reached_limit = state.num_turns >= config.max_turns
+
+    new_terminated = jnp.where(
+        reached_limit,
+        jnp.array(True, dtype=jnp.bool_),
+        state.terminated,
+    )
+
+    # Only override winner if the game wasn't already terminated
+    new_winner = jnp.where(
+        reached_limit & ~state.terminated,
+        jnp.array(0, dtype=jnp.int32),  # 0 = draw
+        state.winner,
+    )
+
+    return state._replace(
+        terminated=new_terminated,
+        winner=new_winner,
+    )
+
+
 def execute_placement(state: PhutballState, position: Array, config: EnvConfig) -> PhutballState:
     """Place a man at the given position and end turn."""
     row, col = position[0], position[1]
@@ -391,12 +423,16 @@ def execute_placement(state: PhutballState, position: Array, config: EnvConfig) 
     # Switch player and increment turn
     new_player = 3 - state.current_player  # 1 -> 2, 2 -> 1
     new_turns = state.num_turns + 1
-    
-    return state._replace(
+
+    new_state = state._replace(
         board=new_board,
         current_player=new_player,
-        num_turns=new_turns
+        num_turns=new_turns,
     )
+
+    # Enforce max_turns if configured
+    return apply_turn_limit(new_state, config)
+
 
 
 def calculate_jumped_men(ball_pos: Array, landing_pos: Array, board: Array) -> Array:
@@ -412,7 +448,8 @@ def calculate_jumped_men(ball_pos: Array, landing_pos: Array, board: Array) -> A
     dist = jnp.maximum(jnp.abs(land_row - ball_row), jnp.abs(land_col - ball_col))
     
     # Collect jumped positions
-    max_jump_dist = 21  # Maximum board dimension
+    rows, cols = board.shape
+    max_jump_dist = max(rows, cols)
     
     def get_jumped_pos(i):
         """Get position i steps from ball, or (-1, -1) if out of range."""
@@ -477,12 +514,15 @@ def execute_halt(state: PhutballState, config: EnvConfig) -> PhutballState:
     """End jump sequence and switch player."""
     new_player = 3 - state.current_player
     new_turns = state.num_turns + 1
-    
-    return state._replace(
+
+    new_state = state._replace(
         current_player=new_player,
         is_jumping=jnp.array(False, dtype=jnp.bool_),
-        num_turns=new_turns
+        num_turns=new_turns,
     )
+
+    # Enforce max_turns if configured
+    return apply_turn_limit(new_state, config)
 
 
 def step(state: PhutballState, action: Array, config: EnvConfig) -> PhutballState:

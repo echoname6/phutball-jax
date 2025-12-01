@@ -433,90 +433,127 @@ class AlphaZeroTrainer:
         print(f"Total games: {self.total_games}")
         print(f"Total examples: {self.total_examples}")
 
-    def evaluate_current_checkpoint_vs_recent(self):
-        """
-        After saving the *current* checkpoint, pit it against up to the last
-        K previous checkpoints.
 
-        For each opponent:
-          - play eval_games_per_color games with current as P1
-          - play eval_games_per_color games with current as P2
-        All 2 * eval_games_per_color games vs that opponent are batched and
-        stepped in parallel via play_match_batched.
+def evaluate_current_checkpoint_vs_recent(self):
+    """
+    After saving the *current* checkpoint, pit it against up to the
+    last K previous checkpoints.
 
-        Score is reported from the current checkpoint's perspective.
-        """
-        if not self.config.eval_enable:
-            return
+    For each opponent:
+        - play eval_games_per_color games with current as P1
+        - play eval_games_per_color games with current as P2
 
-        import glob
+    So at most:
+        K opponents * 2 * eval_games_per_color games.
+    """
+    if not self.config.eval_enable:
+        return
 
-        pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
-        ckpt_paths = sorted(glob.glob(pattern))
-        if len(ckpt_paths) < 2:
-            return  # need at least current + one opponent
+    import glob
+    from mcts import MCTSConfig
 
-        # Current is the most recent
-        current_path = ckpt_paths[-1]
-        prev_paths_all = ckpt_paths[:-1]
+    max_prev = self.config.eval_max_prev_checkpoints
+    games_per_color = self.config.eval_games_per_color
+    if max_prev <= 0 or games_per_color <= 0:
+        return
 
-        # Most recent previous first
-        prev_paths_all = list(reversed(prev_paths_all))
-        max_prev = self.config.eval_max_prev_checkpoints
-        prev_paths = prev_paths_all[:max_prev]
+    pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
+    ckpt_paths = sorted(glob.glob(pattern))
+    if len(ckpt_paths) < 2:
+        return  # need at least current + one opponent
 
-        games_per_color = self.config.eval_games_per_color
-        if games_per_color <= 0:
-            return
+    # Current is the most recently saved
+    current_path = ckpt_paths[-1]
+    # Up to max_prev most recent previous checkpoints
+    prev_paths = ckpt_paths[-(max_prev + 1):-1]
+    prev_paths = list(reversed(prev_paths))  # newest first
 
-        # Load current params once
-        with open(current_path, "rb") as f:
-            current_ckpt = pickle.load(f)
-        current_params = {
-            "network_params": current_ckpt["params"],
-            "batch_stats": current_ckpt["batch_stats"],
+    # Load current params once
+    with open(current_path, "rb") as f:
+        current_ckpt = pickle.load(f)
+    current_params = {
+        "network_params": current_ckpt["params"],
+        "batch_stats": current_ckpt["batch_stats"],
+    }
+    current_name = os.path.basename(current_path)
+
+    # 🔹 define these once here
+    mcts_config = MCTSConfig(
+        num_simulations=self.config.eval_num_simulations,
+        max_num_considered_actions=32,
+        dirichlet_alpha=0.3,
+        root_exploration_fraction=0.25,
+    )
+    max_moves = self.config.eval_max_moves
+    temperature = self.config.eval_temperature
+
+    print(f"  [eval] Batched evaluation for {current_name} vs {len(prev_paths)} recent checkpoints...")
+    seed_counter = 0
+
+    for opp_path in prev_paths:
+        opp_name = os.path.basename(opp_path)
+        with open(opp_path, "rb") as f:
+            opp_ckpt = pickle.load(f)
+        opp_params = {
+            "network_params": opp_ckpt["params"],
+            "batch_stats": opp_ckpt["batch_stats"],
         }
-        current_name = os.path.basename(current_path)
 
-        print(
-            f"  [eval] Batched evaluation for {current_name} "
-            f"vs {len(prev_paths)} recent checkpoints..."
-        )
+        score_current = 0.0
+        total_games = 0
+        wins_current = 0
+        losses_current = 0
+        draws_current = 0
 
-        for opp_path in prev_paths:
-            opp_name = os.path.basename(opp_path)
-            with open(opp_path, "rb") as f:
-                opp_ckpt = pickle.load(f)
-            opp_params = {
-                "network_params": opp_ckpt["params"],
-                "batch_stats": opp_ckpt["batch_stats"],
-            }
-
-            # Use a deterministic but separate RNG stream for eval
-            self.rng, eval_rng = jax.random.split(self.rng)
-
-            total_score_A, total_games = play_match_batched(
+        # current as P1, opponent as P2
+        for g in range(games_per_color):
+            seed_counter += 1
+            res = self._eval_play_one_game(
                 current_params,
                 opp_params,
-                eval_rng,
-                self.network,
-                self.env_config,
-                games_per_color=self.config.eval_games_per_color,
-                max_moves=self.config.eval_max_moves,
-                num_simulations=self.config.eval_num_simulations,
-                temperature=self.config.eval_temperature,
+                mcts_config,
+                max_moves,
+                temperature,
+                seed=1000 + seed_counter,
             )
+            # res from current's perspective
+            score_current += res
+            total_games += 1
+            if res > 0:
+                wins_current += 1
+            elif res < 0:
+                losses_current += 1
+            else:
+                draws_current += 1
 
-            # Bring small scalars back to host
-            score = float(total_score_A)
-            n_games = int(total_games)
-            avg_score = score / n_games if n_games > 0 else 0.0
-
-            print(
-                f"    [eval] {current_name} vs {opp_name}: "
-                f"{score:+.1f} over {n_games} games "
-                f"(avg {avg_score:+.3f})"
+        # opponent as P1, current as P2 (flip perspective)
+        for g in range(games_per_color):
+            seed_counter += 1
+            res_opp = self._eval_play_one_game(
+                opp_params,
+                current_params,
+                mcts_config,
+                max_moves,
+                temperature,
+                seed=2000 + seed_counter,
             )
+            res = -res_opp  # flip back to "current" perspective
+            score_current += res
+            total_games += 1
+            if res > 0:
+                wins_current += 1
+            elif res < 0:
+                losses_current += 1
+            else:
+                draws_current += 1
+
+        avg_score = score_current / total_games if total_games > 0 else 0.0
+        print(
+            f"    [eval] {current_name} vs {opp_name}: "
+            f"W-L-D = {wins_current}-{losses_current}-{draws_current} "
+            f"({score_current:+.1f} / {total_games}, avg {avg_score:+.3f})"
+        )
+
 
 
 
