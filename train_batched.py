@@ -612,23 +612,9 @@ class AlphaZeroTrainer:
         max_moves: int | None = None,
         temperature: float | None = None,
     ):
-        """
-        Run a round-robin tournament over checkpoints in checkpoint_dir,
-        using play_match_batched (which returns total_score_A and total_games).
-
-        Returns:
-            names:   list[str] of checkpoint filenames
-            scores:  (N, N) matrix, scores[i, j] = avg score for i vs j in [-1, 1]
-            games:   (N, N) matrix, games[i, j] = number of games in that pairing
-            ratings: (N,) array of Elo-like ratings
-        """
-        import glob
-        import os
-        import numpy as np
-        import pickle
+        import glob, os, pickle, numpy as np
         import jax
 
-        # Use eval settings by default
         if num_simulations is None:
             num_simulations = self.config.eval_num_simulations
         if max_moves is None:
@@ -651,7 +637,7 @@ class AlphaZeroTrainer:
         for name in names:
             print(f"  - {name}")
 
-        # Load all params once
+        # Load params
         params_list = []
         for path in ckpt_paths:
             with open(path, "rb") as f:
@@ -663,14 +649,18 @@ class AlphaZeroTrainer:
                 }
             )
 
-        # scores[i, j] = avg score per game for i vs j in [-1, 1]
-        scores = np.zeros((n, n), dtype=float)
+        scores = np.zeros((n, n), dtype=float)  # avg score in [-1, 1]
         games_mat = np.zeros((n, n), dtype=int)
+
+        # Optional W/D/L matrices if you care
+        W_mat = np.zeros((n, n), dtype=int)
+        D_mat = np.zeros((n, n), dtype=int)
+        L_mat = np.zeros((n, n), dtype=int)
 
         total_pairs = n * (n - 1) // 2
         pair_idx = 0
 
-        rng = self.rng  # reuse trainer RNG
+        rng = self.rng
 
         for i in range(n):
             for j in range(i + 1, n):
@@ -680,10 +670,9 @@ class AlphaZeroTrainer:
                 params_i = params_list[i]
                 params_j = params_list[j]
 
-                # Each call plays 2 * games_per_color games internally
                 rng, match_rng = jax.random.split(rng)
 
-                total_score_A, total_games = play_match_batched(
+                total_score_A, total_games, wins_A, draws, wins_B = play_match_batched(
                     params_A=params_i,
                     params_B=params_j,
                     rng=match_rng,
@@ -697,44 +686,53 @@ class AlphaZeroTrainer:
 
                 total_score_A = float(total_score_A)
                 total_games = int(total_games)
-                avg_score_A = total_score_A / total_games  # [-1, 1]
+                wins_A = int(wins_A)
+                wins_B = int(wins_B)
+                draws = int(draws)
+
+                assert wins_A + wins_B + draws == total_games, "W+D+L != total_games"
+
+                avg_score_A = total_score_A / total_games if total_games > 0 else 0.0
 
                 scores[i, j] = avg_score_A
-                scores[j, i] = -avg_score_A  # symmetric
+                scores[j, i] = -avg_score_A
                 games_mat[i, j] = games_mat[j, i] = total_games
+
+                W_mat[i, j] = wins_A
+                L_mat[i, j] = wins_B
+                D_mat[i, j] = draws
+
+                # Mirror W/L from j's perspective
+                W_mat[j, i] = wins_B
+                L_mat[j, i] = wins_A
+                D_mat[j, i] = draws
 
                 print(
                     f"  [round-robin] {names[i]} vs {names[j]}: "
-                    f"score={total_score_A:+.1f} over {total_games} games "
-                    f"(avg {avg_score_A:+.3f})"
+                    f"W-D-L = {wins_A}-{draws}-{wins_B} "
+                    f"(score={total_score_A:+.1f} over {total_games} games, avg {avg_score_A:+.3f})"
                 )
 
-        # Store updated RNG back into trainer
         self.rng = rng
 
-        # --- Simple Elo-style ratings from score matrix ---
-
+        # --- Simple Elo-ish rating based on average scores ---
         ratings = np.zeros(n, dtype=float)
         K = 16.0
 
         def expected_score(r_i, r_j):
             return 1.0 / (1.0 + 10.0 ** ((r_j - r_i) / 400.0))
 
-        # Our avg_score in [-1, 1]; convert to [0, 1] like win/draw/loss score:
-        #   -1 -> 0.0, 0 -> 0.5, +1 -> 1.0
         for i in range(n):
             for j in range(n):
-                if i == j:
+                if i == j or games_mat[i, j] == 0:
                     continue
-                if games_mat[i, j] == 0:
-                    continue
-
-                avg_score = scores[i, j]  # [-1, 1]
-                s_01 = 0.5 * (avg_score + 1.0)  # [0, 1]
+                # Convert avg score in [-1,1] to [0,1]
+                s_01 = 0.5 * (scores[i, j] + 1.0)
                 e_01 = expected_score(ratings[i], ratings[j])
                 ratings[i] += K * (s_01 - e_01)
 
-        return names, scores, games_mat, ratings
+        return names, scores, games_mat, ratings, (W_mat, D_mat, L_mat)
+
 
 
 

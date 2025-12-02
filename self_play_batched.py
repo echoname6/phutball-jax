@@ -489,6 +489,7 @@ def play_games_batched(
         actions=all_actions,
     )
 
+
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def play_match_batched(
     params_A: dict,
@@ -504,7 +505,7 @@ def play_match_batched(
     """
     Batched match between two checkpoints A and B.
 
-    We launch 2 * games_per_color games:
+    Launches 2 * games_per_color games:
 
       - games [0 .. g-1]:   A is Player 1, B is Player 2
       - games [g .. 2g-1]:  B is Player 1, A is Player 2
@@ -512,8 +513,11 @@ def play_match_batched(
     All games are stepped in parallel using a JAX while_loop.
 
     Returns:
-        total_score_A: sum of scores (+1 win, -1 loss, 0 draw/cutoff) from A's POV
-        total_games:   number of games played (= 2 * games_per_color)
+        total_score_A : sum of (+1 win, -1 loss, 0 draw) from A’s POV
+        total_games   : total games played (= 2 * games_per_color)
+        wins_A        : number of games A wins
+        draws         : number of draws / cutoffs
+        wins_B        : number of games B wins
     """
     batch_size = 2 * games_per_color
 
@@ -533,7 +537,7 @@ def play_match_batched(
 
     def cond_fn(carry):
         states, terminated, rng, step_idx = carry
-        any_active = jnp.any(~terminated)          # bool scalar (traced)
+        any_active = jnp.any(~terminated)
         return jnp.logical_and(step_idx < max_moves, any_active)
 
     def body_fn(carry):
@@ -595,21 +599,32 @@ def play_match_batched(
 
     winners = final_states.winner  # (batch,) in {0,1,2}
     idx = jnp.arange(batch_size)
-    A_is_P1 = idx < games_per_color
+    A_is_P1 = idx < games_per_color  # same convention as before
 
-    # From env: winner==1 ⇒ P1 won, winner==2 ⇒ P2 won, 0 ⇒ draw/cutoff
-    win1 = (winners == 1).astype(jnp.float32)
-    win2 = (winners == 2).astype(jnp.float32)
+    # winner==1 => P1; winner==2 => P2; winner==0 => draw/cutoff
+    win1 = winners == 1
+    win2 = winners == 2
+    draw_mask = winners == 0
 
-    # Score if A is P1: +1 if P1 wins, -1 if P2 wins
-    score_if_P1 = win1 - win2
-    # Score if A is P2: +1 if P2 wins, -1 if P1 wins
-    score_if_P2 = win2 - win1
+    # A wins if:
+    #   - A is P1 and P1 wins, OR
+    #   - A is P2 and P2 wins
+    A_win_mask = (win1 & A_is_P1) | (win2 & ~A_is_P1)
+    # B wins if:
+    #   - A is P1 and P2 wins, OR
+    #   - A is P2 and P1 wins
+    B_win_mask = (win2 & A_is_P1) | (win1 & ~A_is_P1)
 
-    per_game_score = jnp.where(A_is_P1, score_if_P1, score_if_P2)
+    wins_A = jnp.sum(A_win_mask).astype(jnp.int32)
+    wins_B = jnp.sum(B_win_mask).astype(jnp.int32)
+    draws = jnp.sum(draw_mask).astype(jnp.int32)
+
+    # Per-game score from A’s POV: +1 win, -1 loss, 0 draw
+    per_game_score = jnp.where(A_win_mask, 1.0,
+                               jnp.where(B_win_mask, -1.0, 0.0))
     total_score_A = jnp.sum(per_game_score)
 
-    return total_score_A, jnp.int32(batch_size)
+    return total_score_A, jnp.int32(batch_size), wins_A, draws, wins_B
 
 def trajectory_to_training_examples(
     trajectory: TrajectoryData,
