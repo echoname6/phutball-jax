@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass, asdict
 from typing import Optional
 import pickle
+from mcts import MCTSConfig
+import glob
 
 from phutball_env_jax import EnvConfig, reset, step, get_legal_actions
 from network import (
@@ -426,12 +428,61 @@ class AlphaZeroTrainer:
 
                 wandb.log(log_data, step=global_step)
 
-        
         # Final checkpoint
         self.save_checkpoint()
         print("Training complete!")
         print(f"Total games: {self.total_games}")
         print(f"Total examples: {self.total_examples}")
+
+
+    def _eval_play_one_game(
+        self,
+        params_p1,
+        params_p2,
+        mcts_config,
+        max_moves: int,
+        temperature: float,
+        seed: int,
+    ) -> float:
+        """
+        Single evaluation game between params_p1 (player 1) and params_p2 (player 2).
+
+        Returns:
+            +1.0 if player 1 wins
+            -1.0 if player 1 loses
+             0.0 on draw / max-move cutoff
+        """
+        from mcts import select_action
+
+        rng = jax.random.PRNGKey(seed)
+        state = reset(self.env_config)
+        move = 0
+
+        while (not bool(state.terminated)) and (move < max_moves):
+            current_player = int(state.current_player)
+            agent_params = params_p1 if current_player == 1 else params_p2
+
+            rng, mcts_rng = jax.random.split(rng)
+            action, _, _ = select_action(
+                agent_params,
+                mcts_rng,
+                state,
+                self.network,
+                self.env_config,
+                mcts_config,
+                temperature=temperature,
+            )
+            state = step(state, jnp.array(action, dtype=jnp.int32), self.env_config)
+            move += 1
+
+        winner = int(state.winner)
+        if winner == 0 or move >= max_moves:
+            return 0.0
+        elif winner == 1:
+            return 1.0
+        else:
+            return -1.0
+
 
     def evaluate_current_checkpoint_vs_recent(self):
         """
@@ -553,6 +604,159 @@ class AlphaZeroTrainer:
                 f"({score_current:+.1f} / {total_games}, avg {avg_score:+.3f})"
             )
 
+    def run_round_robin(
+        self,
+        games_per_color: int = 5,
+        max_checkpoints: Optional[int] = None,
+        num_simulations: Optional[int] = None,
+        max_moves: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ):
+        """
+        Run a round-robin tournament between multiple checkpoints.
+
+        For each pair (i, j), we play:
+          - games_per_color games with i as P1, j as P2
+          - games_per_color games with j as P1, i as P2
+        So 2 * games_per_color games per pair.
+
+        Returns:
+          names: List[str] of checkpoint names
+          W, D, L: (N, N) integer matrices (from row's perspective)
+          ratings: np.ndarray of Elo ratings
+        """
+        ckpt_dir = self.config.checkpoint_dir
+        pattern = os.path.join(ckpt_dir, "checkpoint_*.pkl")
+        ckpt_paths = sorted(glob.glob(pattern))
+
+        if len(ckpt_paths) < 2:
+            print("Not enough checkpoints for round robin.")
+            return [], None, None, None
+
+        # Optionally restrict to most recent N checkpoints
+        if max_checkpoints is not None and max_checkpoints < len(ckpt_paths):
+            ckpt_paths = ckpt_paths[-max_checkpoints:]
+
+        n = len(ckpt_paths)
+        print(f"[round-robin] Using {n} checkpoints:")
+        for p in ckpt_paths:
+            print("  -", os.path.basename(p))
+
+        # Load all checkpoints into memory
+        checkpoints = []
+        for path in ckpt_paths:
+            with open(path, "rb") as f:
+                ckpt = pickle.load(f)
+            params = {
+                "network_params": ckpt["params"],
+                "batch_stats": ckpt["batch_stats"],
+            }
+            checkpoints.append((os.path.basename(path), params))
+
+        names = [name for (name, _) in checkpoints]
+
+        # Result matrices: from row i vs column j perspective
+        W = np.zeros((n, n), dtype=np.int32)
+        D = np.zeros((n, n), dtype=np.int32)
+        L = np.zeros((n, n), dtype=np.int32)
+
+        # Eval config
+        sims = num_simulations or self.config.eval_num_simulations
+        mv   = max_moves or self.config.eval_max_moves
+        temp = self.config.eval_temperature if temperature is None else temperature
+
+        mcts_config = MCTSConfig(
+            num_simulations=sims,
+            max_num_considered_actions=32,
+            dirichlet_alpha=0.0,        # no exploration noise during eval
+            root_exploration_fraction=0.0,
+        )
+
+        total_pairs = n * (n - 1) // 2
+        pair_idx = 0
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                name_i, params_i = checkpoints[i]
+                name_j, params_j = checkpoints[j]
+
+                pair_idx += 1
+                print(
+                    f"[round-robin] Pair {pair_idx}/{total_pairs}: "
+                    f"{name_i} vs {name_j}"
+                )
+
+                # i as P1, j as P2
+                results_ij = play_match_batched(
+                    params_p1=params_i,
+                    params_p2=params_j,
+                    network=self.network,
+                    env_config=self.env_config,
+                    mcts_config=mcts_config,
+                    num_games=games_per_color,
+                    max_moves=mv,
+                    temperature=temp,
+                    seed=1000 + pair_idx * 10,
+                )
+                results_ij = np.array(results_ij)  # shape (games_per_color,)
+
+                # j as P1, i as P2  → later flip perspective back to "i"
+                results_ji = play_match_batched(
+                    params_p1=params_j,
+                    params_p2=params_i,
+                    network=self.network,
+                    env_config=self.env_config,
+                    mcts_config=mcts_config,
+                    num_games=games_per_color,
+                    max_moves=mv,
+                    temperature=temp,
+                    seed=2000 + pair_idx * 10,
+                )
+                results_ji = np.array(results_ji)
+
+                # From i's perspective, the second batch is negated
+                all_results = np.concatenate([results_ij, -results_ji])
+
+                wins_i = int(np.sum(all_results > 0))
+                draws  = int(np.sum(all_results == 0))
+                loss_i = int(np.sum(all_results < 0))
+                n_games = wins_i + draws + loss_i
+
+                print(
+                    f"    [pair] {name_i} vs {name_j}: "
+                    f"{wins_i}-{loss_i}-{draws} (W-L-D) over {n_games} games"
+                )
+
+                # Fill matrices from i's perspective
+                W[i, j] = wins_i
+                D[i, j] = draws
+                L[i, j] = loss_i
+
+                # From j's perspective it's symmetric
+                W[j, i] = loss_i
+                D[j, i] = draws
+                L[j, i] = wins_i
+
+        # Now compute Elo
+        ratings = compute_elo_from_results(names, W, D, L)
+
+        print("\n[round-robin] Final Elo ranking:")
+        order = np.argsort(-ratings)
+        for rank, idx in enumerate(order, start=1):
+            total_wins  = int(W[idx].sum())
+            total_draws = int(D[idx].sum())
+            total_loss  = int(L[idx].sum())
+            total_games = total_wins + total_draws + total_loss
+            score = total_wins + 0.5 * total_draws
+            pct = 100.0 * score / max(1, total_games)
+            print(
+                f"  #{rank:2d}  {names[idx]:>20s}  "
+                f"Elo={ratings[idx]:7.1f}  "
+                f"Record={total_wins}-{total_loss}-{total_draws}  "
+                f"Score={score:.1f}/{total_games} ({pct:.1f}%)"
+            )
+
+        return names, W, D, L, ratings
 
 
 
@@ -602,6 +806,8 @@ def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
     win_rate = wins / num_games
     print(f"Evaluation vs Random: {wins}/{num_games} wins ({win_rate*100:.1f}%)")
     return win_rate
+
+
 
 
 # ============================================================================
