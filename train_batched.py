@@ -434,73 +434,25 @@ class AlphaZeroTrainer:
         print(f"Total games: {self.total_games}")
         print(f"Total examples: {self.total_examples}")
 
-
-    def _eval_play_one_game(
-        self,
-        params_p1,
-        params_p2,
-        mcts_config,
-        max_moves: int,
-        temperature: float,
-        seed: int,
-    ) -> float:
-        """
-        Single evaluation game between params_p1 (player 1) and params_p2 (player 2).
-
-        Returns:
-            +1.0 if player 1 wins
-            -1.0 if player 1 loses
-             0.0 on draw / max-move cutoff
-        """
-        from mcts import select_action
-
-        rng = jax.random.PRNGKey(seed)
-        state = reset(self.env_config)
-        move = 0
-
-        while (not bool(state.terminated)) and (move < max_moves):
-            current_player = int(state.current_player)
-            agent_params = params_p1 if current_player == 1 else params_p2
-
-            rng, mcts_rng = jax.random.split(rng)
-            action, _, _ = select_action(
-                agent_params,
-                mcts_rng,
-                state,
-                self.network,
-                self.env_config,
-                mcts_config,
-                temperature=temperature,
-            )
-            state = step(state, jnp.array(action, dtype=jnp.int32), self.env_config)
-            move += 1
-
-        winner = int(state.winner)
-        if winner == 0 or move >= max_moves:
-            return 0.0
-        elif winner == 1:
-            return 1.0
-        else:
-            return -1.0
-
-
+    
     def evaluate_current_checkpoint_vs_recent(self):
         """
         After saving the *current* checkpoint, pit it against up to the
-        last K previous checkpoints.
+        last K previous checkpoints using the batched evaluator.
 
         For each opponent:
-          - play eval_games_per_color games with current as P1
-          - play eval_games_per_color games with current as P2
+        - games_per_color with current as P1 (home=P1, away=P2)
+        - games_per_color with current as P2 (home=P2, away=P1)
 
-        So at most:
-          K opponents * 2 * eval_games_per_color games.
+        All 2 * games_per_color games vs that opponent are played in a
+        single batched call to play_match_batched.
         """
         if not self.config.eval_enable:
             return
 
-        import glob
-        from mcts import MCTSConfig
+        import glob, os, pickle
+        import jax
+        import numpy as np
 
         max_prev = self.config.eval_max_prev_checkpoints
         games_per_color = self.config.eval_games_per_color
@@ -527,18 +479,14 @@ class AlphaZeroTrainer:
         }
         current_name = os.path.basename(current_path)
 
-        # 🔹 define these once here
-        mcts_config = MCTSConfig(
-            num_simulations=self.config.eval_num_simulations,
-            max_num_considered_actions=32,
-            dirichlet_alpha=0.3,
-            root_exploration_fraction=0.25,
-        )
+        # Eval hyperparams from config
+        num_simulations = self.config.eval_num_simulations
         max_moves = self.config.eval_max_moves
         temperature = self.config.eval_temperature
 
         print(f"  [eval] Batched evaluation for {current_name} vs {len(prev_paths)} recent checkpoints...")
-        seed_counter = 0
+
+        rng = self.rng  # thread rng through
 
         for opp_path in prev_paths:
             opp_name = os.path.basename(opp_path)
@@ -549,60 +497,80 @@ class AlphaZeroTrainer:
                 "batch_stats": opp_ckpt["batch_stats"],
             }
 
-            score_current = 0.0
-            total_games = 0
-            wins_current = 0
-            losses_current = 0
-            draws_current = 0
+            rng, match_rng = jax.random.split(rng)
 
-            # current as P1, opponent as P2
-            for g in range(games_per_color):
-                seed_counter += 1
-                res = self._eval_play_one_game(
-                    current_params,
-                    opp_params,
-                    mcts_config,
-                    max_moves,
-                    temperature,
-                    seed=1000 + seed_counter,
-                )
-                # res from current's perspective
-                score_current += res
-                total_games += 1
-                if res > 0:
-                    wins_current += 1
-                elif res < 0:
-                    losses_current += 1
-                else:
-                    draws_current += 1
-
-            # opponent as P1, current as P2 (flip perspective)
-            for g in range(games_per_color):
-                seed_counter += 1
-                res_opp = self._eval_play_one_game(
-                    opp_params,
-                    current_params,
-                    mcts_config,
-                    max_moves,
-                    temperature,
-                    seed=2000 + seed_counter,
-                )
-                res = -res_opp  # flip back to "current" perspective
-                score_current += res
-                total_games += 1
-                if res > 0:
-                    wins_current += 1
-                elif res < 0:
-                    losses_current += 1
-                else:
-                    draws_current += 1
-
-            avg_score = score_current / total_games if total_games > 0 else 0.0
-            print(
-                f"    [eval] {current_name} vs {opp_name}: "
-                f"W-L-D = {wins_current}-{losses_current}-{draws_current} "
-                f"({score_current:+.1f} / {total_games}, avg {avg_score:+.3f})"
+            (
+                total_score_home,
+                total_games,
+                wins_home,
+                draws,
+                wins_away,
+                per_game_turns,
+                per_game_jumps_p1,
+                per_game_jumps_p2,
+                per_game_jumps_total,
+                per_game_removed,
+                winners,
+                home_is_P1,
+            ) = play_match_batched(
+                params_A=current_params,   # treat A as "home"
+                params_B=opp_params,       # treat B as "away"
+                rng=match_rng,
+                network=self.network,
+                env_config=self.env_config,
+                games_per_color=games_per_color,
+                max_moves=max_moves,
+                num_simulations=num_simulations,
+                temperature=temperature,
             )
+
+            # ---- convert to numpy / python ----
+            total_score_home = float(total_score_home)
+            total_games = int(total_games)
+            wins_home = int(wins_home)
+            wins_away = int(wins_away)
+            draws = int(draws)
+
+            per_game_turns = np.asarray(per_game_turns, dtype=np.int32)
+            per_game_jumps_p1 = np.asarray(per_game_jumps_p1, dtype=np.int32)
+            per_game_jumps_p2 = np.asarray(per_game_jumps_p2, dtype=np.int32)
+            per_game_jumps_total = np.asarray(per_game_jumps_total, dtype=np.int32)
+            per_game_removed = np.asarray(per_game_removed, dtype=np.int32)
+            home_is_P1 = np.asarray(home_is_P1, dtype=bool)
+
+            assert total_games == len(per_game_turns)
+
+            # Map P1/P2 jump counts to home/away
+            jumps_home = np.where(home_is_P1, per_game_jumps_p1, per_game_jumps_p2)
+            jumps_away = per_game_jumps_p1 + per_game_jumps_p2 - jumps_home
+
+            avg_score_home = total_score_home / total_games if total_games > 0 else 0.0
+            avg_turns = float(per_game_turns.mean())
+            avg_jumps_home = float(jumps_home.mean())
+            avg_jumps_away = float(jumps_away.mean())
+
+            # Average jump length across all jumps in these games
+            jump_mask = per_game_jumps_total > 0
+            if jump_mask.any():
+                total_removed = int(per_game_removed[jump_mask].sum())
+                total_jumps = int(per_game_jumps_total[jump_mask].sum())
+                avg_jump_len = total_removed / total_jumps
+            else:
+                avg_jump_len = 0.0
+
+            # ---- prints ----
+            print(
+                f"    [eval] {current_name} (home) vs {opp_name} (away): "
+                f"W-D-L = {wins_home}-{draws}-{wins_away} "
+                f"({total_score_home:+.1f} / {total_games}, avg {avg_score_home:+.3f})"
+            )
+            print(
+                f"      turns/game={avg_turns:.1f}, "
+                f"jumps/game home={avg_jumps_home:.2f}, away={avg_jumps_away:.2f}, "
+                f"avg_jump_len={avg_jump_len:.2f}"
+            )
+
+        self.rng = rng
 
     def run_round_robin(
         self,
@@ -662,31 +630,30 @@ class AlphaZeroTrainer:
 
         rng = self.rng
 
-        
         for i in range(n):
             for j in range(i + 1, n):
                 pair_idx += 1
-                print(f"[round-robin] Pair {pair_idx}/{total_pairs}: {names[i]} vs {names[j]}")
+                print(f"[round-robin] Pair {pair_idx}/{total_pairs}: {names[i]} (home) vs {names[j]} (away)")
 
-                params_i = params_list[i]
-                params_j = params_list[j]
+                home_params = params_list[i]
+                away_params = params_list[j]
 
                 rng, match_rng = jax.random.split(rng)
 
-                (total_score_A,
+                (total_score_home,
                 total_games,
-                wins_A,
+                home_wins,
                 draws,
-                wins_B,
+                away_wins,
                 per_game_turns,
                 per_game_jumps_p1,
                 per_game_jumps_p2,
                 per_game_jumps_total,
                 per_game_removed,
                 winners,
-                A_is_P1) = play_match_batched(
-                    params_A=params_i,
-                    params_B=params_j,
+                home_is_P1) = play_match_batched(
+                    home_params=home_params,
+                    away_params=away_params,
                     rng=match_rng,
                     network=self.network,
                     env_config=self.env_config,
@@ -696,11 +663,11 @@ class AlphaZeroTrainer:
                     temperature=temperature,
                 )
 
-                # Convert from JAX arrays to numpy / python
-                total_score_A = float(total_score_A)
+                # --- Convert to numpy / python ---
+                total_score_home = float(total_score_home)
                 total_games = int(total_games)
-                wins_A = int(wins_A)
-                wins_B = int(wins_B)
+                home_wins = int(home_wins)
+                away_wins = int(away_wins)
                 draws = int(draws)
 
                 per_game_turns = np.array(per_game_turns, dtype=np.int32)
@@ -709,24 +676,23 @@ class AlphaZeroTrainer:
                 per_game_jumps_total = np.array(per_game_jumps_total, dtype=np.int32)
                 per_game_removed = np.array(per_game_removed, dtype=np.int32)
                 winners = np.array(winners, dtype=np.int32)
-                A_is_P1 = np.array(A_is_P1, dtype=bool)
+                home_is_P1 = np.array(home_is_P1, dtype=bool)
 
                 assert total_games == len(per_game_turns)
 
-                # Map jumps to "A" and "B" for each game
-                jumps_A = np.where(A_is_P1, per_game_jumps_p1, per_game_jumps_p2)
-                jumps_B = per_game_jumps_p1 + per_game_jumps_p2 - jumps_A
+                # Map jumps to "home" and "away" for each game
+                jumps_home = np.where(home_is_P1, per_game_jumps_p1, per_game_jumps_p2)
+                jumps_away = per_game_jumps_p1 + per_game_jumps_p2 - jumps_home
 
-                # Aggregate stats across these games
-                avg_score_A = total_score_A / total_games if total_games > 0 else 0.0
+                # Aggregate stats
+                avg_score_home = total_score_home / total_games if total_games > 0 else 0.0
                 avg_turns = float(per_game_turns.mean())
 
-                total_jumps_A = jumps_A.sum()
-                total_jumps_B = jumps_B.sum()
-                avg_jumps_A = total_jumps_A / total_games
-                avg_jumps_B = total_jumps_B / total_games
+                total_jumps_home = jumps_home.sum()
+                total_jumps_away = jumps_away.sum()
+                avg_jumps_home = total_jumps_home / total_games
+                avg_jumps_away = total_jumps_away / total_games
 
-                # Average jump length across all jumps (both players)
                 jump_mask = per_game_jumps_total > 0
                 if jump_mask.any():
                     total_removed = per_game_removed[jump_mask].sum()
@@ -735,26 +701,27 @@ class AlphaZeroTrainer:
                 else:
                     avg_jump_len = 0.0
 
-                # Store results in matrices as before (if you're doing Elo etc.)
-                scores[i, j] = avg_score_A
-                scores[j, i] = -avg_score_A
+                # Store results from HOME's POV
+                scores[i, j] = avg_score_home
+                scores[j, i] = -avg_score_home
                 games_mat[i, j] = games_mat[j, i] = total_games
 
-                W_mat[i, j] = wins_A
-                L_mat[i, j] = wins_B
+                W_mat[i, j] = home_wins
+                L_mat[i, j] = away_wins
                 D_mat[i, j] = draws
-                W_mat[j, i] = wins_B
-                L_mat[j, i] = wins_A
+                W_mat[j, i] = away_wins
+                L_mat[j, i] = home_wins
                 D_mat[j, i] = draws
 
                 print(
-                    f"  [round-robin] {names[i]} vs {names[j]}: "
-                    f"W-D-L = {wins_A}-{draws}-{wins_B} "
-                    f"(score={total_score_A:+.1f} over {total_games} games, avg {avg_score_A:+.3f})"
+                    f"  [round-robin] {names[i]} (home) vs {names[j]} (away): "
+                    f"home W-D-L = {home_wins}-{draws}-{away_wins} "
+                    f"(score={total_score_home:+.1f} over {total_games} games, "
+                    f"avg {avg_score_home:+.3f})"
                 )
                 print(
                     f"    turns/game={avg_turns:.1f}, "
-                    f"jumps/game A={avg_jumps_A:.2f}, B={avg_jumps_B:.2f}, "
+                    f"jumps/game home={avg_jumps_home:.2f}, away={avg_jumps_away:.2f}, "
                     f"avg_jump_len={avg_jump_len:.2f}"
                 )
 
@@ -763,13 +730,15 @@ class AlphaZeroTrainer:
                     if winners[g] == 0:
                         outcome = "draw"
                     else:
-                        A_won = (
-                            (winners[g] == 1 and A_is_P1[g]) or
-                            (winners[g] == 2 and not A_is_P1[g])
+                        # Did home win this game?
+                        home_won = (
+                            (winners[g] == 1 and home_is_P1[g]) or
+                            (winners[g] == 2 and not home_is_P1[g])
                         )
-                        outcome = "A win" if A_won else "B win"
+                        outcome = "home win" if home_won else "away win"
 
-                    role_str = "A=P1,B=P2" if A_is_P1[g] else "A=P2,B=P1"
+                    # How does P1/P2 map to home/away?
+                    role_str = "P1=home,P2=away" if home_is_P1[g] else "P1=away,P2=home"
 
                     if per_game_jumps_total[g] > 0:
                         game_avg_jump_len = per_game_removed[g] / per_game_jumps_total[g]
@@ -779,12 +748,13 @@ class AlphaZeroTrainer:
                     print(
                         f"      game {g:2d}: {role_str}, "
                         f"turns={per_game_turns[g]}, "
-                        f"jumps_A={int(jumps_A[g])}, jumps_B={int(jumps_B[g])}, "
+                        f"jumps_home={int(jumps_home[g])}, jumps_away={int(jumps_away[g])}, "
                         f"avg_jump_len={game_avg_jump_len:.2f}, "
                         f"result={outcome}"
                     )
 
         self.rng = rng
+
 
         # --- Simple Elo-ish rating based on average scores ---
         ratings = np.zeros(n, dtype=float)

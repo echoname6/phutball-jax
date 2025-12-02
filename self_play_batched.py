@@ -493,8 +493,8 @@ def play_games_batched(
 
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def play_match_batched(
-    params_A: dict,
-    params_B: dict,
+    home_params: dict,
+    away_params: dict,
     rng: jnp.ndarray,
     network: PhutballNetwork,
     env_config: EnvConfig,
@@ -504,117 +504,110 @@ def play_match_batched(
     temperature: float = 0.0,
 ):
     """
-    Batched match between two checkpoints A and B.
+    Batched match between two checkpoints: `home` vs `away`.
 
-    Launches 2 * games_per_color games:
+    We launch 2 * games_per_color games:
 
-      - games [0 .. g-1]:   A is Player 1, B is Player 2
-      - games [g .. 2g-1]:  B is Player 1, A is Player 2
+      - games [0 .. g-1]:   home plays as P1, away as P2
+      - games [g .. 2g-1]:  away plays as P1, home as P2
 
     All games are stepped in parallel using a JAX while_loop.
 
-    Returns:
-        total_score_A        : sum of scores (+1 win, -1 loss, 0 draw) from A's POV
-        total_games          : number of games played (= 2 * games_per_color)
-        wins_A, draws, wins_B
-        per_game_turns       : int32[batch]  (env.num_turns)
-        per_game_jumps_p1    : int32[batch]  (# jumps made by Player 1)
-        per_game_jumps_p2    : int32[batch]  (# jumps made by Player 2)
-        per_game_jumps_total : int32[batch]  (# jumps total)
-        per_game_removed     : int32[batch]  (total men removed by jumps)
-        winners              : int32[batch]  (0/1/2 from env)
-        A_is_P1              : bool[batch]   (True if game started with A as P1)
+    Returns (all JAX arrays):
+
+        total_score_home: sum of scores (+1 win, -1 loss, 0 draw) from *home* POV
+        total_games:      number of games played (= 2 * games_per_color)
+        home_wins, draws, away_wins: counts
+        per_game_turns:         num_turns from env
+        per_game_jumps_p1/p2:   jump counts by env P1/P2
+        per_game_jumps_total:   total jumps (P1+P2)
+        per_game_removed:       total men removed by jumps
+        winners:                {0=draw, 1=P1 win, 2=P2 win}
+        home_is_P1:             bool per game, True if home was P1 in that game
     """
+    rows, cols = env_config.rows, env_config.cols
+    total_positions = rows * cols
+
     batch_size = 2 * games_per_color
 
-    rows = env_config.rows
-    cols = env_config.cols
-    total_positions = rows * cols
-    MAN = jnp.int32(1)
-
-    # Which agent is P1/P2 in each game? (True = A, False = B)
-    agent_p1_is_A = jnp.concatenate(
+    # Which agent is P1/P2 in each game? (True = home, False = away)
+    home_is_P1 = jnp.concatenate(
         [
-            jnp.ones((games_per_color,), dtype=jnp.bool_),   # first block: A as P1
-            jnp.zeros((games_per_color,), dtype=jnp.bool_),  # second block: B as P1
+            jnp.ones((games_per_color,), dtype=jnp.bool_),   # first block: home is P1
+            jnp.zeros((games_per_color,), dtype=jnp.bool_),  # second block: away is P1
         ],
         axis=0,
     )
-    agent_p2_is_A = ~agent_p1_is_A  # opposite mapping
+    home_is_P2 = ~home_is_P1  # complement
 
     # Initial batched env state
     states = batched_reset(env_config, batch_size)
     terminated = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
-    # Per-game stats we want to accumulate
+    # Stats we accumulate per game
     jumps_p1 = jnp.zeros((batch_size,), dtype=jnp.int32)
     jumps_p2 = jnp.zeros((batch_size,), dtype=jnp.int32)
     jumps_total = jnp.zeros((batch_size,), dtype=jnp.int32)
     jump_removed_total = jnp.zeros((batch_size,), dtype=jnp.int32)
 
+    step0 = jnp.int32(0)
+
     def cond_fn(carry):
         (states, terminated, rng, step_idx,
-        jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
+         jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
         any_active = jnp.any(~terminated)
         return jnp.logical_and(step_idx < max_moves, any_active)
 
-
     def body_fn(carry):
-        (
-            states,
-            terminated,
-            rng,
-            step_idx,
-            jumps_p1,
-            jumps_p2,
-            jumps_total,
-            jump_removed_total,
-        ) = carry
+        (states, terminated, rng, step_idx,
+         jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
 
         current_player = states.current_player  # (batch,)
 
-        # For each game, decide whether A is to move
-        use_A = jnp.where(
+        # For each game, decide whether *home* is to move
+        use_home = jnp.where(
             current_player == 1,
-            agent_p1_is_A,   # if P1 to move, use mapping for P1
-            agent_p2_is_A,   # if P2 to move, use mapping for P2
+            home_is_P1,   # if P1 to move, this tells us if home is P1
+            home_is_P2,   # if P2 to move, this tells us if home is P2
         )
 
-        rng, rngA, rngB = jax.random.split(rng, 3)
+        rng, rng_home, rng_away = jax.random.split(rng, 3)
 
-        # Run MCTS for ALL games with A and ALL games with B,
-        # then select per-game outputs based on use_A.
-        actions_A, _, _ = batched_mcts_policy(
-            params_A,
+        # Run MCTS for ALL games with home, and ALL games with away,
+        # then select per-game outputs based on use_home.
+        actions_home, _, _ = batched_mcts_policy(
+            home_params,
             states,
-            rngA,
+            rng_home,
             network,
             env_config,
             num_simulations=num_simulations,
             temperature=temperature,
         )
-        actions_B, _, _ = batched_mcts_policy(
-            params_B,
+        actions_away, _, _ = batched_mcts_policy(
+            away_params,
             states,
-            rngB,
+            rng_away,
             network,
             env_config,
             num_simulations=num_simulations,
             temperature=temperature,
         )
 
-        actions = jnp.where(use_A, actions_A, actions_B)  # (batch,)
+        actions = jnp.where(use_home, actions_home, actions_away)  # (batch,)
 
-        # --- stats: jumps & pieces removed ---
+        # Step all envs in parallel
         board_before = states.board                    # (batch, R, C)
         new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
         board_after = new_states_raw.board             # (batch, R, C)
 
         active = ~terminated
+
+        # Action encoding: [0..N-1] placements, [N..2N-1] jumps, others = halt, etc.
         is_jump = (actions >= total_positions) & (actions < 2 * total_positions)
         jump_mask = is_jump & active
 
-        # Count jumps by player
+        # Count jumps by env player
         p1_mask = (current_player == 1) & jump_mask
         p2_mask = (current_player == 2) & jump_mask
 
@@ -622,34 +615,29 @@ def play_match_batched(
         jumps_p2 = jumps_p2 + p2_mask.astype(jnp.int32)
         jumps_total = jumps_total + jump_mask.astype(jnp.int32)
 
-        # Compute men removed by jump
+        # Men removed by a jump (only when a jump actually occurred)
         men_before = jnp.sum((board_before == MAN).astype(jnp.int32), axis=(1, 2))
         men_after = jnp.sum((board_after == MAN).astype(jnp.int32), axis=(1, 2))
         removed_step = jnp.maximum(men_before - men_after, 0)
         removed_step = removed_step * jump_mask.astype(jnp.int32)
         jump_removed_total = jump_removed_total + removed_step
 
-        # Games that are done after this step
-        new_terminated = terminated | new_states_raw.terminated
-
-        # For most fields, we only update games that were NOT terminated
-        # at the *start* of this step.
-        use_new = ~terminated  # True for games that were alive when we stepped
+        # Once a game is terminated, freeze it
+        done_mask = terminated | new_states_raw.terminated
 
         new_states = PhutballState(
-            board=jnp.where(use_new[:, None, None], new_states_raw.board, states.board),
-            ball_pos=jnp.where(use_new[:, None], new_states_raw.ball_pos, states.ball_pos),
-            current_player=jnp.where(use_new, new_states_raw.current_player, states.current_player),
-            is_jumping=jnp.where(use_new, new_states_raw.is_jumping, states.is_jumping),
-            terminated=new_terminated,
-            # IMPORTANT: keep old winner only for games that were already done
-            winner=jnp.where(terminated, states.winner, new_states_raw.winner),
-            num_turns=jnp.where(use_new, new_states_raw.num_turns, states.num_turns),
+            board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
+            ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
+            current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
+            is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
+            terminated=done_mask,
+            winner=jnp.where(done_mask, states.winner, new_states_raw.winner),
+            num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
         )
 
         return (
             new_states,
-            new_terminated,
+            done_mask,
             rng,
             step_idx + jnp.int32(1),
             jumps_p1,
@@ -657,64 +645,58 @@ def play_match_batched(
             jumps_total,
             jump_removed_total,
         )
-    
-    init_carry = (
-        states,
-        terminated,
-        rng,
-        jnp.int32(0),
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p1
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p2
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_total
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jump_removed_total
-    )
+
+    init_carry = (states, terminated, rng, step0,
+                  jumps_p1, jumps_p2, jumps_total, jump_removed_total)
 
     (final_states,
-    final_terminated,
-    _,
-    final_step_idx,
-    jumps_p1,
-    jumps_p2,
-    jumps_total,
-    jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
+     final_terminated,
+     _,
+     _,
+     jumps_p1,
+     jumps_p2,
+     jumps_total,
+     jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
 
-    winners = final_states.winner  # (batch,) in {0,1,2}
+    winners = final_states.winner      # (batch,) in {0,1,2}
     per_game_turns = final_states.num_turns
 
-    idx = jnp.arange(batch_size)
-    A_is_P1 = idx < games_per_color
+    # From env: winner==1 ⇒ P1, winner==2 ⇒ P2, 0 ⇒ draw/cutoff
+    win_p1 = (winners == 1).astype(jnp.float32)
+    win_p2 = (winners == 2).astype(jnp.float32)
 
-    # From env: winner==1 ⇒ P1; winner==2 ⇒ P2; winner==0 ⇒ draw/cutoff
-    win1 = winners == 1
-    win2 = winners == 2
-    draw_mask = winners == 0
+    # Score from HOME's POV
+    # If home is P1, +1 when P1 wins, -1 when P2 wins
+    score_if_home_P1 = win_p1 - win_p2
+    # If home is P2, +1 when P2 wins, -1 when P1 wins
+    score_if_home_P2 = win_p2 - win_p1
 
-    A_win_mask = (win1 & A_is_P1) | (win2 & ~A_is_P1)
+    per_game_score_home = jnp.where(home_is_P1, score_if_home_P1, score_if_home_P2)
+    total_score_home = jnp.sum(per_game_score_home)
+    total_games = jnp.int32(batch_size)
 
-    B_win_mask = (win2 & A_is_P1) | (win1 & ~A_is_P1)
+    # W/D/L counts from home POV
+    home_win = ((winners == 1) & home_is_P1) | ((winners == 2) & ~home_is_P1)
+    away_win = ((winners == 1) & ~home_is_P1) | ((winners == 2) & home_is_P1)
+    draw_mask = (winners == 0)
 
-    wins_A = jnp.sum(A_win_mask).astype(jnp.int32)
-    wins_B = jnp.sum(B_win_mask).astype(jnp.int32)
-    draws = jnp.sum(draw_mask).astype(jnp.int32)
-
-    # Per-game score from A’s POV: +1 win, -1 loss, 0 draw
-    per_game_score = jnp.where(A_win_mask, 1.0,
-                               jnp.where(B_win_mask, -1.0, 0.0))
-    total_score_A = jnp.sum(per_game_score)
+    home_wins = jnp.sum(home_win.astype(jnp.int32))
+    away_wins = jnp.sum(away_win.astype(jnp.int32))
+    draws = jnp.sum(draw_mask.astype(jnp.int32))
 
     return (
-        total_score_A,
-        jnp.int32(batch_size),
-        wins_A,
+        total_score_home,
+        total_games,
+        home_wins,
         draws,
-        wins_B,
+        away_wins,
         per_game_turns,
         jumps_p1,
         jumps_p2,
         jumps_total,
         jump_removed_total,
         winners,
-        A_is_P1,
+        home_is_P1,
     )
 
 
