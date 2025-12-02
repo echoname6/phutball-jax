@@ -490,6 +490,7 @@ def play_games_batched(
     )
 
 
+
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def play_match_batched(
     params_A: dict,
@@ -513,13 +514,23 @@ def play_match_batched(
     All games are stepped in parallel using a JAX while_loop.
 
     Returns:
-        total_score_A : sum of (+1 win, -1 loss, 0 draw) from A’s POV
-        total_games   : total games played (= 2 * games_per_color)
-        wins_A        : number of games A wins
-        draws         : number of draws / cutoffs
-        wins_B        : number of games B wins
+        total_score_A        : sum of scores (+1 win, -1 loss, 0 draw) from A's POV
+        total_games          : number of games played (= 2 * games_per_color)
+        wins_A, draws, wins_B
+        per_game_turns       : int32[batch]  (env.num_turns)
+        per_game_jumps_p1    : int32[batch]  (# jumps made by Player 1)
+        per_game_jumps_p2    : int32[batch]  (# jumps made by Player 2)
+        per_game_jumps_total : int32[batch]  (# jumps total)
+        per_game_removed     : int32[batch]  (total men removed by jumps)
+        winners              : int32[batch]  (0/1/2 from env)
+        A_is_P1              : bool[batch]   (True if game started with A as P1)
     """
     batch_size = 2 * games_per_color
+
+    rows = env_config.rows
+    cols = env_config.cols
+    total_positions = rows * cols
+    MAN = jnp.int32(1)
 
     # Which agent is P1/P2 in each game? (True = A, False = B)
     agent_p1_is_A = jnp.concatenate(
@@ -535,13 +546,20 @@ def play_match_batched(
     states = batched_reset(env_config, batch_size)
     terminated = jnp.zeros((batch_size,), dtype=jnp.bool_)
 
+    # Per-game stats we want to accumulate
+    jumps_p1 = jnp.zeros((batch_size,), dtype=jnp.int32)
+    jumps_p2 = jnp.zeros((batch_size,), dtype=jnp.int32)
+    jumps_total = jnp.zeros((batch_size,), dtype=jnp.int32)
+    jump_removed_total = jnp.zeros((batch_size,), dtype=jnp.int32)
+
     def cond_fn(carry):
-        states, terminated, rng, step_idx = carry
+        states, terminated, rng, step_idx, *_ = carry
         any_active = jnp.any(~terminated)
         return jnp.logical_and(step_idx < max_moves, any_active)
 
     def body_fn(carry):
-        states, terminated, rng, step_idx = carry
+        (states, terminated, rng, step_idx,
+         jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
 
         current_player = states.current_player  # (batch,)
         # For each game, decide whether A is to move
@@ -553,7 +571,7 @@ def play_match_batched(
 
         rng, rngA, rngB = jax.random.split(rng, 3)
 
-        # Run MCTS for ALL games with A, and ALL games with B,
+        # Run MCTS for ALL games with A and ALL games with B,
         # then select per-game outputs based on use_A.
         actions_A, _, _ = batched_mcts_policy(
             params_A,
@@ -574,10 +592,31 @@ def play_match_batched(
             temperature=temperature,
         )
 
-        actions = jnp.where(use_A, actions_A, actions_B)
+        actions = jnp.where(use_A, actions_A, actions_B)  # (batch,)
 
         # Step all envs in parallel
+        board_before = states.board                    # (batch, R, C)
         new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
+        board_after = new_states_raw.board             # (batch, R, C)
+
+        active = ~terminated
+        is_jump = (actions >= total_positions) & (actions < 2 * total_positions)
+        jump_mask = is_jump & active
+
+        # Count jumps by player
+        p1_mask = (current_player == 1) & jump_mask
+        p2_mask = (current_player == 2) & jump_mask
+
+        jumps_p1 = jumps_p1 + p1_mask.astype(jnp.int32)
+        jumps_p2 = jumps_p2 + p2_mask.astype(jnp.int32)
+        jumps_total = jumps_total + jump_mask.astype(jnp.int32)
+
+        # Compute men removed by jump
+        men_before = jnp.sum((board_before == MAN).astype(jnp.int32), axis=(1, 2))
+        men_after = jnp.sum((board_after == MAN).astype(jnp.int32), axis=(1, 2))
+        removed_step = jnp.maximum(men_before - men_after, 0)
+        removed_step = removed_step * jump_mask.astype(jnp.int32)
+        jump_removed_total = jump_removed_total + removed_step
 
         # Once a game is terminated, we freeze it and stop evolving it
         done_mask = terminated | new_states_raw.terminated
@@ -592,16 +631,43 @@ def play_match_batched(
             num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
         )
 
-        return (new_states, done_mask, rng, step_idx + jnp.int32(1))
+        return (
+            new_states,
+            done_mask,
+            rng,
+            step_idx + jnp.int32(1),
+            jumps_p1,
+            jumps_p2,
+            jumps_total,
+            jump_removed_total,
+        )
 
-    init_carry = (states, terminated, rng, jnp.int32(0))
-    final_states, final_terminated, _, _ = lax.while_loop(cond_fn, body_fn, init_carry)
+    init_carry = (
+        states,
+        terminated,
+        rng,
+        jnp.int32(0),
+        jumps_p1,
+        jumps_p2,
+        jumps_total,
+        jump_removed_total,
+    )
+    (final_states,
+     final_terminated,
+     _,
+     _,
+     jumps_p1,
+     jumps_p2,
+     jumps_total,
+     jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
 
     winners = final_states.winner  # (batch,) in {0,1,2}
-    idx = jnp.arange(batch_size)
-    A_is_P1 = idx < games_per_color  # same convention as before
+    per_game_turns = final_states.num_turns
 
-    # winner==1 => P1; winner==2 => P2; winner==0 => draw/cutoff
+    idx = jnp.arange(batch_size)
+    A_is_P1 = idx < games_per_color
+
+    # From env: winner==1 ⇒ P1; winner==2 ⇒ P2; winner==0 ⇒ draw/cutoff
     win1 = winners == 1
     win2 = winners == 2
     draw_mask = winners == 0
@@ -624,7 +690,21 @@ def play_match_batched(
                                jnp.where(B_win_mask, -1.0, 0.0))
     total_score_A = jnp.sum(per_game_score)
 
-    return total_score_A, jnp.int32(batch_size), wins_A, draws, wins_B
+    return (
+        total_score_A,
+        jnp.int32(batch_size),
+        wins_A,
+        draws,
+        wins_B,
+        per_game_turns,
+        jumps_p1,
+        jumps_p2,
+        jumps_total,
+        jump_removed_total,
+        winners,
+        A_is_P1,
+    )
+
 
 def trajectory_to_training_examples(
     trajectory: TrajectoryData,

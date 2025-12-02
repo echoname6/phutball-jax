@@ -662,6 +662,7 @@ class AlphaZeroTrainer:
 
         rng = self.rng
 
+        
         for i in range(n):
             for j in range(i + 1, n):
                 pair_idx += 1
@@ -672,7 +673,18 @@ class AlphaZeroTrainer:
 
                 rng, match_rng = jax.random.split(rng)
 
-                total_score_A, total_games, wins_A, draws, wins_B = play_match_batched(
+                (total_score_A,
+                total_games,
+                wins_A,
+                draws,
+                wins_B,
+                per_game_turns,
+                per_game_jumps_p1,
+                per_game_jumps_p2,
+                per_game_jumps_total,
+                per_game_removed,
+                winners,
+                A_is_P1) = play_match_batched(
                     params_A=params_i,
                     params_B=params_j,
                     rng=match_rng,
@@ -684,16 +696,46 @@ class AlphaZeroTrainer:
                     temperature=temperature,
                 )
 
+                # Convert from JAX arrays to numpy / python
                 total_score_A = float(total_score_A)
                 total_games = int(total_games)
                 wins_A = int(wins_A)
                 wins_B = int(wins_B)
                 draws = int(draws)
 
-                assert wins_A + wins_B + draws == total_games, "W+D+L != total_games"
+                per_game_turns = np.array(per_game_turns, dtype=np.int32)
+                per_game_jumps_p1 = np.array(per_game_jumps_p1, dtype=np.int32)
+                per_game_jumps_p2 = np.array(per_game_jumps_p2, dtype=np.int32)
+                per_game_jumps_total = np.array(per_game_jumps_total, dtype=np.int32)
+                per_game_removed = np.array(per_game_removed, dtype=np.int32)
+                winners = np.array(winners, dtype=np.int32)
+                A_is_P1 = np.array(A_is_P1, dtype=bool)
 
+                assert total_games == len(per_game_turns)
+
+                # Map jumps to "A" and "B" for each game
+                jumps_A = np.where(A_is_P1, per_game_jumps_p1, per_game_jumps_p2)
+                jumps_B = per_game_jumps_p1 + per_game_jumps_p2 - jumps_A
+
+                # Aggregate stats across these games
                 avg_score_A = total_score_A / total_games if total_games > 0 else 0.0
+                avg_turns = float(per_game_turns.mean())
 
+                total_jumps_A = jumps_A.sum()
+                total_jumps_B = jumps_B.sum()
+                avg_jumps_A = total_jumps_A / total_games
+                avg_jumps_B = total_jumps_B / total_games
+
+                # Average jump length across all jumps (both players)
+                jump_mask = per_game_jumps_total > 0
+                if jump_mask.any():
+                    total_removed = per_game_removed[jump_mask].sum()
+                    total_jumps = per_game_jumps_total[jump_mask].sum()
+                    avg_jump_len = total_removed / total_jumps
+                else:
+                    avg_jump_len = 0.0
+
+                # Store results in matrices as before (if you're doing Elo etc.)
                 scores[i, j] = avg_score_A
                 scores[j, i] = -avg_score_A
                 games_mat[i, j] = games_mat[j, i] = total_games
@@ -701,8 +743,6 @@ class AlphaZeroTrainer:
                 W_mat[i, j] = wins_A
                 L_mat[i, j] = wins_B
                 D_mat[i, j] = draws
-
-                # Mirror W/L from j's perspective
                 W_mat[j, i] = wins_B
                 L_mat[j, i] = wins_A
                 D_mat[j, i] = draws
@@ -712,6 +752,37 @@ class AlphaZeroTrainer:
                     f"W-D-L = {wins_A}-{draws}-{wins_B} "
                     f"(score={total_score_A:+.1f} over {total_games} games, avg {avg_score_A:+.3f})"
                 )
+                print(
+                    f"    turns/game={avg_turns:.1f}, "
+                    f"jumps/game A={avg_jumps_A:.2f}, B={avg_jumps_B:.2f}, "
+                    f"avg_jump_len={avg_jump_len:.2f}"
+                )
+
+                # --- Per-game detailed report ---
+                for g in range(total_games):
+                    if winners[g] == 0:
+                        outcome = "draw"
+                    else:
+                        A_won = (
+                            (winners[g] == 1 and A_is_P1[g]) or
+                            (winners[g] == 2 and not A_is_P1[g])
+                        )
+                        outcome = "A win" if A_won else "B win"
+
+                    role_str = "A=P1,B=P2" if A_is_P1[g] else "A=P2,B=P1"
+
+                    if per_game_jumps_total[g] > 0:
+                        game_avg_jump_len = per_game_removed[g] / per_game_jumps_total[g]
+                    else:
+                        game_avg_jump_len = 0.0
+
+                    print(
+                        f"      game {g:2d}: {role_str}, "
+                        f"turns={per_game_turns[g]}, "
+                        f"jumps_A={int(jumps_A[g])}, jumps_B={int(jumps_B[g])}, "
+                        f"avg_jump_len={game_avg_jump_len:.2f}, "
+                        f"result={outcome}"
+                    )
 
         self.rng = rng
 
