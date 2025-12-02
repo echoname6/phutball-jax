@@ -558,26 +558,6 @@ def play_match_batched(
         any_active = jnp.any(~terminated)
         return jnp.logical_and(step_idx < max_moves, any_active)
 
-    init_carry = (
-        states,
-        terminated,
-        rng,
-        jnp.int32(0),
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p1
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p2
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_total
-        jnp.zeros((batch_size,), dtype=jnp.int32),  # jump_removed_total
-    )
-
-    (final_states,
-    final_terminated,
-    _,
-    final_step_idx,
-    jumps_p1,
-    jumps_p2,
-    jumps_total,
-    jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
-
 
     def body_fn(carry):
         (
@@ -677,6 +657,26 @@ def play_match_batched(
             jumps_total,
             jump_removed_total,
         )
+    
+    init_carry = (
+        states,
+        terminated,
+        rng,
+        jnp.int32(0),
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p1
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p2
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_total
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jump_removed_total
+    )
+
+    (final_states,
+    final_terminated,
+    _,
+    final_step_idx,
+    jumps_p1,
+    jumps_p2,
+    jumps_total,
+    jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
 
     winners = final_states.winner  # (batch,) in {0,1,2}
     per_game_turns = final_states.num_turns
@@ -690,7 +690,7 @@ def play_match_batched(
     draw_mask = winners == 0
 
     A_win_mask = (win1 & A_is_P1) | (win2 & ~A_is_P1)
-    
+
     B_win_mask = (win2 & A_is_P1) | (win1 & ~A_is_P1)
 
     wins_A = jnp.sum(A_win_mask).astype(jnp.int32)
