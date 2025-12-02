@@ -553,15 +553,46 @@ def play_match_batched(
     jump_removed_total = jnp.zeros((batch_size,), dtype=jnp.int32)
 
     def cond_fn(carry):
-        states, terminated, rng, step_idx, *_ = carry
+        (states, terminated, rng, step_idx,
+        jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
         any_active = jnp.any(~terminated)
         return jnp.logical_and(step_idx < max_moves, any_active)
 
+    init_carry = (
+        states,
+        terminated,
+        rng,
+        jnp.int32(0),
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p1
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_p2
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jumps_total
+        jnp.zeros((batch_size,), dtype=jnp.int32),  # jump_removed_total
+    )
+
+    (final_states,
+    final_terminated,
+    _,
+    final_step_idx,
+    jumps_p1,
+    jumps_p2,
+    jumps_total,
+    jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
+
+
     def body_fn(carry):
-        (states, terminated, rng, step_idx,
-         jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
+        (
+            states,
+            terminated,
+            rng,
+            step_idx,
+            jumps_p1,
+            jumps_p2,
+            jumps_total,
+            jump_removed_total,
+        ) = carry
 
         current_player = states.current_player  # (batch,)
+
         # For each game, decide whether A is to move
         use_A = jnp.where(
             current_player == 1,
@@ -594,7 +625,7 @@ def play_match_batched(
 
         actions = jnp.where(use_A, actions_A, actions_B)  # (batch,)
 
-        # Step all envs in parallel
+        # --- stats: jumps & pieces removed ---
         board_before = states.board                    # (batch, R, C)
         new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
         board_after = new_states_raw.board             # (batch, R, C)
@@ -618,22 +649,27 @@ def play_match_batched(
         removed_step = removed_step * jump_mask.astype(jnp.int32)
         jump_removed_total = jump_removed_total + removed_step
 
-        # Once a game is terminated, we freeze it and stop evolving it
-        done_mask = terminated | new_states_raw.terminated
+        # Games that are done after this step
+        new_terminated = terminated | new_states_raw.terminated
+
+        # For most fields, we only update games that were NOT terminated
+        # at the *start* of this step.
+        use_new = ~terminated  # True for games that were alive when we stepped
 
         new_states = PhutballState(
-            board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
-            ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
-            current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
-            is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
-            terminated=done_mask,
-            winner=jnp.where(done_mask, states.winner, new_states_raw.winner),
-            num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
+            board=jnp.where(use_new[:, None, None], new_states_raw.board, states.board),
+            ball_pos=jnp.where(use_new[:, None], new_states_raw.ball_pos, states.ball_pos),
+            current_player=jnp.where(use_new, new_states_raw.current_player, states.current_player),
+            is_jumping=jnp.where(use_new, new_states_raw.is_jumping, states.is_jumping),
+            terminated=new_terminated,
+            # IMPORTANT: keep old winner only for games that were already done
+            winner=jnp.where(terminated, states.winner, new_states_raw.winner),
+            num_turns=jnp.where(use_new, new_states_raw.num_turns, states.num_turns),
         )
 
         return (
             new_states,
-            done_mask,
+            new_terminated,
             rng,
             step_idx + jnp.int32(1),
             jumps_p1,
@@ -641,25 +677,6 @@ def play_match_batched(
             jumps_total,
             jump_removed_total,
         )
-
-    init_carry = (
-        states,
-        terminated,
-        rng,
-        jnp.int32(0),
-        jumps_p1,
-        jumps_p2,
-        jumps_total,
-        jump_removed_total,
-    )
-    (final_states,
-     final_terminated,
-     _,
-     _,
-     jumps_p1,
-     jumps_p2,
-     jumps_total,
-     jump_removed_total) = lax.while_loop(cond_fn, body_fn, init_carry)
 
     winners = final_states.winner  # (batch,) in {0,1,2}
     per_game_turns = final_states.num_turns
@@ -672,13 +689,8 @@ def play_match_batched(
     win2 = winners == 2
     draw_mask = winners == 0
 
-    # A wins if:
-    #   - A is P1 and P1 wins, OR
-    #   - A is P2 and P2 wins
     A_win_mask = (win1 & A_is_P1) | (win2 & ~A_is_P1)
-    # B wins if:
-    #   - A is P1 and P2 wins, OR
-    #   - A is P2 and P1 wins
+    
     B_win_mask = (win2 & A_is_P1) | (win1 & ~A_is_P1)
 
     wins_A = jnp.sum(A_win_mask).astype(jnp.int32)
