@@ -11,7 +11,7 @@ import optax
 import time
 import os
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Optional, List, Tuple
 import pickle
 from mcts import MCTSConfig
 import glob
@@ -604,160 +604,187 @@ class AlphaZeroTrainer:
                 f"({score_current:+.1f} / {total_games}, avg {avg_score:+.3f})"
             )
 
-    def run_round_robin(
-        self,
-        games_per_color: int = 5,
-        max_checkpoints: Optional[int] = None,
-        num_simulations: Optional[int] = None,
-        max_moves: Optional[int] = None,
-        temperature: Optional[float] = None,
-    ):
-        """
-        Run a round-robin tournament between multiple checkpoints.
+def run_round_robin(
+    self,
+    games_per_color: int = 5,
+    max_checkpoints: int | None = None,
+    num_simulations: int | None = None,
+    max_moves: int | None = None,
+    temperature: float | None = None,
+):
+    """
+    Run a round-robin tournament over checkpoints in checkpoint_dir,
+    using play_match_batched (which returns total_score_A and total_games).
 
-        For each pair (i, j), we play:
-          - games_per_color games with i as P1, j as P2
-          - games_per_color games with j as P1, i as P2
-        So 2 * games_per_color games per pair.
+    Returns:
+        names:   list[str] of checkpoint filenames
+        scores:  (N, N) matrix, scores[i, j] = avg score for i vs j in [-1, 1]
+        games:   (N, N) matrix, games[i, j] = number of games in that pairing
+        ratings: (N,) array of Elo-like ratings
+    """
+    import glob
+    import os
+    import numpy as np
+    import pickle
+    import jax
 
-        Returns:
-          names: List[str] of checkpoint names
-          W, D, L: (N, N) integer matrices (from row's perspective)
-          ratings: np.ndarray of Elo ratings
-        """
-        ckpt_dir = self.config.checkpoint_dir
-        pattern = os.path.join(ckpt_dir, "checkpoint_*.pkl")
-        ckpt_paths = sorted(glob.glob(pattern))
+    # Use eval settings by default
+    if num_simulations is None:
+        num_simulations = self.config.eval_num_simulations
+    if max_moves is None:
+        max_moves = self.config.eval_max_moves
+    if temperature is None:
+        temperature = self.config.eval_temperature
 
-        if len(ckpt_paths) < 2:
-            print("Not enough checkpoints for round robin.")
-            return [], None, None, None
+    pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
+    ckpt_paths = sorted(glob.glob(pattern))
+    if max_checkpoints is not None:
+        ckpt_paths = ckpt_paths[-max_checkpoints:]
 
-        # Optionally restrict to most recent N checkpoints
-        if max_checkpoints is not None and max_checkpoints < len(ckpt_paths):
-            ckpt_paths = ckpt_paths[-max_checkpoints:]
+    n = len(ckpt_paths)
+    if n < 2:
+        print("[round-robin] Need at least 2 checkpoints.")
+        return [], None, None, None
 
-        n = len(ckpt_paths)
-        print(f"[round-robin] Using {n} checkpoints:")
-        for p in ckpt_paths:
-            print("  -", os.path.basename(p))
+    names = [os.path.basename(p) for p in ckpt_paths]
+    print(f"[round-robin] Using {n} checkpoints:")
+    for name in names:
+        print(f"  - {name}")
 
-        # Load all checkpoints into memory
-        checkpoints = []
-        for path in ckpt_paths:
-            with open(path, "rb") as f:
-                ckpt = pickle.load(f)
-            params = {
+    # Load all params once
+    params_list = []
+    for path in ckpt_paths:
+        with open(path, "rb") as f:
+            ckpt = pickle.load(f)
+        params_list.append(
+            {
                 "network_params": ckpt["params"],
                 "batch_stats": ckpt["batch_stats"],
             }
-            checkpoints.append((os.path.basename(path), params))
-
-        names = [name for (name, _) in checkpoints]
-
-        # Result matrices: from row i vs column j perspective
-        W = np.zeros((n, n), dtype=np.int32)
-        D = np.zeros((n, n), dtype=np.int32)
-        L = np.zeros((n, n), dtype=np.int32)
-
-        # Eval config
-        sims = num_simulations or self.config.eval_num_simulations
-        mv   = max_moves or self.config.eval_max_moves
-        temp = self.config.eval_temperature if temperature is None else temperature
-
-        mcts_config = MCTSConfig(
-            num_simulations=sims,
-            max_num_considered_actions=32,
-            dirichlet_alpha=0.0,        # no exploration noise during eval
-            root_exploration_fraction=0.0,
         )
 
-        total_pairs = n * (n - 1) // 2
-        pair_idx = 0
+    # scores[i, j] = avg score per game for i vs j in [-1, 1]
+    scores = np.zeros((n, n), dtype=float)
+    games_mat = np.zeros((n, n), dtype=int)
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                name_i, params_i = checkpoints[i]
-                name_j, params_j = checkpoints[j]
+    total_pairs = n * (n - 1) // 2
+    pair_idx = 0
 
-                pair_idx += 1
-                print(
-                    f"[round-robin] Pair {pair_idx}/{total_pairs}: "
-                    f"{name_i} vs {name_j}"
-                )
+    rng = self.rng  # reuse trainer RNG
 
-                # i as P1, j as P2
-                results_ij = play_match_batched(
-                    params_p1=params_i,
-                    params_p2=params_j,
-                    network=self.network,
-                    env_config=self.env_config,
-                    mcts_config=mcts_config,
-                    num_games=games_per_color,
-                    max_moves=mv,
-                    temperature=temp,
-                    seed=1000 + pair_idx * 10,
-                )
-                results_ij = np.array(results_ij)  # shape (games_per_color,)
+    for i in range(n):
+        for j in range(i + 1, n):
+            pair_idx += 1
+            print(f"[round-robin] Pair {pair_idx}/{total_pairs}: {names[i]} vs {names[j]}")
 
-                # j as P1, i as P2  → later flip perspective back to "i"
-                results_ji = play_match_batched(
-                    params_p1=params_j,
-                    params_p2=params_i,
-                    network=self.network,
-                    env_config=self.env_config,
-                    mcts_config=mcts_config,
-                    num_games=games_per_color,
-                    max_moves=mv,
-                    temperature=temp,
-                    seed=2000 + pair_idx * 10,
-                )
-                results_ji = np.array(results_ji)
+            params_i = params_list[i]
+            params_j = params_list[j]
 
-                # From i's perspective, the second batch is negated
-                all_results = np.concatenate([results_ij, -results_ji])
+            # Each call plays 2 * games_per_color games internally
+            rng, match_rng = jax.random.split(rng)
 
-                wins_i = int(np.sum(all_results > 0))
-                draws  = int(np.sum(all_results == 0))
-                loss_i = int(np.sum(all_results < 0))
-                n_games = wins_i + draws + loss_i
-
-                print(
-                    f"    [pair] {name_i} vs {name_j}: "
-                    f"{wins_i}-{loss_i}-{draws} (W-L-D) over {n_games} games"
-                )
-
-                # Fill matrices from i's perspective
-                W[i, j] = wins_i
-                D[i, j] = draws
-                L[i, j] = loss_i
-
-                # From j's perspective it's symmetric
-                W[j, i] = loss_i
-                D[j, i] = draws
-                L[j, i] = wins_i
-
-        # Now compute Elo
-        ratings = compute_elo_from_results(names, W, D, L)
-
-        print("\n[round-robin] Final Elo ranking:")
-        order = np.argsort(-ratings)
-        for rank, idx in enumerate(order, start=1):
-            total_wins  = int(W[idx].sum())
-            total_draws = int(D[idx].sum())
-            total_loss  = int(L[idx].sum())
-            total_games = total_wins + total_draws + total_loss
-            score = total_wins + 0.5 * total_draws
-            pct = 100.0 * score / max(1, total_games)
-            print(
-                f"  #{rank:2d}  {names[idx]:>20s}  "
-                f"Elo={ratings[idx]:7.1f}  "
-                f"Record={total_wins}-{total_loss}-{total_draws}  "
-                f"Score={score:.1f}/{total_games} ({pct:.1f}%)"
+            total_score_A, total_games = play_match_batched(
+                params_A=params_i,
+                params_B=params_j,
+                rng=match_rng,
+                network=self.network,
+                env_config=self.env_config,
+                games_per_color=games_per_color,
+                max_moves=max_moves,
+                num_simulations=num_simulations,
+                temperature=temperature,
             )
 
-        return names, W, D, L, ratings
+            total_score_A = float(total_score_A)
+            total_games = int(total_games)
+            avg_score_A = total_score_A / total_games  # [-1, 1]
 
+            scores[i, j] = avg_score_A
+            scores[j, i] = -avg_score_A  # symmetric
+            games_mat[i, j] = games_mat[j, i] = total_games
+
+            print(
+                f"  [round-robin] {names[i]} vs {names[j]}: "
+                f"score={total_score_A:+.1f} over {total_games} games "
+                f"(avg {avg_score_A:+.3f})"
+            )
+
+    # Store updated RNG back into trainer
+    self.rng = rng
+
+    # --- Simple Elo-style ratings from score matrix ---
+
+    ratings = np.zeros(n, dtype=float)
+    K = 16.0
+
+    def expected_score(r_i, r_j):
+        return 1.0 / (1.0 + 10.0 ** ((r_j - r_i) / 400.0))
+
+    # Our avg_score in [-1, 1]; convert to [0, 1] like win/draw/loss score:
+    #   -1 -> 0.0, 0 -> 0.5, +1 -> 1.0
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if games_mat[i, j] == 0:
+                continue
+
+            avg_score = scores[i, j]  # [-1, 1]
+            s_01 = 0.5 * (avg_score + 1.0)  # [0, 1]
+            e_01 = expected_score(ratings[i], ratings[j])
+            ratings[i] += K * (s_01 - e_01)
+
+    return names, scores, games_mat, ratings
+
+
+
+def compute_elo_from_results(
+    names: List[str],
+    W: np.ndarray,
+    D: np.ndarray,
+    L: np.ndarray,
+    base_elo: float = 1500.0,
+    K: float = 32.0,
+    iters: int = 50,
+) -> np.ndarray:
+    """
+    Simple multi-player Elo solver from a full W/D/L matrix.
+
+    W[i,j] = wins of i vs j
+    D[i,j] = draws
+    L[i,j] = losses of i vs j
+
+    Returns:
+        ratings: np.ndarray of shape (N,)
+    """
+    n = len(names)
+    ratings = np.full(n, base_elo, dtype=np.float64)
+
+    for _ in range(iters):
+        for i in range(n):
+            for j in range(i + 1, n):
+                # Aggregate results for this pair
+                wins_ij  = float(W[i, j])
+                draws_ij = float(D[i, j])
+                loss_ij  = float(L[i, j])
+                N_ij = wins_ij + draws_ij + loss_ij
+                if N_ij == 0:
+                    continue
+
+                # Actual total score for i vs j (win=1, draw=0.5, loss=0)
+                S_i = wins_ij + 0.5 * draws_ij
+
+                # Expected score per game for i vs j
+                diff = (ratings[j] - ratings[i]) / 400.0
+                p_i = 1.0 / (1.0 + 10.0**diff)
+                E_i = N_ij * p_i
+
+                # Batch Elo update (equivalent to N_ij separate games)
+                delta = K * (S_i - E_i) / max(1.0, N_ij)
+                ratings[i] += delta
+                ratings[j] -= delta
+
+    return ratings
 
 
 def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
