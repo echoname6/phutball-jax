@@ -604,137 +604,137 @@ class AlphaZeroTrainer:
                 f"({score_current:+.1f} / {total_games}, avg {avg_score:+.3f})"
             )
 
-def run_round_robin(
-    self,
-    games_per_color: int = 5,
-    max_checkpoints: int | None = None,
-    num_simulations: int | None = None,
-    max_moves: int | None = None,
-    temperature: float | None = None,
-):
-    """
-    Run a round-robin tournament over checkpoints in checkpoint_dir,
-    using play_match_batched (which returns total_score_A and total_games).
+    def run_round_robin(
+        self,
+        games_per_color: int = 5,
+        max_checkpoints: int | None = None,
+        num_simulations: int | None = None,
+        max_moves: int | None = None,
+        temperature: float | None = None,
+    ):
+        """
+        Run a round-robin tournament over checkpoints in checkpoint_dir,
+        using play_match_batched (which returns total_score_A and total_games).
 
-    Returns:
-        names:   list[str] of checkpoint filenames
-        scores:  (N, N) matrix, scores[i, j] = avg score for i vs j in [-1, 1]
-        games:   (N, N) matrix, games[i, j] = number of games in that pairing
-        ratings: (N,) array of Elo-like ratings
-    """
-    import glob
-    import os
-    import numpy as np
-    import pickle
-    import jax
+        Returns:
+            names:   list[str] of checkpoint filenames
+            scores:  (N, N) matrix, scores[i, j] = avg score for i vs j in [-1, 1]
+            games:   (N, N) matrix, games[i, j] = number of games in that pairing
+            ratings: (N,) array of Elo-like ratings
+        """
+        import glob
+        import os
+        import numpy as np
+        import pickle
+        import jax
 
-    # Use eval settings by default
-    if num_simulations is None:
-        num_simulations = self.config.eval_num_simulations
-    if max_moves is None:
-        max_moves = self.config.eval_max_moves
-    if temperature is None:
-        temperature = self.config.eval_temperature
+        # Use eval settings by default
+        if num_simulations is None:
+            num_simulations = self.config.eval_num_simulations
+        if max_moves is None:
+            max_moves = self.config.eval_max_moves
+        if temperature is None:
+            temperature = self.config.eval_temperature
 
-    pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
-    ckpt_paths = sorted(glob.glob(pattern))
-    if max_checkpoints is not None:
-        ckpt_paths = ckpt_paths[-max_checkpoints:]
+        pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
+        ckpt_paths = sorted(glob.glob(pattern))
+        if max_checkpoints is not None:
+            ckpt_paths = ckpt_paths[-max_checkpoints:]
 
-    n = len(ckpt_paths)
-    if n < 2:
-        print("[round-robin] Need at least 2 checkpoints.")
-        return [], None, None, None
+        n = len(ckpt_paths)
+        if n < 2:
+            print("[round-robin] Need at least 2 checkpoints.")
+            return [], None, None, None
 
-    names = [os.path.basename(p) for p in ckpt_paths]
-    print(f"[round-robin] Using {n} checkpoints:")
-    for name in names:
-        print(f"  - {name}")
+        names = [os.path.basename(p) for p in ckpt_paths]
+        print(f"[round-robin] Using {n} checkpoints:")
+        for name in names:
+            print(f"  - {name}")
 
-    # Load all params once
-    params_list = []
-    for path in ckpt_paths:
-        with open(path, "rb") as f:
-            ckpt = pickle.load(f)
-        params_list.append(
-            {
-                "network_params": ckpt["params"],
-                "batch_stats": ckpt["batch_stats"],
-            }
-        )
-
-    # scores[i, j] = avg score per game for i vs j in [-1, 1]
-    scores = np.zeros((n, n), dtype=float)
-    games_mat = np.zeros((n, n), dtype=int)
-
-    total_pairs = n * (n - 1) // 2
-    pair_idx = 0
-
-    rng = self.rng  # reuse trainer RNG
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            pair_idx += 1
-            print(f"[round-robin] Pair {pair_idx}/{total_pairs}: {names[i]} vs {names[j]}")
-
-            params_i = params_list[i]
-            params_j = params_list[j]
-
-            # Each call plays 2 * games_per_color games internally
-            rng, match_rng = jax.random.split(rng)
-
-            total_score_A, total_games = play_match_batched(
-                params_A=params_i,
-                params_B=params_j,
-                rng=match_rng,
-                network=self.network,
-                env_config=self.env_config,
-                games_per_color=games_per_color,
-                max_moves=max_moves,
-                num_simulations=num_simulations,
-                temperature=temperature,
+        # Load all params once
+        params_list = []
+        for path in ckpt_paths:
+            with open(path, "rb") as f:
+                ckpt = pickle.load(f)
+            params_list.append(
+                {
+                    "network_params": ckpt["params"],
+                    "batch_stats": ckpt["batch_stats"],
+                }
             )
 
-            total_score_A = float(total_score_A)
-            total_games = int(total_games)
-            avg_score_A = total_score_A / total_games  # [-1, 1]
+        # scores[i, j] = avg score per game for i vs j in [-1, 1]
+        scores = np.zeros((n, n), dtype=float)
+        games_mat = np.zeros((n, n), dtype=int)
 
-            scores[i, j] = avg_score_A
-            scores[j, i] = -avg_score_A  # symmetric
-            games_mat[i, j] = games_mat[j, i] = total_games
+        total_pairs = n * (n - 1) // 2
+        pair_idx = 0
 
-            print(
-                f"  [round-robin] {names[i]} vs {names[j]}: "
-                f"score={total_score_A:+.1f} over {total_games} games "
-                f"(avg {avg_score_A:+.3f})"
-            )
+        rng = self.rng  # reuse trainer RNG
 
-    # Store updated RNG back into trainer
-    self.rng = rng
+        for i in range(n):
+            for j in range(i + 1, n):
+                pair_idx += 1
+                print(f"[round-robin] Pair {pair_idx}/{total_pairs}: {names[i]} vs {names[j]}")
 
-    # --- Simple Elo-style ratings from score matrix ---
+                params_i = params_list[i]
+                params_j = params_list[j]
 
-    ratings = np.zeros(n, dtype=float)
-    K = 16.0
+                # Each call plays 2 * games_per_color games internally
+                rng, match_rng = jax.random.split(rng)
 
-    def expected_score(r_i, r_j):
-        return 1.0 / (1.0 + 10.0 ** ((r_j - r_i) / 400.0))
+                total_score_A, total_games = play_match_batched(
+                    params_A=params_i,
+                    params_B=params_j,
+                    rng=match_rng,
+                    network=self.network,
+                    env_config=self.env_config,
+                    games_per_color=games_per_color,
+                    max_moves=max_moves,
+                    num_simulations=num_simulations,
+                    temperature=temperature,
+                )
 
-    # Our avg_score in [-1, 1]; convert to [0, 1] like win/draw/loss score:
-    #   -1 -> 0.0, 0 -> 0.5, +1 -> 1.0
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            if games_mat[i, j] == 0:
-                continue
+                total_score_A = float(total_score_A)
+                total_games = int(total_games)
+                avg_score_A = total_score_A / total_games  # [-1, 1]
 
-            avg_score = scores[i, j]  # [-1, 1]
-            s_01 = 0.5 * (avg_score + 1.0)  # [0, 1]
-            e_01 = expected_score(ratings[i], ratings[j])
-            ratings[i] += K * (s_01 - e_01)
+                scores[i, j] = avg_score_A
+                scores[j, i] = -avg_score_A  # symmetric
+                games_mat[i, j] = games_mat[j, i] = total_games
 
-    return names, scores, games_mat, ratings
+                print(
+                    f"  [round-robin] {names[i]} vs {names[j]}: "
+                    f"score={total_score_A:+.1f} over {total_games} games "
+                    f"(avg {avg_score_A:+.3f})"
+                )
+
+        # Store updated RNG back into trainer
+        self.rng = rng
+
+        # --- Simple Elo-style ratings from score matrix ---
+
+        ratings = np.zeros(n, dtype=float)
+        K = 16.0
+
+        def expected_score(r_i, r_j):
+            return 1.0 / (1.0 + 10.0 ** ((r_j - r_i) / 400.0))
+
+        # Our avg_score in [-1, 1]; convert to [0, 1] like win/draw/loss score:
+        #   -1 -> 0.0, 0 -> 0.5, +1 -> 1.0
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                if games_mat[i, j] == 0:
+                    continue
+
+                avg_score = scores[i, j]  # [-1, 1]
+                s_01 = 0.5 * (avg_score + 1.0)  # [0, 1]
+                e_01 = expected_score(ratings[i], ratings[j])
+                ratings[i] += K * (s_01 - e_01)
+
+        return names, scores, games_mat, ratings
 
 
 
