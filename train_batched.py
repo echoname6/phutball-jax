@@ -98,7 +98,7 @@ class AlphaZeroTrainer:
         self.config = config
         
         # Environment config
-        self.env_config = EnvConfig(rows=config.rows, cols=config.cols)
+        self.env_config = EnvConfig(rows=config.rows, cols=config.cols, max_turns=config.max_turns_per_game)
         
         # Create network
         self.network = create_network(
