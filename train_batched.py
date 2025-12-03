@@ -513,8 +513,8 @@ class AlphaZeroTrainer:
                 winners,
                 home_is_P1,
             ) = play_match_batched(
-                home_params=current_params,
-                away_params=opp_params,
+                home_params=current_params,   # treat A as "home"
+                away_params=opp_params,       # treat B as "away"
                 rng=match_rng,
                 network=self.network,
                 env_config=self.env_config,
@@ -536,6 +536,7 @@ class AlphaZeroTrainer:
             per_game_jumps_p2 = np.asarray(per_game_jumps_p2, dtype=np.int32)
             per_game_jumps_total = np.asarray(per_game_jumps_total, dtype=np.int32)
             per_game_removed = np.asarray(per_game_removed, dtype=np.int32)
+            winners = np.asarray(winners, dtype=np.int32)
             home_is_P1 = np.asarray(home_is_P1, dtype=bool)
 
             assert total_games == len(per_game_turns)
@@ -549,7 +550,7 @@ class AlphaZeroTrainer:
             avg_jumps_home = float(jumps_home.mean())
             avg_jumps_away = float(jumps_away.mean())
 
-            # Average jump length across all jumps in these games
+            # Average jump length across all jumps in this match
             jump_mask = per_game_jumps_total > 0
             if jump_mask.any():
                 total_removed = int(per_game_removed[jump_mask].sum())
@@ -558,7 +559,7 @@ class AlphaZeroTrainer:
             else:
                 avg_jump_len = 0.0
 
-            # ---- prints ----
+            # ---- aggregate line ----
             print(
                 f"    [eval] {current_name} (home) vs {opp_name} (away): "
                 f"W-D-L = {wins_home}-{draws}-{wins_away} "
@@ -570,6 +571,33 @@ class AlphaZeroTrainer:
                 f"avg_jump_len={avg_jump_len:.2f}"
             )
 
+            # ---- per-game detailed lines ----
+            for g in range(total_games):
+                if winners[g] == 0:
+                    outcome = "draw"
+                else:
+                    home_won = (
+                        (winners[g] == 1 and home_is_P1[g]) or
+                        (winners[g] == 2 and not home_is_P1[g])
+                    )
+                    outcome = "home win" if home_won else "away win"
+
+                role_str = "home=P1,away=P2" if home_is_P1[g] else "home=P2,away=P1"
+
+                if per_game_jumps_total[g] > 0:
+                    game_avg_jump_len = per_game_removed[g] / per_game_jumps_total[g]
+                else:
+                    game_avg_jump_len = 0.0
+
+                print(
+                    f"        game {g:2d}: {role_str}, "
+                    f"turns={per_game_turns[g]}, "
+                    f"jumps_home={int(jumps_home[g])}, jumps_away={int(jumps_away[g])}, "
+                    f"avg_jump_len={game_avg_jump_len:.2f}, "
+                    f"result={outcome}"
+                )
+
+        # persist RNG so eval randomness keeps moving forward
         self.rng = rng
 
     def run_round_robin(
