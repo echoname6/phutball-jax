@@ -14,7 +14,8 @@ import numpy as np
 from phutball_env_jax import (
     PhutballState, EnvConfig,
     reset, step, get_legal_actions,
-    calculate_jumped_men
+    calculate_jumped_men,
+    MAN, BALL, EMPTY, END_HI, END_LO
 )
 from network import PhutballNetwork, predict
 from mcts import state_to_network_input
