@@ -630,7 +630,7 @@ def play_match_batched(
             current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
             is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
             terminated=done_mask,
-            winner=jnp.where(done_mask, states.winner, new_states_raw.winner),
+            winner=jnp.where(terminated, states.winner, new_states_raw.winner),
             num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
         )
 
