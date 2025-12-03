@@ -186,6 +186,9 @@ class AlphaZeroTrainer:
             "sum_jump_removed_tiles": 0,
             "adjacency_opportunities": 0,
             "adjacency_conversions": 0,
+            "p1_wins": 0,
+            "p2_wins": 0,
+            "draws": 0
         }
         
         # Run multiple batches to get desired number of games
@@ -210,6 +213,11 @@ class AlphaZeroTrainer:
             batch_stats = compute_phutball_stats(trajectory, self.env_config)
             for k in stats_totals:
                 stats_totals[k] += batch_stats[k]
+            
+            winners_np = np.array(trajectory.winners)
+            stats_totals["p1_wins"] += int(np.sum(winners_np == 1))
+            stats_totals["p2_wins"] += int(np.sum(winners_np == 2))
+            stats_totals["draws"] += int(np.sum(winners_np == 0))
             
             # Convert to training examples
             states, policies, values = trajectory_to_training_examples(trajectory)
@@ -276,6 +284,7 @@ class AlphaZeroTrainer:
         print(
             f"  Self-play: {num_examples} examples from {games_total} games "
             f"({games_per_sec:.1f} games/sec, {elapsed:.1f}s) | "
+            f"W1/W2/D={stats_totals['p1_wins']}/{stats_totals['p2_wins']}/{stats_totals['draws']} | "
             f"avg_moves/game={avg_moves_per_game:.1f}, "
             f"avg_jump_seq={avg_jump_seq_len:.2f}, "
             f"avg_jump_len={avg_jump_length:.2f}, "
