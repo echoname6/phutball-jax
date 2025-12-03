@@ -489,8 +489,6 @@ def play_games_batched(
         actions=all_actions,
     )
 
-
-
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def play_match_batched(
     home_params: dict,

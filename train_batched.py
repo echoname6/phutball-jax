@@ -513,8 +513,8 @@ class AlphaZeroTrainer:
                 winners,
                 home_is_P1,
             ) = play_match_batched(
-                params_A=current_params,   # treat A as "home"
-                params_B=opp_params,       # treat B as "away"
+                home_params=current_params,
+                away_params=opp_params,
                 rng=match_rng,
                 network=self.network,
                 env_config=self.env_config,
