@@ -27,6 +27,7 @@ from self_play_batched import (
     ReplayBuffer,
     compute_phutball_stats,
     play_match_batched,
+    play_vs_random_batched, 
     batched_mcts_policy,
     batched_reset,
 )
@@ -83,7 +84,10 @@ class TrainConfig:
     eval_games_per_color: int = 5      # 5 as P1 + 5 as P2 per opponent
     eval_num_simulations: int = 128    # MCTS sims per move during eval
     eval_max_moves: int = 2048         # cutoff to avoid marathon eval games
-    eval_temperature: float = 0.0 
+    eval_temperature: float = 0.0
+
+    eval_vs_random_games: int = 100
+    eval_vs_random_threshold: float = 0.90 
 
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
@@ -409,7 +413,17 @@ class AlphaZeroTrainer:
                 self.save_checkpoint()
 
                 if self.config.eval_enable:
-                    self.evaluate_current_checkpoint_vs_recent()
+                    # First check vs random
+                    win_rate = self.evaluate_vs_random_batched()
+                    
+                    # Only run expensive checkpoint-vs-checkpoint if we're beating random
+                    if win_rate >= self.config.eval_vs_random_threshold:
+                        print(f"  [eval] Win rate {win_rate:.1%} >= {self.config.eval_vs_random_threshold:.0%}, "
+                            f"running checkpoint comparison...")
+                        self.evaluate_current_checkpoint_vs_recent()
+                    else:
+                        print(f"  [eval] Win rate {win_rate:.1%} < {self.config.eval_vs_random_threshold:.0%}, "
+                            f"skipping checkpoint comparison")
 
             # iteration timing + wandb logging
             iter_time = time.time() - iter_start
@@ -609,6 +623,37 @@ class AlphaZeroTrainer:
 
         # persist RNG so eval randomness keeps moving forward
         self.rng = rng
+    
+
+    def evaluate_vs_random_batched(self) -> float:
+        """
+        Evaluate current checkpoint vs random. Returns win rate.
+        """
+        self.rng, eval_rng = jax.random.split(self.rng)
+        
+        ckpt_wins, draws, rand_wins, turns, _, _ = play_vs_random_batched(
+            checkpoint_params=self.get_network_params(),
+            rng=eval_rng,
+            network=self.network,
+            env_config=self.env_config,
+            num_games=self.config.eval_vs_random_games,
+            max_moves=self.config.eval_max_moves,
+            num_simulations=self.config.eval_num_simulations,
+            temperature=self.config.eval_temperature,
+        )
+        
+        ckpt_wins = int(ckpt_wins)
+        draws = int(draws)
+        rand_wins = int(rand_wins)
+        total = ckpt_wins + draws + rand_wins
+        
+        win_rate = ckpt_wins / total if total > 0 else 0.0
+        avg_turns = float(jnp.mean(turns))
+        
+        print(f"  [eval] vs random: {ckpt_wins}-{draws}-{rand_wins} "
+            f"(win rate: {win_rate:.1%}, avg turns: {avg_turns:.1f})")
+        
+        return win_rate
 
     def run_round_robin(
         self,
@@ -811,9 +856,6 @@ class AlphaZeroTrainer:
                 ratings[i] += K * (s_01 - e_01)
 
         return names, scores, games_mat, ratings, (W_mat, D_mat, L_mat)
-
-
-
 
 def compute_elo_from_results(
     names: List[str],

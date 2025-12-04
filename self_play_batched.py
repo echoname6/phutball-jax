@@ -698,6 +698,137 @@ def play_match_batched(
         home_is_P1,
     )
 
+@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
+def play_vs_random_batched(
+    checkpoint_params: dict,
+    rng: jnp.ndarray,
+    network: PhutballNetwork,
+    env_config: EnvConfig,
+    num_games: int,
+    max_moves: int,
+    num_simulations: int,
+    temperature: float = 0.0,
+):
+    """
+    Play checkpoint vs random policy.
+    
+    Runs num_games total:
+      - games [0 .. num_games//2 - 1]: checkpoint as P1, random as P2
+      - games [num_games//2 .. num_games - 1]: random as P1, checkpoint as P2
+    
+    Returns:
+        checkpoint_wins: number of wins for checkpoint
+        draws: number of draws  
+        random_wins: number of wins for random
+        per_game_turns: turns per game
+        winners: raw winner array {0=draw, 1=P1, 2=P2}
+        checkpoint_is_P1: bool array indicating which color checkpoint played
+    """
+    rows, cols = env_config.rows, env_config.cols
+    total_positions = rows * cols
+    action_space_size = 2 * total_positions + 1
+    
+    games_per_color = num_games // 2
+    batch_size = 2 * games_per_color
+    
+    # Which games have checkpoint as P1?
+    checkpoint_is_P1 = jnp.concatenate([
+        jnp.ones((games_per_color,), dtype=jnp.bool_),
+        jnp.zeros((games_per_color,), dtype=jnp.bool_),
+    ])
+    checkpoint_is_P2 = ~checkpoint_is_P1
+    
+    # Initial states
+    states = batched_reset(env_config, batch_size)
+    terminated = jnp.zeros((batch_size,), dtype=jnp.bool_)
+    step0 = jnp.int32(0)
+    
+    def cond_fn(carry):
+        states, terminated, rng, step_idx = carry
+        any_active = jnp.any(~terminated)
+        return jnp.logical_and(step_idx < max_moves, any_active)
+    
+    def body_fn(carry):
+        states, terminated, rng, step_idx = carry
+        
+        current_player = states.current_player
+        
+        # Determine if checkpoint is to move
+        use_checkpoint = jnp.where(
+            current_player == 1,
+            checkpoint_is_P1,
+            checkpoint_is_P2,
+        )
+        
+        rng, rng_ckpt, rng_rand = jax.random.split(rng, 3)
+        
+        # Get checkpoint actions via MCTS
+        actions_ckpt, _, _ = batched_mcts_policy(
+            checkpoint_params,
+            states,
+            rng_ckpt,
+            network,
+            env_config,
+            num_simulations=num_simulations,
+            temperature=temperature,
+        )
+        
+        # Get random actions (uniform over legal)
+        def get_random_action(state, rng_key):
+            legal = get_legal_actions(state, env_config)
+            # Uniform over legal actions
+            probs = legal.astype(jnp.float32)
+            probs = probs / jnp.sum(probs)
+            return jax.random.choice(rng_key, action_space_size, p=probs)
+        
+        rand_rngs = jax.random.split(rng_rand, batch_size)
+        actions_rand = jax.vmap(get_random_action)(states, rand_rngs)
+        
+        # Select action based on who's moving
+        actions = jnp.where(use_checkpoint, actions_ckpt, actions_rand)
+        
+        # Step environments
+        new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
+        
+        # Freeze terminated games
+        done_mask = terminated | new_states_raw.terminated
+        
+        new_states = PhutballState(
+            board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
+            ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
+            current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
+            is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
+            terminated=done_mask,
+            winner=jnp.where(terminated, states.winner, new_states_raw.winner),
+            num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
+        )
+        
+        return (new_states, done_mask, rng, step_idx + jnp.int32(1))
+    
+    init_carry = (states, terminated, rng, step0)
+    final_states, _, _, _ = lax.while_loop(cond_fn, body_fn, init_carry)
+    
+    winners = final_states.winner
+    per_game_turns = final_states.num_turns
+    
+    # Compute wins from checkpoint's POV
+    checkpoint_win = ((winners == 1) & checkpoint_is_P1) | ((winners == 2) & ~checkpoint_is_P1)
+    random_win = ((winners == 1) & ~checkpoint_is_P1) | ((winners == 2) & checkpoint_is_P1)
+    draw_mask = (winners == 0)
+    
+    checkpoint_wins = jnp.sum(checkpoint_win.astype(jnp.int32))
+    random_wins = jnp.sum(random_win.astype(jnp.int32))
+    draws = jnp.sum(draw_mask.astype(jnp.int32))
+    
+    return (
+        checkpoint_wins,
+        draws,
+        random_wins,
+        per_game_turns,
+        winners,
+        checkpoint_is_P1,
+    )
+
 
 def trajectory_to_training_examples(
     trajectory: TrajectoryData,
