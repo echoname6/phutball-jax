@@ -981,6 +981,16 @@ def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
     return win_rate
 
 
+def get_buffer_size(rows, cols, games_per_iter=256, target_staleness_iters=12):
+    estimated_moves_per_game = (rows * cols) // 3 * 2
+    examples_per_iter = games_per_iter * estimated_moves_per_game
+    return examples_per_iter * target_staleness_iters
+
+def get_train_steps(buffer_size, batch_size=256, target_epochs_per_iter=1):
+    raw_steps = (buffer_size * target_epochs_per_iter) // batch_size
+    rounded = round(raw_steps / 100) * 100
+    return max(100, rounded)
+
 def make_train_config(
     rows: int,
     cols: int,
@@ -996,6 +1006,11 @@ def make_train_config(
     Convenience factory for TrainConfig so we don't duplicate hyperparams
     in every notebook/script.
     """
+
+    buffer_size = get_buffer_size(rows, cols)
+    train_steps = get_train_steps(buffer_size)
+
+
     return TrainConfig(
         # Environment
         rows=rows,
@@ -1017,10 +1032,10 @@ def make_train_config(
         batch_size_train=256,
         learning_rate=1e-3,
         weight_decay=1e-4,
-        train_steps_per_iteration=1000,
+        train_steps_per_iteration=train_steps,
 
         # Replay buffer
-        buffer_size=500_000,
+        buffer_size=buffer_size,
         min_buffer_size=1_000,
 
         # Iterations / checkpoints
