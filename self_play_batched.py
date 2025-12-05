@@ -698,7 +698,7 @@ def play_match_batched(
         home_is_P1,
     )
 
-@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
+@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7))
 def play_vs_random_batched(
     checkpoint_params: dict,
     rng: jnp.ndarray,
