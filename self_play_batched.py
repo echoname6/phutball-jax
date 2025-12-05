@@ -157,6 +157,8 @@ def batched_mcts_policy(
     env_config: EnvConfig,
     num_simulations: int = 50,
     temperature: float = 1.0,
+    dirichlet_alpha: float = 0.3,
+    dirichlet_fraction: float = 0.25,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Get MCTS-improved policy for a batch of states.
@@ -188,20 +190,35 @@ def batched_mcts_policy(
     
     legal_mask = jax.vmap(single_legal)(states)
     masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+
+    rng, noise_rng = jax.random.split(rng)
     
-    # Create root for MCTS
+    priors = jax.nn.softmax(masked_logits, axis=-1)
+    
+    # Sample Dirichlet noise for each state in batch
+    noise_rngs = jax.random.split(noise_rng, batch_size)
+    noise = jax.vmap(
+        lambda r: jax.random.dirichlet(r, jnp.full(action_space_size, dirichlet_alpha))
+    )(noise_rngs)
+    
+    # Mix: (1 - ε) * prior + ε * noise, but only on legal actions
+    noisy_priors = (1 - dirichlet_fraction) * priors + dirichlet_fraction * noise
+    noisy_priors = jnp.where(legal_mask == 1, noisy_priors, 0.0)
+    noisy_priors = noisy_priors / (noisy_priors.sum(axis=-1, keepdims=True) + 1e-8)
+
+    noisy_logits = jnp.log(noisy_priors + 1e-8)
+    noisy_logits = jnp.where(legal_mask == 1, noisy_logits, -1e9)
+    
     root = mctx.RootFnOutput(
-        prior_logits=masked_logits,
+        prior_logits=noisy_logits,
         value=values,
         embedding=states,
     )
     
-    # Create recurrent function
     recurrent_fn = make_mcts_recurrent_fn(network, env_config)
     
-    # Run MCTS
     rng, mcts_rng = jax.random.split(rng)
-    policy_output = mctx.gumbel_muzero_policy(
+    policy_output = mctx.muzero_policy(
         params=params,
         rng_key=mcts_rng,
         root=root,
@@ -210,21 +227,16 @@ def batched_mcts_policy(
         max_num_considered_actions=32,
         gumbel_scale=1.0,
     )
-    
-    # Get MCTS policy (visit counts normalized)
+
     mcts_policy = policy_output.action_weights
     
-    # Get root value from search
     root_values = policy_output.search_tree.node_values[:, 0]
     
-    # Sample action based on temperature
     rng, sample_rng = jax.random.split(rng)
     
     if temperature < 0.01:
-        # Greedy
         actions = jnp.argmax(mcts_policy, axis=-1)
     else:
-        # Sample with temperature
         logits = jnp.log(mcts_policy + 1e-8) / temperature
         sample_rngs = jax.random.split(sample_rng, batch_size)
         actions = jax.vmap(lambda r, l: jax.random.categorical(r, l))(sample_rngs, logits)
