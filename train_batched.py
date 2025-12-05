@@ -87,7 +87,11 @@ class TrainConfig:
     eval_temperature: float = 0.0
 
     eval_vs_random_games: int = 100
-    eval_vs_random_threshold: float = 0.90 
+    eval_vs_random_threshold: Optional[float] = None
+    stop_when_beating_random: bool = False
+
+    use_wandb: bool = False
+
 
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
@@ -415,15 +419,38 @@ class AlphaZeroTrainer:
                 if self.config.eval_enable:
                     # First check vs random
                     win_rate = self.evaluate_vs_random_batched()
-                    
-                    # Only run expensive checkpoint-vs-checkpoint if we're beating random
-                    if win_rate >= self.config.eval_vs_random_threshold:
-                        print(f"  [eval] Win rate {win_rate:.1%} >= {self.config.eval_vs_random_threshold:.0%}, "
-                            f"running checkpoint comparison...")
-                        self.evaluate_current_checkpoint_vs_recent()
+                    threshold = self.config.eval_vs_random_threshold
+
+                    if threshold is not None:
+                        # Threshold is active: gate the expensive comparison
+                        if win_rate >= threshold:
+                            print(
+                                f"  [eval] Win rate {win_rate:.1%} >= {threshold:.0%}, "
+                                f"running checkpoint comparison..."
+                            )
+                            self.evaluate_current_checkpoint_vs_recent()
+                        else:
+                            print(
+                                f"  [eval] Win rate {win_rate:.1%} < {threshold:.0%}, "
+                                f"skipping checkpoint comparison"
+                            )
+
+                        # Optional early stop if we are configured to do so
+                        if self.config.stop_when_beating_random and win_rate >= threshold:
+                            print(
+                                f"  [train] Reached eval_vs_random_threshold={threshold:.0%}, "
+                                f"stopping training early for this board size."
+                            )
+                            break
                     else:
-                        print(f"  [eval] Win rate {win_rate:.1%} < {self.config.eval_vs_random_threshold:.0%}, "
-                            f"skipping checkpoint comparison")
+                        # No threshold configured: don't gate on it at all.
+                        # Behave like the old code: always run checkpoint-vs-checkpoint eval.
+                        print(
+                            "  [eval] eval_vs_random_threshold not set; "
+                            "running checkpoint comparison unconditionally."
+                        )
+                        self.evaluate_current_checkpoint_vs_recent()
+
 
             # iteration timing + wandb logging
             iter_time = time.time() - iter_start
@@ -952,6 +979,73 @@ def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
     win_rate = wins / num_games
     print(f"Evaluation vs Random: {wins}/{num_games} wins ({win_rate*100:.1f}%)")
     return win_rate
+
+
+def make_train_config(
+    rows: int,
+    cols: int,
+    checkpoint_dir: str,
+    num_iterations: int = 256,
+    checkpoint_every: int = 20,
+    use_wandb: bool = False,
+    wandb_run_name: Optional[str] = None,
+    eval_vs_random_threshold: Optional[float] = 0.90,
+    stop_when_beating_random: bool = True,
+) -> TrainConfig:
+    """
+    Convenience factory for TrainConfig so we don't duplicate hyperparams
+    in every notebook/script.
+    """
+    return TrainConfig(
+        # Environment
+        rows=rows,
+        cols=cols,
+
+        # Network
+        num_channels=64,
+        num_res_blocks=8,
+
+        # Self-play
+        batch_size_games=128,
+        games_per_iteration=256,
+        max_turns_per_game=512,
+        max_moves_per_game=512,
+        temperature=1.0,
+        num_simulations=64,
+
+        # Training
+        batch_size_train=256,
+        learning_rate=1e-3,
+        weight_decay=1e-4,
+        train_steps_per_iteration=1000,
+
+        # Replay buffer
+        buffer_size=500_000,
+        min_buffer_size=1_000,
+
+        # Iterations / checkpoints
+        num_iterations=num_iterations,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_every=checkpoint_every,
+        log_every=1,
+
+        # Eval vs random
+        eval_enable=True,
+        eval_vs_random_games=100,
+        eval_vs_random_threshold=eval_vs_random_threshold,
+        stop_when_beating_random=stop_when_beating_random,
+        eval_max_prev_checkpoints=5,
+        eval_games_per_color=5,
+        eval_num_simulations=128,
+        eval_max_moves=512,
+        eval_temperature=0.0,
+
+        # Wandb
+        use_wandb=use_wandb,
+        wandb_project="phutball-az",
+        wandb_run_name=wandb_run_name,
+        wandb_mode="online" if use_wandb else "disabled",
+    )
 
 
 
