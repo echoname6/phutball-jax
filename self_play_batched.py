@@ -219,13 +219,11 @@ def batched_mcts_policy(
     
     rng, mcts_rng = jax.random.split(rng)
     policy_output = mctx.muzero_policy(
-        params=params,
-        rng_key=mcts_rng,
-        root=root,
-        recurrent_fn=recurrent_fn,
-        num_simulations=num_simulations,
-        max_num_considered_actions=32,
-        gumbel_scale=1.0,
+    params=params,
+    rng_key=mcts_rng,
+    root=root,
+    recurrent_fn=recurrent_fn,
+    num_simulations=num_simulations,
     )
 
     mcts_policy = policy_output.action_weights
