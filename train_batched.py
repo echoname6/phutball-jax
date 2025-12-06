@@ -378,6 +378,14 @@ class AlphaZeroTrainer:
     
     def train(self):
         """Main training loop."""
+
+        # Auto-resume from latest checkpoint if exists
+        existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
+        if existing:
+            latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            self.load_checkpoint(latest)
+            self.iteration += 1
+        print(f"Resuming from iteration {self.iteration}")
         print("=" * 60)
         print("AlphaZero Training for Phutball (Batched)")
         print("=" * 60)
