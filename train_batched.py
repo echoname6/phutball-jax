@@ -426,9 +426,8 @@ class AlphaZeroTrainer:
 
                 if self.config.eval_enable:
                     # First check vs random
-                    win_rate = self.evaluate_vs_random_batched()
+                    win_rate, stats = self.evaluate_vs_random_batched()
                     threshold = self.config.eval_vs_random_threshold
-
                     if threshold is not None:
                         # Threshold is active: gate the expensive comparison
                         if win_rate >= threshold:
@@ -660,13 +659,18 @@ class AlphaZeroTrainer:
         self.rng = rng
     
 
-    def evaluate_vs_random_batched(self) -> float:
+    def evaluate_vs_random_batched(self):
         """
-        Evaluate current checkpoint vs random. Returns win rate.
+        Evaluate current checkpoint vs random, side-aware.
+        Returns (overall_win_rate, stats_dict).
         """
         self.rng, eval_rng = jax.random.split(self.rng)
-        
-        ckpt_wins, draws, rand_wins, turns, _, _ = play_vs_random_batched(
+
+        (
+            p1_wins, p1_draws, p1_losses,
+            p2_wins, p2_draws, p2_losses,
+            turns,
+        ) = play_vs_random_batched(
             checkpoint_params=self.get_network_params(),
             rng=eval_rng,
             network=self.network,
@@ -676,19 +680,83 @@ class AlphaZeroTrainer:
             num_simulations=self.config.eval_num_simulations,
             temperature=self.config.eval_temperature,
         )
-        
-        ckpt_wins = int(ckpt_wins)
-        draws = int(draws)
-        rand_wins = int(rand_wins)
-        total = ckpt_wins + draws + rand_wins
-        
-        win_rate = ckpt_wins / total if total > 0 else 0.0
+
+        # Make sure these are Python ints
+        p1_wins   = int(p1_wins)
+        p1_draws  = int(p1_draws)
+        p1_losses = int(p1_losses)
+        p2_wins   = int(p2_wins)
+        p2_draws  = int(p2_draws)
+        p2_losses = int(p2_losses)
+
+        # Totals
+        total_p1 = p1_wins + p1_draws + p1_losses
+        total_p2 = p2_wins + p2_draws + p2_losses
+        total    = total_p1 + total_p2
+
+        # Overall (checkpoint POV)
+        total_wins   = p1_wins + p2_wins
+        total_draws  = p1_draws + p2_draws
+        total_losses = p1_losses + p2_losses
+
+        win_rate_overall  = total_wins / total if total > 0 else 0.0
+        draw_rate_overall = total_draws / total if total > 0 else 0.0
+        loss_rate_overall = total_losses / total if total > 0 else 0.0
+
+        # Per-side win rates (checkpoint as P1 / P2)
+        win_rate_p1 = p1_wins / total_p1 if total_p1 > 0 else 0.0
+        win_rate_p2 = p2_wins / total_p2 if total_p2 > 0 else 0.0
+
+        # “Score” (win - loss) / total, overall and per-side
+        score_overall = (total_wins - total_losses) / total if total > 0 else 0.0
+        score_p1 = (p1_wins - p1_losses) / total_p1 if total_p1 > 0 else 0.0
+        score_p2 = (p2_wins - p2_losses) / total_p2 if total_p2 > 0 else 0.0
+        side_bias = score_p1 - score_p2  # positive => better as P1
+
         avg_turns = float(jnp.mean(turns))
-        
-        print(f"  [eval] vs random: {ckpt_wins}-{draws}-{rand_wins} "
-            f"(win rate: {win_rate:.1%}, avg turns: {avg_turns:.1f})")
-        
-        return win_rate
+
+        print(
+            "  [eval] vs random (side-aware):\n"
+            f"    as P1: {p1_wins}-{p1_draws}-{p1_losses} "
+            f"(win: {win_rate_p1:.1%}, score: {score_p1:.3f})\n"
+            f"    as P2: {p2_wins}-{p2_draws}-{p2_losses} "
+            f"(win: {win_rate_p2:.1%}, score: {score_p2:.3f})\n"
+            f"    combined: win {win_rate_overall:.1%}, draw {draw_rate_overall:.1%}, "
+            f"loss {loss_rate_overall:.1%}, score {score_overall:.3f}, "
+            f"side_bias {side_bias:.3f}, avg turns {avg_turns:.1f}"
+        )
+
+        stats = {
+            "total_games": total,
+            "overall": {
+                "wins": total_wins,
+                "draws": total_draws,
+                "losses": total_losses,
+                "win_rate": win_rate_overall,
+                "draw_rate": draw_rate_overall,
+                "loss_rate": loss_rate_overall,
+                "score": score_overall,
+            },
+            "p1": {
+                "wins": p1_wins,
+                "draws": p1_draws,
+                "losses": p1_losses,
+                "win_rate": win_rate_p1,
+                "score": score_p1,
+            },
+            "p2": {
+                "wins": p2_wins,
+                "draws": p2_draws,
+                "losses": p2_losses,
+                "win_rate": win_rate_p2,
+                "score": score_p2,
+            },
+            "side_bias": side_bias,
+            "avg_turns": avg_turns,
+        }
+
+        return win_rate_overall, stats
+
 
     def run_round_robin(
         self,
