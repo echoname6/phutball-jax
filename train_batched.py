@@ -309,7 +309,14 @@ class AlphaZeroTrainer:
             return {}
         
         start_time = time.time()
-        metrics_sum = {'policy_loss': 0, 'value_loss': 0, 'total_loss': 0}
+        metrics_sum = {
+            'policy_loss': 0.0,
+            'value_loss': 0.0,
+            'total_loss': 0.0,
+            'policy_entropy': 0.0,
+            'mcts_entropy': 0.0,
+            'kl_divergence': 0.0,
+        }
         
         for step_idx in range(self.config.train_steps_per_iteration):
             self.rng, step_rng = jax.random.split(self.rng)
