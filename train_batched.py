@@ -1077,6 +1077,7 @@ def make_train_config(
     wandb_run_name: Optional[str] = None,
     eval_vs_random_threshold: Optional[float] = 0.90,
     stop_when_beating_random: bool = True,
+    num_simulations: int = 50
 ) -> TrainConfig:
     """
     Convenience factory for TrainConfig so we don't duplicate hyperparams
@@ -1102,7 +1103,7 @@ def make_train_config(
         max_turns_per_game=512,
         max_moves_per_game=512,
         temperature=1.0,
-        num_simulations=64,
+        num_simulations=num_simulations,
 
         # Training
         batch_size_train=256,

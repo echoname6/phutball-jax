@@ -168,15 +168,26 @@ def compute_loss(params, batch_norm_state, network, batch, rng):
     # Total loss
     total_loss = policy_loss + value_loss
 
-    # Policy entropy (exploration breadth)
+    # Policy entropy (network output)
     probs = jax.nn.softmax(policy_logits)
     entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
+    
+    # KL divergence: D_KL(MCTS || Network) = sum(mcts * log(mcts / net))
+    # = sum(mcts * log(mcts)) - sum(mcts * log(net))
+    # The second term is just the cross-entropy (policy_loss before mean)
+    mcts_entropy = -jnp.sum(policy_targets * jnp.log(policy_targets + 1e-8), axis=-1)
+    kl_div = jnp.mean(-mcts_entropy - jnp.sum(policy_targets * log_probs, axis=-1))
+    # Simplifies to: kl_div = policy_loss - mean(mcts_entropy)
+    
+    total_loss = policy_loss + value_loss
     
     metrics = {
         'policy_loss': policy_loss,
         'value_loss': value_loss,
         'total_loss': total_loss,
-        'entropy': entropy
+        'policy_entropy': entropy,
+        'mcts_entropy': jnp.mean(mcts_entropy),
+        'kl_divergence': kl_div,
     }
     
     return total_loss, (new_state['batch_stats'], metrics)
