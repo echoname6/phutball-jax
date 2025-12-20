@@ -158,20 +158,25 @@ def compute_loss(params, batch_norm_state, network, batch, rng):
     )
     
     # Policy loss: cross-entropy with MCTS policy targets
-    # policy_targets are probabilities from MCTS, policy_logits are raw logits
+    # policy_targets are probabilities from MCTS, policy_logits be logits
     log_probs = jax.nn.log_softmax(policy_logits)
     policy_loss = -jnp.mean(jnp.sum(policy_targets * log_probs, axis=-1))
     
     # Value loss: MSE between predicted value and game outcome
     value_loss = jnp.mean(jnp.square(value_preds - value_targets))
     
-    # Total loss (can weight these differently if needed)
+    # Total loss
     total_loss = policy_loss + value_loss
+
+    # Policy entropy (exploration breadth)
+    probs = jax.nn.softmax(policy_logits)
+    entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
     
     metrics = {
         'policy_loss': policy_loss,
         'value_loss': value_loss,
         'total_loss': total_loss,
+        'entropy': entropy
     }
     
     return total_loss, (new_state['batch_stats'], metrics)
