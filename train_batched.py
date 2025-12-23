@@ -1070,10 +1070,6 @@ def get_buffer_size(rows, cols, games_per_iter=256, max_moves=512, target_stalen
     examples_per_iter = games_per_iter * max_moves
     return examples_per_iter * target_staleness_iters
 
-def get_train_steps(buffer_size, batch_size=256, target_epochs_per_iter=1):
-    raw_steps = (buffer_size * target_epochs_per_iter) // batch_size
-    rounded = round(raw_steps / 100) * 100
-    return max(100, rounded)
 
 def make_train_config(
     rows: int,
@@ -1095,7 +1091,6 @@ def make_train_config(
     """
 
     buffer_size = get_buffer_size(rows, cols)
-    train_steps = get_train_steps(buffer_size)
 
 
     return TrainConfig(
@@ -1121,7 +1116,7 @@ def make_train_config(
         batch_size_train=256,
         learning_rate=1e-3,
         weight_decay=1e-4,
-        train_steps_per_iteration=train_steps,
+        train_steps_per_iteration=100,
 
         # Replay buffer
         buffer_size=buffer_size,
