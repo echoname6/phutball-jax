@@ -219,13 +219,18 @@ def batched_mcts_policy(
     
     rng, sample_rng = jax.random.split(rng)
     
-    if temperature < 0.01:
-        actions = jnp.argmax(mcts_policy, axis=-1)
-    else:
-        logits = jnp.log(mcts_policy + 1e-8) / temperature
-        sample_rngs = jax.random.split(sample_rng, batch_size)
-        actions = jax.vmap(lambda r, l: jax.random.categorical(r, l))(sample_rngs, logits)
+    # Always compute both paths, select with jnp.where (JAX-traceable)
+    greedy_actions = jnp.argmax(mcts_policy, axis=-1)
     
+    # Safe temperature division (avoid div by zero)
+    safe_temp = jnp.maximum(temperature, 1e-8)
+    logits = jnp.log(mcts_policy + 1e-8) / safe_temp
+    sample_rngs = jax.random.split(sample_rng, batch_size)
+    sampled_actions = jax.vmap(lambda r, l: jax.random.categorical(r, l))(sample_rngs, logits)
+    
+    # Select based on temperature
+    actions = jnp.where(temperature < 0.01, greedy_actions, sampled_actions)
+        
     return actions, mcts_policy, root_values
 
 
