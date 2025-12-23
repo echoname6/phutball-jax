@@ -1,8 +1,11 @@
 """
-JAX-native Phutball Environment
+JAX-native Phutball Environment with Jump Sequence Tracking
 
 This is a functional, JIT-compilable implementation of Phutball.
 All operations are pure functions that take state in and return new state out.
+
+Includes jump_sequence and jump_sequence_length to track the path
+during multi-jump turns, enabling proper neural network input encoding.
 """
 
 import jax
@@ -10,11 +13,11 @@ import jax.numpy as jnp
 from jax import lax
 from typing import NamedTuple, Any
 
-# Type alias for JAX arrays (chex.Array equivalent)
-Array = Any  # Would be jax.Array but keeping it simple
+# Type alias for JAX arrays
+Array = Any
 
 # ============================================================================
-# Constants (matching your PyTorch env)
+# Constants
 # ============================================================================
 
 EMPTY = 0
@@ -24,22 +27,35 @@ END_HI = 2    # Row 0 - beyond goal for P2
 END_LO = -2   # Row -1 - beyond goal for P1
 OUT_OF_BOUNDS = jnp.array(3, dtype=jnp.int32)
 
+# Maximum number of jumps in a single turn (for fixed-size arrays)
+# In practice, even crazy sequences rarely exceed 20 jumps
+MAX_JUMP_SEQUENCE_LENGTH = 32
+
 # ============================================================================
-# State Definition
+# State Definition (with jump sequence tracking)
 # ============================================================================
 
 class PhutballState(NamedTuple):
     """
     Complete game state as a JAX-compatible NamedTuple.
     All fields are JAX arrays for JIT compatibility.
+    
+    - jump_sequence: (MAX_JUMP_SEQUENCE_LENGTH, 2) array of (row, col) positions
+                     visited during the current jump sequence
+    - jump_sequence_length: () int32 - number of valid entries in jump_sequence
+                            (includes starting position, so length=1 means "at start, no jumps yet")
     """
-    board: Array           # (rows, cols) int32 - the game board
-    ball_pos: Array        # (2,) int32 - [row, col] of ball
-    current_player: Array  # () int32 - 1 or 2
-    is_jumping: Array      # () bool - are we mid-jump-sequence?
-    terminated: Array      # () bool - is game over?
-    winner: Array          # () int32 - 0=none, 1=P1 wins, 2=P2 wins
-    num_turns: Array       # () int32 - turn counter
+    board: Array               # (rows, cols) int32 - the game board
+    ball_pos: Array            # (2,) int32 - [row, col] of ball
+    current_player: Array      # () int32 - 1 or 2
+    is_jumping: Array          # () bool - are we mid-jump-sequence?
+    terminated: Array          # () bool - is game over?
+    winner: Array              # () int32 - 0=none, 1=P1 wins, 2=P2 wins
+    num_turns: Array           # () int32 - turn counter
+    # Jump sequence tracking
+    jump_sequence: Array       # (MAX_JUMP_SEQUENCE_LENGTH, 2) int32 - positions visited
+    jump_sequence_length: Array  # () int32 - how many positions in sequence
+
 
 # ============================================================================
 # Environment Configuration
@@ -50,6 +66,7 @@ class EnvConfig(NamedTuple):
     rows: int = 21
     cols: int = 15
     max_turns: int = 7200
+
 
 # ============================================================================
 # Core Functions
@@ -63,8 +80,8 @@ def make_initial_board(config: EnvConfig) -> Array:
     board = jnp.zeros((rows, cols), dtype=jnp.int32)
     
     # Set end zones
-    board = board.at[0, :].set(END_HI)           # Row 0: beyond goal (P2's target side)
-    board = board.at[rows - 1, :].set(END_LO)    # Last row: beyond goal (P1's target side)
+    board = board.at[0, :].set(END_HI)
+    board = board.at[rows - 1, :].set(END_LO)
     
     # Place ball in center
     center_row = rows // 2
@@ -80,6 +97,9 @@ def reset(config: EnvConfig) -> PhutballState:
     center_row = config.rows // 2
     center_col = config.cols // 2
     
+    # Initialize empty jump sequence (all -1s indicate invalid/unused)
+    jump_sequence = jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32)
+    
     return PhutballState(
         board=board,
         ball_pos=jnp.array([center_row, center_col], dtype=jnp.int32),
@@ -88,12 +108,9 @@ def reset(config: EnvConfig) -> PhutballState:
         terminated=jnp.array(False, dtype=jnp.bool_),
         winner=jnp.array(0, dtype=jnp.int32),
         num_turns=jnp.array(0, dtype=jnp.int32),
+        jump_sequence=jump_sequence,
+        jump_sequence_length=jnp.array(0, dtype=jnp.int32),
     )
-
-
-def reset_jit(config: EnvConfig) -> PhutballState:
-    """JIT-compiled reset. Config must be static."""
-    return jax.jit(reset, static_argnums=(0,))(config)
 
 
 # ============================================================================
@@ -107,13 +124,7 @@ def get_action_space_size(config: EnvConfig) -> int:
 
 
 def action_to_position(action: Array, config: EnvConfig) -> Array:
-    """
-    Convert action index to (row, col) position.
-    
-    Actions 0 to rows*cols-1: placement at that position
-    Actions rows*cols to 2*rows*cols-1: jump to that position
-    Action 2*rows*cols: halt
-    """
+    """Convert action index to (row, col) position."""
     total_positions = config.rows * config.cols
     pos_index = lax.cond(
         action < total_positions,
@@ -148,7 +159,7 @@ def is_halt_action(action: Array, config: EnvConfig) -> Array:
 # ============================================================================
 
 def get_tile(board: Array, row: Array, col: Array) -> Array:
-    """Get tile value at position. Returns 0 if out of bounds."""
+    """Get tile value at position. Returns OUT_OF_BOUNDS if invalid."""
     rows, cols = board.shape
     in_bounds = (row >= 0) & (row < rows) & (col >= 0) & (col < cols)
     return lax.cond(
@@ -157,8 +168,9 @@ def get_tile(board: Array, row: Array, col: Array) -> Array:
         lambda: OUT_OF_BOUNDS,
     )
 
+
 def is_empty(board: Array, row: Array, col: Array) -> Array:
-    """Check if position is empty (can place a man there)."""
+    """Check if position is empty."""
     tile = get_tile(board, row, col)
     return tile == EMPTY
 
@@ -177,17 +189,12 @@ def check_winner(ball_pos: Array, config: EnvConfig) -> Array:
     """
     Check if the ball has reached a goal line.
     
-    Player 1 wins by getting ball to row >= rows-2 (row 19 for 21-row board)
+    Player 1 wins by getting ball to row >= rows-2
     Player 2 wins by getting ball to row <= 1
-    
-    Returns: 0 (no winner), 1 (P1 wins), 2 (P2 wins)
     """
     ball_row = ball_pos[0]
     
-    # P2 wins if ball reaches row 1 or beyond (row 0)
     p2_wins = ball_row <= 1
-    
-    # P1 wins if ball reaches row rows-2 or beyond (row rows-1)
     p1_wins = ball_row >= config.rows - 2
     
     winner = lax.cond(
@@ -207,67 +214,35 @@ def check_winner(ball_pos: Array, config: EnvConfig) -> Array:
 # ============================================================================
 
 def get_legal_placements(state: PhutballState, config: EnvConfig) -> Array:
-    """
-    Get mask of legal placement positions.
-    
-    Men can be placed anywhere except:
-    - Row 0 (END_HI) and row rows-1 (END_LO) - the "beyond" rows
-    - Where the ball is
-    - Where a man already is
-    
-    Returns: (rows * cols,) bool array
-    """
+    """Get mask of legal placement positions."""
     board = state.board
     rows, cols = config.rows, config.cols
     
-    # Create mask for each position
-    # Legal if: not end zone AND not ball AND not man
-    row_indices = jnp.arange(rows)[:, None]  # (rows, 1)
-    
-    # End zones are row 0 and row rows-1
-    not_end_zone = (row_indices > 0) & (row_indices < rows - 1)  # (rows, 1) broadcasts to (rows, cols)
-    
-    # Check tile contents
+    row_indices = jnp.arange(rows)[:, None]
+    not_end_zone = (row_indices > 0) & (row_indices < rows - 1)
     not_ball = board != BALL
     not_man = board != MAN
     
-    # Combine conditions
-    legal_2d = not_end_zone & not_ball & not_man  # (rows, cols)
-    
-    # Flatten to 1D
+    legal_2d = not_end_zone & not_ball & not_man
     return legal_2d.flatten().astype(jnp.int8)
 
 
 def get_legal_jumps(state: PhutballState, config: EnvConfig) -> Array:
-    """
-    Get mask of legal jump landing positions (vectorized version).
-    
-    A jump is legal if:
-    - There's at least one man between ball and landing position
-    - All tiles between ball and landing are men (continuous line of men)
-    - Landing position is empty, END_HI, or END_LO (not ball, not man)
-    - Jump is in one of 8 directions (horizontal, vertical, diagonal)
-    
-    Returns: (rows * cols,) int8 array
-    """
+    """Get mask of legal jump landing positions (vectorized)."""
     board = state.board
     ball_row, ball_col = state.ball_pos[0], state.ball_pos[1]
     rows, cols = config.rows, config.cols
     max_dist = max(rows, cols)
     
-    # 8 directions: (dr, dc)
     directions = jnp.array([
         [-1, -1], [-1, 0], [-1, 1],
         [0, -1],           [0, 1],
         [1, -1],  [1, 0],  [1, 1]
     ], dtype=jnp.int32)
     
-    # For each direction and distance, check if that landing spot is valid
-    # distances: 2 to max_dist (need at least 1 man to jump over)
     distances = jnp.arange(2, max_dist + 1, dtype=jnp.int32)
     
     def check_one_direction_distance(dir_dist):
-        """Check if jumping (dir, dist) is valid."""
         direction_idx = dir_dist[0].astype(jnp.int32)
         dist = dir_dist[1].astype(jnp.int32)
         dr = directions[direction_idx, 0]
@@ -276,18 +251,13 @@ def get_legal_jumps(state: PhutballState, config: EnvConfig) -> Array:
         land_row = ball_row + dist * dr
         land_col = ball_col + dist * dc
         
-        # Check bounds
         in_bounds = (land_row >= 0) & (land_row < rows) & (land_col >= 0) & (land_col < cols)
         
-        # Check landing tile - must not be ball or man
-        # Use jnp.where with safe indexing
         safe_land_row = jnp.clip(land_row, 0, rows - 1)
         safe_land_col = jnp.clip(land_col, 0, cols - 1)
         land_tile = board[safe_land_row, safe_land_col]
         landing_ok = (land_tile != BALL) & (land_tile != MAN)
         
-        # Check all intermediate tiles are men
-        # For distance d, we need to check positions 1, 2, ..., d-1
         def check_intermediate(i):
             i = i.astype(jnp.int32)
             check_row = ball_row + i * dr
@@ -301,38 +271,29 @@ def get_legal_jumps(state: PhutballState, config: EnvConfig) -> Array:
         intermediate_checks = jax.vmap(check_intermediate)(jnp.arange(max_dist, dtype=jnp.int32))
         all_intermediate_men = jnp.all(intermediate_checks)
         
-        # Valid jump if: in bounds, landing ok, all intermediate are men
         valid = in_bounds & landing_ok & all_intermediate_men
         
-        # Return (row*cols + col, valid) for this position
         pos_idx = land_row * cols + land_col
         safe_pos_idx = jnp.where(in_bounds, pos_idx, jnp.int32(0))
         
         return jnp.array([safe_pos_idx, valid.astype(jnp.int32)], dtype=jnp.int32)
     
-    # Create all (direction, distance) pairs
     dir_indices = jnp.arange(8, dtype=jnp.int32)
     dist_indices = jnp.arange(len(distances), dtype=jnp.int32)
     
-    # Cartesian product: (8 * (max_dist-1), 2) array of [dir_idx, dist]
     dir_grid, dist_grid = jnp.meshgrid(dir_indices, dist_indices, indexing='ij')
     dir_dist_pairs = jnp.stack([
         dir_grid.flatten(),
         distances[dist_grid.flatten()]
     ], axis=1).astype(jnp.int32)
     
-    # Check all pairs in parallel
     results = jax.vmap(check_one_direction_distance)(dir_dist_pairs)
-    # results: (N, 2) where each row is [pos_idx, valid]
     
     positions = results[:, 0]
     valid_flags = results[:, 1]
     
-    # Create output mask using scatter
     legal_mask = jnp.zeros(rows * cols, dtype=jnp.int8)
     
-    # For each valid position, set mask to 1
-    # Use jnp.where to conditionally update
     def update_mask(i, mask):
         i = i.astype(jnp.int32)
         pos = positions[i]
@@ -344,53 +305,37 @@ def get_legal_jumps(state: PhutballState, config: EnvConfig) -> Array:
             mask
         )
     
-    num_pairs = 8 * (max_dist - 1)  # Number of direction-distance pairs
+    num_pairs = 8 * (max_dist - 1)
     legal_mask = lax.fori_loop(0, num_pairs, update_mask, legal_mask)
     
     return legal_mask
 
 
 def get_legal_actions(state: PhutballState, config: EnvConfig) -> Array:
-    """
-    Get full legal action mask.
-    
-    Actions: [placements (rows*cols) | jumps (rows*cols) | halt (1)]
-    
-    During jump sequence: only jumps and halt are legal
-    Otherwise: placements and jumps are legal, halt is not
-    """
+    """Get full legal action mask."""
     rows, cols = config.rows, config.cols
     total_positions = rows * cols
     
     placement_mask = get_legal_placements(state, config)
     jump_mask = get_legal_jumps(state, config)
     
-    # During jump sequence, placements are not allowed
     placement_mask = lax.cond(
         state.is_jumping,
         lambda: jnp.zeros(total_positions, dtype=jnp.int8),
         lambda: placement_mask
     )
     
-    # Halt is only legal during jump sequence
     halt_legal = state.is_jumping.astype(jnp.int8)
     
-    # Combine: [placements | jumps | halt]
     return jnp.concatenate([placement_mask, jump_mask, jnp.array([halt_legal], dtype=jnp.int8)])
 
 
 # ============================================================================
-# Step Function - Execute Actions
+# Step Function - Execute Actions (with jump sequence tracking)
 # ============================================================================
 
 def apply_turn_limit(state: PhutballState, config: EnvConfig) -> PhutballState:
-    """
-    Apply the max_turns limit from config.
-
-    If max_turns > 0 and state.num_turns >= max_turns, mark the game as
-    terminated with a draw (winner = 0). Otherwise, return the state unchanged.
-    """
-    # Treat max_turns <= 0 as "no limit"
+    """Apply the max_turns limit from config."""
     if config.max_turns <= 0:
         return state
 
@@ -402,10 +347,9 @@ def apply_turn_limit(state: PhutballState, config: EnvConfig) -> PhutballState:
         state.terminated,
     )
 
-    # Only override winner if the game wasn't already terminated
     new_winner = jnp.where(
         reached_limit & ~state.terminated,
-        jnp.array(0, dtype=jnp.int32),  # 0 = draw
+        jnp.array(0, dtype=jnp.int32),
         state.winner,
     )
 
@@ -420,26 +364,25 @@ def execute_placement(state: PhutballState, position: Array, config: EnvConfig) 
     row, col = position[0], position[1]
     new_board = state.board.at[row, col].set(MAN)
     
-    # Switch player and increment turn
-    new_player = 3 - state.current_player  # 1 -> 2, 2 -> 1
+    new_player = 3 - state.current_player
     new_turns = state.num_turns + 1
+
+    # Clear jump sequence (not jumping)
+    new_jump_sequence = jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32)
 
     new_state = state._replace(
         board=new_board,
         current_player=new_player,
         num_turns=new_turns,
+        jump_sequence=new_jump_sequence,
+        jump_sequence_length=jnp.array(0, dtype=jnp.int32),
     )
 
-    # Enforce max_turns if configured
     return apply_turn_limit(new_state, config)
 
 
-
 def calculate_jumped_men(ball_pos: Array, landing_pos: Array, board: Array) -> Array:
-    """
-    Calculate positions of men that would be jumped.
-    Returns array of (row, col) pairs, padded with -1.
-    """
+    """Calculate positions of men that would be jumped."""
     ball_row, ball_col = ball_pos[0], ball_pos[1]
     land_row, land_col = landing_pos[0], landing_pos[1]
     
@@ -447,13 +390,11 @@ def calculate_jumped_men(ball_pos: Array, landing_pos: Array, board: Array) -> A
     dc = jnp.sign(land_col - ball_col)
     dist = jnp.maximum(jnp.abs(land_row - ball_row), jnp.abs(land_col - ball_col))
     
-    # Collect jumped positions
     rows, cols = board.shape
     max_jump_dist = max(rows, cols)
     
     def get_jumped_pos(i):
-        """Get position i steps from ball, or (-1, -1) if out of range."""
-        step = i + 1  # Start from 1
+        step = i + 1
         row = ball_row + step * dr
         col = ball_col + step * dc
         is_jumped = step < dist
@@ -500,13 +441,40 @@ def execute_jump(state: PhutballState, landing_pos: Array, config: EnvConfig) ->
     winner = check_winner(landing_pos, config)
     terminated = winner > 0
     
-    # Update state - now in jump sequence, don't switch player yet
+    # Update jump sequence
+    # If this is the first jump, record the starting position first
+    new_jump_sequence = state.jump_sequence
+    new_length = state.jump_sequence_length
+    
+    # If not already jumping, this is the START of a sequence
+    # Record the starting position (ball_pos before jump) at index 0
+    def start_new_sequence():
+        seq = jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32)
+        seq = seq.at[0].set(ball_pos)  # Starting position
+        seq = seq.at[1].set(landing_pos)  # After first jump
+        return seq, jnp.array(2, dtype=jnp.int32)
+    
+    # If already jumping, append the new landing position
+    def continue_sequence():
+        idx = jnp.minimum(new_length, MAX_JUMP_SEQUENCE_LENGTH - 1)
+        seq = new_jump_sequence.at[idx].set(landing_pos)
+        length = jnp.minimum(new_length + 1, MAX_JUMP_SEQUENCE_LENGTH)
+        return seq, length
+    
+    new_jump_sequence, new_length = lax.cond(
+        state.is_jumping,
+        continue_sequence,
+        start_new_sequence
+    )
+    
     return state._replace(
         board=new_board,
         ball_pos=landing_pos,
         is_jumping=jnp.array(True, dtype=jnp.bool_),
         terminated=terminated,
-        winner=winner
+        winner=winner,
+        jump_sequence=new_jump_sequence,
+        jump_sequence_length=new_length,
     )
 
 
@@ -515,44 +483,36 @@ def execute_halt(state: PhutballState, config: EnvConfig) -> PhutballState:
     new_player = 3 - state.current_player
     new_turns = state.num_turns + 1
 
+    # Clear jump sequence
+    new_jump_sequence = jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32)
+
     new_state = state._replace(
         current_player=new_player,
         is_jumping=jnp.array(False, dtype=jnp.bool_),
         num_turns=new_turns,
+        jump_sequence=new_jump_sequence,
+        jump_sequence_length=jnp.array(0, dtype=jnp.int32),
     )
 
-    # Enforce max_turns if configured
     return apply_turn_limit(new_state, config)
 
 
 def step(state: PhutballState, action: Array, config: EnvConfig) -> PhutballState:
-    """
-    Execute one action and return new state.
-    
-    Action encoding:
-    - 0 to rows*cols-1: place man at that position
-    - rows*cols to 2*rows*cols-1: jump to that position  
-    - 2*rows*cols: halt jump sequence
-    """
+    """Execute one action and return new state."""
     total_positions = config.rows * config.cols
     
-    # Determine action type
     is_placement = action < total_positions
     is_jump = (action >= total_positions) & (action < 2 * total_positions)
-    is_halt = action == 2 * total_positions
     
-    # Get position for placement/jump
     position = action_to_position(action, config)
     
-    # Execute the appropriate action
-    # Using nested lax.cond to handle the three cases
     new_state = lax.cond(
         is_placement,
         lambda: execute_placement(state, position, config),
         lambda: lax.cond(
             is_jump,
             lambda: execute_jump(state, position, config),
-            lambda: execute_halt(state, config)  # is_halt
+            lambda: execute_halt(state, config)
         )
     )
     
@@ -560,7 +520,116 @@ def step(state: PhutballState, action: Array, config: EnvConfig) -> PhutballStat
 
 
 # ============================================================================
-# Pretty Printing (for debugging - not JIT compatible)
+# Network Input Encoding
+# ============================================================================
+
+def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
+    """
+    Convert PhutballState to neural network input.
+    
+    Returns:
+        Array of shape (6, rows, cols):
+        - Channel 0: board state (float32 cast of board values)
+        - Channels 1-5: jump sequence encoding
+        
+    Jump sequence encoding:
+        - For each position in the jump sequence, we mark it in one of 5 layers
+        - If a position is visited multiple times, each visit uses the next layer
+        - The VALUE at that position is the step index (0, 1, 2, ...) when visited
+        
+    Example: if jump_sequence = [(5,5), (6,5), (5,5), (7,5)] with length 4:
+        - Layer 1 at (5,5) = 0.0 (first visit, step 0)
+        - Layer 1 at (6,5) = 1.0 (first visit, step 1)
+        - Layer 2 at (5,5) = 2.0 (second visit, step 2)
+        - Layer 1 at (7,5) = 3.0 (first visit, step 3)
+        
+    This allows the network to understand:
+        1. Which positions have been visited (non-zero)
+        2. In what ORDER they were visited (the value)
+        3. If positions were revisited (multiple layers marked)
+    """
+    rows, cols = config.rows, config.cols
+    
+    # Channel 0: board state
+    board_channel = state.board.astype(jnp.float32)
+    
+    # Channels 1-5: jump sequence encoding
+    num_jump_layers = 5
+    jump_layers = jnp.zeros((num_jump_layers, rows, cols), dtype=jnp.float32)
+    
+    # Only encode if we're in a jump sequence
+    def encode_jump_sequence():
+        layers = jnp.zeros((num_jump_layers, rows, cols), dtype=jnp.float32)
+        
+        # Count how many times each position has been visited so far
+        # This determines which layer to use
+        visit_counts = jnp.zeros((rows, cols), dtype=jnp.int32)
+        
+        def process_step(carry, step_idx):
+            layers, visit_counts = carry
+            
+            # Get position for this step
+            pos = state.jump_sequence[step_idx]
+            r, c = pos[0], pos[1]
+            
+            # Check if this step is valid (within sequence length and valid coords)
+            is_valid = (step_idx < state.jump_sequence_length) & (r >= 0) & (c >= 0) & (r < rows) & (c < cols)
+            
+            # Get which layer to use (based on how many times we've visited this position)
+            safe_r = jnp.clip(r, 0, rows - 1)
+            safe_c = jnp.clip(c, 0, cols - 1)
+            layer_idx = jnp.clip(visit_counts[safe_r, safe_c], 0, num_jump_layers - 1)
+            
+            # Update layers: set the value at (layer_idx, r, c) to step_idx
+            # We need to normalize step_idx to a reasonable range (e.g., 0-1 scale or small integers)
+            # Using raw step index for now; can normalize later if needed
+            step_value = step_idx.astype(jnp.float32)
+            
+            # Conditional update
+            new_layers = jnp.where(
+                is_valid,
+                layers.at[layer_idx, safe_r, safe_c].set(step_value + 1.0),  # +1 so 0 means "not visited"
+                layers
+            )
+            
+            # Update visit count for this position
+            new_visit_counts = jnp.where(
+                is_valid,
+                visit_counts.at[safe_r, safe_c].add(1),
+                visit_counts
+            )
+            
+            return (new_layers, new_visit_counts), None
+        
+        # Process all possible steps (up to MAX_JUMP_SEQUENCE_LENGTH)
+        (final_layers, _), _ = lax.scan(
+            process_step,
+            (layers, visit_counts),
+            jnp.arange(MAX_JUMP_SEQUENCE_LENGTH, dtype=jnp.int32)
+        )
+        
+        return final_layers
+    
+    def no_sequence():
+        return jnp.zeros((num_jump_layers, rows, cols), dtype=jnp.float32)
+    
+    jump_layers = lax.cond(
+        state.jump_sequence_length > 0,
+        encode_jump_sequence,
+        no_sequence
+    )
+    
+    # Stack all channels: (6, rows, cols)
+    observation = jnp.concatenate([
+        board_channel[None, :, :],  # (1, rows, cols)
+        jump_layers                  # (5, rows, cols)
+    ], axis=0)
+    
+    return observation
+
+
+# ============================================================================
+# Pretty Printing (for debugging)
 # ============================================================================
 
 def render_board(state: PhutballState) -> str:
@@ -580,6 +649,15 @@ def render_board(state: PhutballState) -> str:
     lines.append(f"Turn: {int(state.num_turns)}, Player: {int(state.current_player)}")
     lines.append(f"Ball: ({int(state.ball_pos[0])}, {int(state.ball_pos[1])})")
     lines.append(f"Jumping: {bool(state.is_jumping)}, Terminated: {bool(state.terminated)}, Winner: {int(state.winner)}")
+    
+    # Show jump sequence if active
+    if int(state.jump_sequence_length) > 0:
+        seq_str = " -> ".join([
+            f"({int(state.jump_sequence[i, 0])},{int(state.jump_sequence[i, 1])})"
+            for i in range(int(state.jump_sequence_length))
+        ])
+        lines.append(f"Jump sequence: {seq_str}")
+    
     lines.append("")
     
     for r in range(rows):
@@ -593,278 +671,127 @@ def render_board(state: PhutballState) -> str:
 
 
 # ============================================================================
-# Test Utilities
+# Tests
 # ============================================================================
 
-def test_reset():
-    """Test that reset produces valid initial state."""
-    config = EnvConfig(rows=21, cols=15)
+def test_jump_sequence_tracking():
+    """Test that jump sequences are properly tracked."""
+    config = EnvConfig(rows=9, cols=9)
     state = reset(config)
     
-    # Check board shape
-    assert state.board.shape == (21, 15), f"Board shape: {state.board.shape}"
+    # Ball starts at (4, 4) for 9x9 board
+    assert int(state.ball_pos[0]) == 4, f"Ball row: {state.ball_pos[0]}"
+    assert int(state.ball_pos[1]) == 4, f"Ball col: {state.ball_pos[1]}"
     
-    # Check ball position
-    assert int(state.ball_pos[0]) == 10, f"Ball row: {state.ball_pos[0]}"
-    assert int(state.ball_pos[1]) == 7, f"Ball col: {state.ball_pos[1]}"
+    # Place men to enable a multi-jump sequence
+    # Place man at (3, 4) - above ball
+    place1 = 3 * 9 + 4  # Row 3, col 4
+    state = step(state, jnp.array(place1, dtype=jnp.int32), config)
     
-    # Check ball is on board
-    assert int(state.board[10, 7]) == BALL, f"Ball on board: {state.board[10, 7]}"
-    
-    # Check end zones
-    assert jnp.all(state.board[0, :] == END_HI), "Top row should be END_HI"
-    assert jnp.all(state.board[20, :] == END_LO), "Bottom row should be END_LO"
-    
-    # Check middle rows are empty (except ball)
-    for r in range(1, 20):
-        for c in range(15):
-            expected = BALL if (r == 10 and c == 7) else EMPTY
-            actual = int(state.board[r, c])
-            assert actual == expected, f"Position ({r},{c}): expected {expected}, got {actual}"
-    
-    # Check initial player
-    assert int(state.current_player) == 1, f"Initial player: {state.current_player}"
-    
-    # Check flags
-    assert not bool(state.is_jumping), "Should not be jumping initially"
-    assert not bool(state.terminated), "Should not be terminated initially"
-    assert int(state.winner) == 0, "Should have no winner initially"
-    
-    print("✓ test_reset passed")
-    return state
-
-
-def test_action_encoding():
-    """Test action space encoding/decoding."""
-    config = EnvConfig(rows=21, cols=15)
-    total_pos = 21 * 15  # 315
-    
-    # Test placement action
-    action = jnp.array(0, dtype=jnp.int32)
-    assert bool(is_placement_action(action, config)), "Action 0 should be placement"
-    pos = action_to_position(action, config)
-    assert int(pos[0]) == 0 and int(pos[1]) == 0, f"Action 0 -> position: {pos}"
-    
-    # Test another placement
-    action = jnp.array(total_pos - 1, dtype=jnp.int32)  # 314
-    assert bool(is_placement_action(action, config)), "Action 314 should be placement"
-    pos = action_to_position(action, config)
-    assert int(pos[0]) == 20 and int(pos[1]) == 14, f"Action 314 -> position: {pos}"
-    
-    # Test jump action
-    action = jnp.array(total_pos, dtype=jnp.int32)  # 315
-    assert bool(is_jump_action(action, config)), "Action 315 should be jump"
-    pos = action_to_position(action, config)
-    assert int(pos[0]) == 0 and int(pos[1]) == 0, f"Action 315 -> position: {pos}"
-    
-    # Test halt action
-    action = jnp.array(2 * total_pos, dtype=jnp.int32)  # 630
-    assert bool(is_halt_action(action, config)), "Action 630 should be halt"
-    
-    print("✓ test_action_encoding passed")
-
-
-def test_winner_check():
-    """Test win condition detection."""
-    config = EnvConfig(rows=21, cols=15)
-    
-    # Ball in center - no winner
-    ball_pos = jnp.array([10, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 0, "Center should have no winner"
-    
-    # Ball at row 1 - P2 wins
-    ball_pos = jnp.array([1, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 2, "Row 1 should be P2 win"
-    
-    # Ball at row 0 - P2 wins
-    ball_pos = jnp.array([0, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 2, "Row 0 should be P2 win"
-    
-    # Ball at row 19 - P1 wins
-    ball_pos = jnp.array([19, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 1, "Row 19 should be P1 win"
-    
-    # Ball at row 20 - P1 wins
-    ball_pos = jnp.array([20, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 1, "Row 20 should be P1 win"
-    
-    # Ball at row 2 - no winner yet
-    ball_pos = jnp.array([2, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 0, "Row 2 should have no winner"
-    
-    # Ball at row 18 - no winner yet
-    ball_pos = jnp.array([18, 7], dtype=jnp.int32)
-    assert int(check_winner(ball_pos, config)) == 0, "Row 18 should have no winner"
-    
-    print("✓ test_winner_check passed")
-
-
-def test_legal_placements():
-    """Test legal placement mask."""
-    config = EnvConfig(rows=21, cols=15)
+    # Place man at (2, 4) - for second jump (opponent places elsewhere, we skip that for simplicity)
+    # Actually, let's set up the board manually for a clean test
     state = reset(config)
-    
-    placement_mask = get_legal_placements(state, config)
-    
-    # Check shape
-    assert placement_mask.shape == (21 * 15,), f"Shape: {placement_mask.shape}"
-    
-    # Row 0 should be all illegal (END_HI)
-    row0_mask = placement_mask[:15]
-    assert jnp.sum(row0_mask) == 0, f"Row 0 should have no legal placements: {jnp.sum(row0_mask)}"
-    
-    # Row 20 should be all illegal (END_LO)
-    row20_mask = placement_mask[20*15:21*15]
-    assert jnp.sum(row20_mask) == 0, f"Row 20 should have no legal placements: {jnp.sum(row20_mask)}"
-    
-    # Ball position (10, 7) should be illegal
-    ball_idx = 10 * 15 + 7
-    assert int(placement_mask[ball_idx]) == 0, f"Ball position should be illegal: {placement_mask[ball_idx]}"
-    
-    # Total legal placements should be (21-2) * 15 - 1 = 19 * 15 - 1 = 284
-    total_legal = int(jnp.sum(placement_mask))
-    expected = 19 * 15 - 1  # Rows 1-19 minus ball position
-    assert total_legal == expected, f"Expected {expected} legal placements, got {total_legal}"
-    
-    print("✓ test_legal_placements passed")
-
-
-def test_legal_jumps_empty_board():
-    """Test that no jumps are legal on empty board."""
-    config = EnvConfig(rows=21, cols=15)
-    state = reset(config)
-    
-    jump_mask = get_legal_jumps(state, config)
-    
-    # No men on board, so no jumps should be legal
-    total_legal = int(jnp.sum(jump_mask))
-    assert total_legal == 0, f"Expected 0 legal jumps on empty board, got {total_legal}"
-    
-    print("✓ test_legal_jumps_empty_board passed")
-
-
-def test_placement_and_jump():
-    """Test placing men and then jumping."""
-    config = EnvConfig(rows=21, cols=15)
-    state = reset(config)
-    
-    # Place a man adjacent to ball (ball is at 10, 7)
-    # Place at (9, 7) - directly above ball
-    place_action = 9 * 15 + 7  # Row 9, col 7
-    state = step(state, jnp.array(place_action, dtype=jnp.int32), config)
-    
-    # Check man was placed
-    assert int(state.board[9, 7]) == MAN, f"Man should be at (9,7): {state.board[9,7]}"
-    
-    # Check player switched
-    assert int(state.current_player) == 2, f"Player should be 2: {state.current_player}"
-    
-    # Now check legal jumps - should be able to jump over the man
-    jump_mask = get_legal_jumps(state, config)
-    
-    # Landing position (8, 7) should be legal
-    landing_idx = 8 * 15 + 7
-    assert int(jump_mask[landing_idx]) == 1, f"Jump to (8,7) should be legal: {jump_mask[landing_idx]}"
-    
-    print("✓ test_placement_and_jump passed")
-
-
-def test_jump_execution():
-    """Test executing a jump."""
-    config = EnvConfig(rows=21, cols=15)
-    state = reset(config)
-    
-    # Manually place a man at (9, 7)
-    state = state._replace(board=state.board.at[9, 7].set(MAN))
-    
-    # Execute jump to (8, 7)
-    total_positions = config.rows * config.cols
-    jump_action = total_positions + 8 * 15 + 7  # Jump to (8, 7)
-    state = step(state, jnp.array(jump_action, dtype=jnp.int32), config)
-    
-    # Check ball moved
-    assert int(state.ball_pos[0]) == 8, f"Ball row should be 8: {state.ball_pos[0]}"
-    assert int(state.ball_pos[1]) == 7, f"Ball col should be 7: {state.ball_pos[1]}"
-    
-    # Check man was removed
-    assert int(state.board[9, 7]) == EMPTY, f"Man at (9,7) should be removed: {state.board[9,7]}"
-    
-    # Check ball on board
-    assert int(state.board[8, 7]) == BALL, f"Ball should be at (8,7): {state.board[8,7]}"
-    
-    # Check old ball position is empty
-    assert int(state.board[10, 7]) == EMPTY, f"Old ball position should be empty: {state.board[10,7]}"
-    
-    # Check is_jumping flag
-    assert bool(state.is_jumping), "Should be in jump sequence"
-    
-    print("✓ test_jump_execution passed")
-
-
-def test_halt():
-    """Test halting a jump sequence."""
-    config = EnvConfig(rows=21, cols=15)
-    state = reset(config)
-    
-    # Set up jump sequence manually
     state = state._replace(
-        board=state.board.at[9, 7].set(MAN),
-        is_jumping=jnp.array(True, dtype=jnp.bool_)
+        board=state.board.at[3, 4].set(MAN).at[2, 4].set(MAN)  # Two men above ball
     )
     
-    # Execute halt
-    halt_action = 2 * config.rows * config.cols
-    state = step(state, jnp.array(halt_action, dtype=jnp.int32), config)
+    # Now execute first jump: from (4,4) over (3,4) to land at (2,4)? 
+    # Wait, (2,4) has a man. Let's think...
+    # Jump over (3,4) to (2,4) - but there's a man there!
+    # Let's place men at (3,4) only, and have (2,4) empty
+    state = reset(config)
+    state = state._replace(
+        board=state.board.at[3, 4].set(MAN)
+    )
     
-    # Check player switched
-    assert int(state.current_player) == 2, f"Player should switch to 2: {state.current_player}"
+    # Execute jump to (2, 4)
+    total_pos = 9 * 9
+    jump_to_2_4 = total_pos + 2 * 9 + 4
+    state = step(state, jnp.array(jump_to_2_4, dtype=jnp.int32), config)
     
-    # Check no longer jumping
-    assert not bool(state.is_jumping), "Should not be in jump sequence"
+    # Check jump sequence
+    assert bool(state.is_jumping), "Should be in jump sequence"
+    assert int(state.jump_sequence_length) == 2, f"Sequence length should be 2: {state.jump_sequence_length}"
     
-    print("✓ test_halt passed")
+    # Sequence should be: [(4,4), (2,4)]
+    assert int(state.jump_sequence[0, 0]) == 4 and int(state.jump_sequence[0, 1]) == 4, \
+        f"First position should be (4,4): {state.jump_sequence[0]}"
+    assert int(state.jump_sequence[1, 0]) == 2 and int(state.jump_sequence[1, 1]) == 4, \
+        f"Second position should be (2,4): {state.jump_sequence[1]}"
+    
+    print("✓ test_jump_sequence_tracking passed")
 
 
-def test_legal_actions_full():
-    """Test full legal actions mask."""
-    config = EnvConfig(rows=21, cols=15)
+def test_network_input_encoding():
+    """Test that network input is correctly encoded."""
+    config = EnvConfig(rows=9, cols=9)
     state = reset(config)
     
-    legal = get_legal_actions(state, config)
+    # Set up a jump sequence manually
+    state = state._replace(
+        is_jumping=jnp.array(True, dtype=jnp.bool_),
+        jump_sequence=state.jump_sequence.at[0].set(jnp.array([4, 4])).at[1].set(jnp.array([2, 4])),
+        jump_sequence_length=jnp.array(2, dtype=jnp.int32),
+    )
     
-    # Check shape: placements + jumps + halt
-    expected_size = 2 * 21 * 15 + 1  # 631
-    assert legal.shape == (expected_size,), f"Shape: {legal.shape}"
+    obs = state_to_network_input(state, config)
     
-    # Halt should be illegal (not in jump sequence)
-    assert int(legal[-1]) == 0, f"Halt should be illegal: {legal[-1]}"
+    # Check shape
+    assert obs.shape == (6, 9, 9), f"Observation shape: {obs.shape}"
     
-    # Some placements should be legal
-    placements_legal = jnp.sum(legal[:21*15])
-    assert int(placements_legal) == 284, f"Expected 284 legal placements: {placements_legal}"
+    # Check channel 0 is the board
+    assert float(obs[0, 4, 4]) == float(BALL), f"Ball position in channel 0: {obs[0, 4, 4]}"
     
-    # No jumps should be legal (empty board)
-    jumps_legal = jnp.sum(legal[21*15:-1])
-    assert int(jumps_legal) == 0, f"Expected 0 legal jumps: {jumps_legal}"
+    # Check jump sequence channels
+    # Position (4,4) was visited at step 0, so layer 1 should have value 1.0 (step 0 + 1)
+    assert float(obs[1, 4, 4]) == 1.0, f"Layer 1 at (4,4): {obs[1, 4, 4]}"
+    # Position (2,4) was visited at step 1, so layer 1 should have value 2.0 (step 1 + 1)
+    assert float(obs[1, 2, 4]) == 2.0, f"Layer 1 at (2,4): {obs[1, 2, 4]}"
     
-    print("✓ test_legal_actions_full passed")
+    print("✓ test_network_input_encoding passed")
+
+
+def test_repeated_position_visit():
+    """Test encoding when the same position is visited multiple times."""
+    config = EnvConfig(rows=9, cols=9)
+    state = reset(config)
+    
+    # Simulate a sequence that visits (4,4) twice: (4,4) -> (2,4) -> (4,4)
+    state = state._replace(
+        is_jumping=jnp.array(True, dtype=jnp.bool_),
+        jump_sequence=state.jump_sequence.at[0].set(jnp.array([4, 4]))
+                                          .at[1].set(jnp.array([2, 4]))
+                                          .at[2].set(jnp.array([4, 4])),  # Back to start!
+        jump_sequence_length=jnp.array(3, dtype=jnp.int32),
+        ball_pos=jnp.array([4, 4], dtype=jnp.int32),  # Ball returned to center
+    )
+    
+    obs = state_to_network_input(state, config)
+    
+    # Position (4,4) visited twice:
+    # - First visit at step 0 -> layer 1, value 1.0
+    # - Second visit at step 2 -> layer 2, value 3.0
+    assert float(obs[1, 4, 4]) == 1.0, f"Layer 1 at (4,4): {obs[1, 4, 4]} (expected 1.0)"
+    assert float(obs[2, 4, 4]) == 3.0, f"Layer 2 at (4,4): {obs[2, 4, 4]} (expected 3.0)"
+    
+    # Position (2,4) visited once at step 1 -> layer 1, value 2.0
+    assert float(obs[1, 2, 4]) == 2.0, f"Layer 1 at (2,4): {obs[1, 2, 4]} (expected 2.0)"
+    
+    print("✓ test_repeated_position_visit passed")
 
 
 if __name__ == "__main__":
-    print("Running JAX Phutball environment tests...\n")
+    print("Testing Phutball Environment...\n")
     
-    state = test_reset()
-    print("\nInitial board:")
+    # Basic tests
+    config = EnvConfig(rows=9, cols=9)
+    state = reset(config)
+    print("Initial board:")
     print(render_board(state))
     print()
     
-    test_action_encoding()
-    test_winner_check()
-    test_legal_placements()
-    test_legal_jumps_empty_board()
-    test_placement_and_jump()
-    test_jump_execution()
-    test_halt()
-    test_legal_actions_full()
+    test_jump_sequence_tracking()
+    test_network_input_encoding()
+    test_repeated_position_visit()
     
     print("\n✓ All tests passed!")

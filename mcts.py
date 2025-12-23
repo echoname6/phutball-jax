@@ -13,7 +13,8 @@ from functools import partial
 
 from phutball_env_jax import (
     PhutballState, EnvConfig, 
-    reset, step, get_legal_actions, 
+    reset, step, get_legal_actions,
+    state_to_network_input,
     EMPTY, BALL, MAN, END_HI, END_LO
 )
 from network import PhutballNetwork, predict
@@ -25,32 +26,6 @@ class MCTSConfig(NamedTuple):
     max_num_considered_actions: int = 32  # For Gumbel MuZero
     dirichlet_alpha: float = 0.3
     root_exploration_fraction: float = 0.25
-
-
-def state_to_network_input(state: PhutballState, config: EnvConfig) -> jnp.ndarray:
-    """
-    Convert PhutballState to neural network input.
-    
-    Returns:
-        Array of shape (channels, rows, cols) = (6, rows, cols)
-        Channel 0: board
-        Channels 1-5: jump sequence layers (currently just zeros if not tracking)
-    """
-    board = state.board.astype(jnp.float32)
-    
-    # For now, we don't track jump sequence layers in the JAX env
-    # Just use zeros for channels 1-5
-    # TODO: Add jump sequence tracking if needed
-    num_jump_layers = 5
-    jump_layers = jnp.zeros((num_jump_layers, config.rows, config.cols), dtype=jnp.float32)
-    
-    # Stack: (6, rows, cols)
-    observation = jnp.concatenate([
-        board[None, :, :],  # (1, rows, cols)
-        jump_layers         # (5, rows, cols)
-    ], axis=0)
-    
-    return observation
 
 
 def make_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
@@ -107,16 +82,21 @@ def make_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
         # Check for terminal states
         terminated = next_states.terminated
         
-        # For terminal states, value should be the actual outcome
-        # Winner: 0 = ongoing, 1 = P1 wins, 2 = P2 wins
-        # We need to convert to value from perspective of player who just moved
-        # This is tricky - for now use network value, TODO: fix for terminal
+        # For terminal states, compute value from current_player's perspective.
+        # During jumps (the only way to win), current_player is the player who just moved.
+        # If winner == current_player, that player won.
+        # If winner != current_player and != 0, that player lost (own goal).
+        terminal_value = jnp.where(
+            next_states.winner == next_states.current_player,
+            1.0,   # Current player won
+            jnp.where(next_states.winner == 0, 0.0, -1.0)  # Draw or opponent won
+        )
+        values = jnp.where(terminated, terminal_value, values)
         
         # Discount: 1 for ongoing, 0 for terminal
         discount = jnp.where(terminated, 0.0, 1.0)
         
         # Reward: 0 for AlphaZero (no intermediate rewards)
-        # Terminal reward handled by value
         reward = jnp.zeros_like(values)
         
         recurrent_fn_output = mctx.RecurrentFnOutput(

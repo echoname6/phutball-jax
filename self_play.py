@@ -13,9 +13,10 @@ import numpy as np
 from phutball_env_jax import (
     PhutballState, EnvConfig,
     reset, step, get_legal_actions,
+    state_to_network_input,
 )
 from network import PhutballNetwork, init_network, create_network
-from mcts import MCTSConfig, select_action, state_to_network_input
+from mcts import MCTSConfig, select_action
 
 
 class TrainingExample(NamedTuple):
@@ -90,7 +91,7 @@ def play_game(
             temperature=temperature,
         )
         
-        # Store state and policy
+        # Store state and policy (uses state_to_network_input from env)
         state_array = np.array(state_to_network_input(state, env_config))
         player = int(state.current_player)
         history.append((state_array, np.array(policy), player))

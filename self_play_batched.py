@@ -1,6 +1,5 @@
 """
 Batched Self-play for Phutball AlphaZero.
-
 Runs multiple games in parallel using vmap for TPU efficiency.
 """
 
@@ -14,11 +13,14 @@ import numpy as np
 from phutball_env_jax import (
     PhutballState, EnvConfig,
     reset, step, get_legal_actions,
+    state_to_network_input,
     calculate_jumped_men,
+    MAX_JUMP_SEQUENCE_LENGTH,
     MAN, BALL, EMPTY, END_HI, END_LO
 )
 from network import PhutballNetwork, predict
-from mcts import state_to_network_input
+
+import mctx
 
 
 class GameState(NamedTuple):
@@ -72,9 +74,6 @@ def make_batched_network_input(env_config: EnvConfig):
     return batched_to_input
 
 
-import mctx
-
-
 def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
     """Create recurrent function for mctx that uses real env dynamics."""
     
@@ -99,12 +98,7 @@ def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
         next_states = jax.vmap(single_step)(embedding, action)
         
         # Convert to network input
-        def single_to_input(state):
-            board = state.board.astype(jnp.float32)
-            jump_layers = jnp.zeros((5, rows, cols), dtype=jnp.float32)
-            return jnp.concatenate([board[None, :, :], jump_layers], axis=0)
-        
-        network_inputs = jax.vmap(single_to_input)(next_states)
+        network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(next_states)
         
         # Get network predictions
         variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
@@ -125,15 +119,12 @@ def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
         # Discount: 1 for ongoing, 0 for terminal
         discount = jnp.where(terminated, 0.0, 1.0)
         
-        # For terminal states, set value based on winner
-        # Winner from perspective of player who just moved
-        # This is tricky - winner=1 means P1 won, winner=2 means P2 won
-        # The "current_player" after the move is the OTHER player
-        # So if winner == current_player, the player who just moved LOST
+        # For terminal states, compute value from current_player's perspective.
+        # During jumps (the only way to win), current_player is the player who just moved.
         terminal_value = jnp.where(
             next_states.winner == next_states.current_player,
-            -1.0,  # Current player won = previous player (who moved) lost
-            jnp.where(next_states.winner == 0, 0.0, 1.0)  # Draw or previous player won
+            1.0,   # Current player won
+            jnp.where(next_states.winner == 0, 0.0, -1.0)  # Draw or opponent won
         )
         values = jnp.where(terminated, terminal_value, values)
         
@@ -173,12 +164,8 @@ def batched_mcts_policy(
     batch_size = states.board.shape[0]
     
     # Convert states to network input for root evaluation
-    def single_to_input(state):
-        board = state.board.astype(jnp.float32)
-        jump_layers = jnp.zeros((5, rows, cols), dtype=jnp.float32)
-        return jnp.concatenate([board[None, :, :], jump_layers], axis=0)
-    
-    network_inputs = jax.vmap(single_to_input)(states)
+    # Uses state_to_network_input with jump sequence
+    network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(states)
     
     # Get root network predictions
     variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
@@ -264,7 +251,7 @@ def batched_network_policy(
     """
     batch_size = states.board.shape[0]
     
-    # Convert states to network input
+    # Convert states to network input - Uses state_to_network_input
     batched_to_input = make_batched_network_input(env_config)
     network_inputs = batched_to_input(states)
     
@@ -291,6 +278,33 @@ def batched_network_policy(
     actions = jax.vmap(lambda r, p: jax.random.choice(r, len(p), p=p))(rngs, policies)
     
     return actions, policies, values
+
+
+def _make_frozen_state(old_states: PhutballState, new_states_raw: PhutballState, 
+                       done_mask: jnp.ndarray, env_config: EnvConfig) -> PhutballState:
+    """Helper to create a new state that freezes terminated games."""
+    rows, cols = env_config.rows, env_config.cols
+    batch_size = done_mask.shape[0]
+    
+    return PhutballState(
+        board=jnp.where(done_mask[:, None, None], old_states.board, new_states_raw.board),
+        ball_pos=jnp.where(done_mask[:, None], old_states.ball_pos, new_states_raw.ball_pos),
+        current_player=jnp.where(done_mask, old_states.current_player, new_states_raw.current_player),
+        is_jumping=jnp.where(done_mask, old_states.is_jumping, new_states_raw.is_jumping),
+        terminated=done_mask,
+        winner=jnp.where(done_mask & old_states.terminated, old_states.winner, new_states_raw.winner),
+        num_turns=jnp.where(done_mask, old_states.num_turns, new_states_raw.num_turns),
+        jump_sequence=jnp.where(
+            done_mask[:, None, None], 
+            old_states.jump_sequence, 
+            new_states_raw.jump_sequence
+        ),
+        jump_sequence_length=jnp.where(
+            done_mask, 
+            old_states.jump_sequence_length, 
+            new_states_raw.jump_sequence_length
+        ),
+    )
 
 
 def play_games_batched(
@@ -342,11 +356,6 @@ def play_games_batched(
     def single_step(state, action):
         return step(state, action, env_config)
     
-    def single_to_input(state):
-        board = state.board.astype(jnp.float32)
-        jump_layers = jnp.zeros((5, rows, cols), dtype=jnp.float32)
-        return jnp.concatenate([board[None, :, :], jump_layers], axis=0)
-    
     def single_legal(state):
         return get_legal_actions(state, env_config)
     
@@ -362,7 +371,8 @@ def play_games_batched(
         active = ~effectively_done
         
         # Get current observations: (batch, 6, rows, cols)
-        current_obs = jax.vmap(single_to_input)(env_states)
+        # Uses state_to_network_input with jump sequence
+        current_obs = jax.vmap(lambda s: state_to_network_input(s, env_config))(env_states)
         current_players = env_states.current_player
         
         if use_mcts:
@@ -414,24 +424,8 @@ def play_games_batched(
         # Step environments
         new_env_states = jax.vmap(single_step)(env_states, actions)
         
-        # For terminated games, keep old state using proper broadcasting
-        new_board = jnp.where(effectively_done[:, None, None], env_states.board, new_env_states.board)
-        new_ball_pos = jnp.where(effectively_done[:, None], env_states.ball_pos, new_env_states.ball_pos)
-        new_current_player = jnp.where(effectively_done, env_states.current_player, new_env_states.current_player)
-        new_is_jumping = jnp.where(effectively_done, env_states.is_jumping, new_env_states.is_jumping)
-        new_terminated_flag = jnp.where(effectively_done, env_states.terminated, new_env_states.terminated)
-        new_winner = jnp.where(effectively_done, env_states.winner, new_env_states.winner)
-        new_num_turns = jnp.where(effectively_done, env_states.num_turns, new_env_states.num_turns)
-        
-        new_env_states = PhutballState(
-            board=new_board,
-            ball_pos=new_ball_pos,
-            current_player=new_current_player,
-            is_jumping=new_is_jumping,
-            terminated=new_terminated_flag,
-            winner=new_winner,
-            num_turns=new_num_turns,
-        )
+        # For terminated games, keep old state
+        new_env_states = _make_frozen_state(env_states, new_env_states, effectively_done, env_config)
         
         # Update termination status
         new_terminated = terminated | new_env_states.terminated
@@ -442,14 +436,6 @@ def play_games_batched(
         return carry, None
     
     # Run the game loop with early stopping.
-    #
-    # We keep the big max_moves / max_turns caps for safety, but we do NOT
-    # always run max_moves steps. Instead we stop once:
-    #   - all games are effectively done (terminated or turns_exceeded), OR
-    #   - we hit max_moves.
-    #
-    # This makes runtime scale with actual game length instead of the cap.
-
     step0 = jnp.int32(0)
 
     def cond_fn(carry):
@@ -499,6 +485,7 @@ def play_games_batched(
         winners=winners,
         actions=all_actions,
     )
+
 
 @partial(jax.jit, static_argnums=(3, 4, 5, 6, 7, 8))
 def play_match_batched(
@@ -634,15 +621,7 @@ def play_match_batched(
         # Once a game is terminated, freeze it
         done_mask = terminated | new_states_raw.terminated
 
-        new_states = PhutballState(
-            board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
-            ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
-            current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
-            is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
-            terminated=done_mask,
-            winner=jnp.where(terminated, states.winner, new_states_raw.winner),
-            num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
-        )
+        new_states = _make_frozen_state(states, new_states_raw, done_mask, env_config)
 
         return (
             new_states,
@@ -707,6 +686,7 @@ def play_match_batched(
         winners,
         home_is_P1,
     )
+
 
 @partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7))
 def play_vs_random_batched(
@@ -803,15 +783,7 @@ def play_vs_random_batched(
         # Freeze terminated games
         done_mask = terminated | new_states_raw.terminated
         
-        new_states = PhutballState(
-            board=jnp.where(done_mask[:, None, None], states.board, new_states_raw.board),
-            ball_pos=jnp.where(done_mask[:, None], states.ball_pos, new_states_raw.ball_pos),
-            current_player=jnp.where(done_mask, states.current_player, new_states_raw.current_player),
-            is_jumping=jnp.where(done_mask, states.is_jumping, new_states_raw.is_jumping),
-            terminated=done_mask,
-            winner=jnp.where(terminated, states.winner, new_states_raw.winner),
-            num_turns=jnp.where(done_mask, states.num_turns, new_states_raw.num_turns),
-        )
+        new_states = _make_frozen_state(states, new_states_raw, done_mask, env_config)
         
         return (new_states, done_mask, rng, step_idx + jnp.int32(1))
     
@@ -903,6 +875,7 @@ def trajectory_to_training_examples(
         np.array(all_values, dtype=np.float32),
     )
 
+
 def compute_phutball_stats(
     trajectory: TrajectoryData,
     env_config: EnvConfig,
@@ -929,10 +902,6 @@ def compute_phutball_stats(
     rows, cols = env_config.rows, env_config.cols
     total_positions = rows * cols
 
-    # From phutball_env_jax
-    BALL = -1
-    MAN = 1
-
     total_moves = 0
     total_placements = 0
     total_jumps = 0
@@ -956,7 +925,6 @@ def compute_phutball_stats(
 
             is_placement = a < total_positions
             is_jump = (total_positions <= a < 2 * total_positions)
-            # halt = 2*total_positions, we don't need it explicitly here
 
             if is_placement:
                 # --- % occupying-adjacent-tile conversion ---
@@ -991,13 +959,11 @@ def compute_phutball_stats(
                 total_jumps += 1
 
                 # --- jump length (tiles removed) using env helper ---
-                # Decode landing position from action index
-                jump_idx = a - total_positions           # 0 .. total_positions-1
+                jump_idx = a - total_positions
                 land_r = jump_idx // cols
                 land_c = jump_idx % cols
                 landing_pos = np.array([land_r, land_c], dtype=np.int32)
 
-                # Ball position from board_before
                 ball_pos_arr = np.argwhere(board_before == BALL)
                 if ball_pos_arr.size > 0:
                     ball_pos = ball_pos_arr[0]
@@ -1008,15 +974,12 @@ def compute_phutball_stats(
                         jnp.array(board_before),
                     )
                     jumped_np = np.asarray(jumped)
-                    # Filter out the (-1, -1) padding
                     valid_jumped = jumped_np[jumped_np[:, 0] >= 0]
                     removed = int(valid_jumped.shape[0])
                 else:
-                    # Shouldn't really happen, but be defensive
                     removed = 0
 
                 sum_jump_removed_tiles += removed
-
 
                 # --- jump sequence length (contiguous jump run) ---
                 if prev_action_was_jump:
@@ -1051,6 +1014,7 @@ def compute_phutball_stats(
         "adjacency_opportunities": adjacency_opportunities,
         "adjacency_conversions": adjacency_conversions,
     }
+
 
 class ReplayBuffer:
     """Simple replay buffer for training examples."""
@@ -1119,9 +1083,9 @@ class ReplayBuffer:
         return self.size
 
 
-# ============================================================================
+# --------============
 # Tests
-# ============================================================================
+# --------============
 
 def test_batched_reset():
     """Test batched environment reset."""
@@ -1132,6 +1096,11 @@ def test_batched_reset():
     
     assert states.board.shape == (batch_size, 9, 9), f"Board shape: {states.board.shape}"
     assert states.ball_pos.shape == (batch_size, 2), f"Ball pos shape: {states.ball_pos.shape}"
+    # Check jump sequence fields
+    assert states.jump_sequence.shape == (batch_size, MAX_JUMP_SEQUENCE_LENGTH, 2), \
+        f"Jump sequence shape: {states.jump_sequence.shape}"
+    assert states.jump_sequence_length.shape == (batch_size,), \
+        f"Jump sequence length shape: {states.jump_sequence_length.shape}"
     
     print("✓ Batched reset works")
 
