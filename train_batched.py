@@ -331,6 +331,7 @@ class AlphaZeroTrainer:
             
             # Accumulate metrics
             for k, v in metrics.items():
+                print(f"key={repr(k)}")
                 metrics_sum[k] += float(v)
         
         elapsed = time.time() - start_time
