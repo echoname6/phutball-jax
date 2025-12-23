@@ -48,15 +48,17 @@ class TrainConfig:
     cols: int = 15
     
     # Network architecture
-    num_channels: int = 64
-    num_res_blocks: int = 6
+    num_channels: int = 128
+    num_res_blocks: int = 8
     
     # Self-play (batched)
     batch_size_games: int = 64       # Games played in parallel
-    max_turns_per_game: int = 2048   # Max turns before game ends (safety cap)
-    max_moves_per_game: int = 4096 # Memory cap on moves stored
-    temperature: float = 1.0          # Sampling temperature
-    num_simulations: int = 50         # MCTS simulations per move (0 = raw network)
+    max_turns_per_game: int = 2048   # Max turns before game ends
+    max_moves_per_game: int = 4096   # Memory cap on moves stored
+    temperature: float = 1.0         # Initial sampling temperature (exploration)
+    temp_threshold: int = 30         # Moves before temperature drops
+    temp_final: float = 0.1          # Temperature after threshold (exploitation)
+    num_simulations: int = 50        # MCTS simulations per move (0 = raw network)
     
     # Training
     batch_size_train: int = 256
@@ -89,9 +91,6 @@ class TrainConfig:
     eval_vs_random_games: int = 100
     eval_vs_random_threshold: Optional[float] = None
     stop_when_beating_random: bool = False
-
-    use_wandb: bool = False
-
 
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
@@ -206,7 +205,7 @@ class AlphaZeroTrainer:
         for batch_idx in range(num_batches):
             self.rng, game_rng = jax.random.split(self.rng)
             
-            # Play games in parallel
+            # Play games in parallel with temperature scheduling
             trajectory = play_games_batched(
                 params=self.get_network_params(),
                 rng=game_rng,
@@ -216,6 +215,8 @@ class AlphaZeroTrainer:
                 max_turns=self.config.max_turns_per_game,
                 max_moves=self.config.max_moves_per_game,
                 temperature=self.config.temperature,
+                temp_threshold=self.config.temp_threshold,
+                temp_final=self.config.temp_final,
                 num_simulations=self.config.num_simulations,
             )
 
@@ -331,7 +332,6 @@ class AlphaZeroTrainer:
             
             # Accumulate metrics
             for k, v in metrics.items():
-                print(f"key={repr(k)}")
                 metrics_sum[k] += float(v)
         
         elapsed = time.time() - start_time
@@ -401,6 +401,7 @@ class AlphaZeroTrainer:
         print(f"Network: {self.config.num_channels} channels, {self.config.num_res_blocks} res blocks")
         print(f"Self-play: {self.config.games_per_iteration} games/iter (batch={self.config.batch_size_games})")
         print(f"Training: {self.config.train_steps_per_iteration} steps/iter (batch={self.config.batch_size_train})")
+        print(f"Temperature: {self.config.temperature} -> {self.config.temp_final} after {self.config.temp_threshold} moves")
         print(f"Devices: {jax.devices()}")
         print("=" * 60)
         print()
@@ -715,7 +716,7 @@ class AlphaZeroTrainer:
         win_rate_p1 = p1_wins / total_p1 if total_p1 > 0 else 0.0
         win_rate_p2 = p2_wins / total_p2 if total_p2 > 0 else 0.0
 
-        # “Score” (win - loss) / total, overall and per-side
+        # "Score" (win - loss) / total, overall and per-side
         score_overall = (total_wins - total_losses) / total if total > 0 else 0.0
         score_p1 = (p1_wins - p1_losses) / total_p1 if total_p1 > 0 else 0.0
         score_p2 = (p2_wins - p2_losses) / total_p2 if total_p2 > 0 else 0.0
@@ -1085,7 +1086,9 @@ def make_train_config(
     wandb_run_name: Optional[str] = None,
     eval_vs_random_threshold: Optional[float] = 0.90,
     stop_when_beating_random: bool = True,
-    num_simulations: int = 50
+    num_simulations: int = 50,
+    temp_threshold: int = 30,
+    temp_final: float = 0.1,
 ) -> TrainConfig:
     """
     Convenience factory for TrainConfig so we don't duplicate hyperparams
@@ -1111,6 +1114,8 @@ def make_train_config(
         max_turns_per_game=512,
         max_moves_per_game=512,
         temperature=1.0,
+        temp_threshold=temp_threshold,
+        temp_final=temp_final,
         num_simulations=num_simulations,
 
         # Training
@@ -1168,6 +1173,9 @@ def test_training_loop():
         max_turns_per_game=30,   # 30 turns max
         max_moves_per_game=200,  # Memory cap
         games_per_iteration=16,  # 2 batches of 8
+        temperature=1.0,
+        temp_threshold=15,       # Drop temp after 15 moves
+        temp_final=0.1,
         # Minimal training
         train_steps_per_iteration=5,
         batch_size_train=8,
@@ -1175,7 +1183,7 @@ def test_training_loop():
         min_buffer_size=10,
         # Short run
         num_iterations=3,
-        checkpoint_every=100,  # Don't checkpoint during test
+        checkpoint_every=100,
     )
     
     trainer = AlphaZeroTrainer(config)

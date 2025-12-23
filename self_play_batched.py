@@ -316,6 +316,8 @@ def play_games_batched(
     max_turns: int = 7200,
     max_moves: int = 50000,  # Safety cap on total moves (for memory)
     temperature: float = 1.0,
+    temp_threshold: int = 30,  # Moves before temperature drops
+    temp_final: float = 0.1,   # Temperature after threshold
     num_simulations: int = 0,  # 0 = no MCTS, >0 = use MCTS with this many sims
 ) -> TrajectoryData:
     """
@@ -329,7 +331,9 @@ def play_games_batched(
         batch_size: Number of games to play in parallel
         max_turns: Maximum turns per game (placement or halt = 1 turn)
         max_moves: Maximum moves to store (memory cap)
-        temperature: Sampling temperature
+        temperature: Initial sampling temperature (for exploration)
+        temp_threshold: Number of moves before temperature drops
+        temp_final: Temperature after threshold (for exploitation)
         num_simulations: MCTS simulations per move (0 = raw network policy)
         
     Returns:
@@ -359,11 +363,21 @@ def play_games_batched(
     def single_legal(state):
         return get_legal_actions(state, env_config)
     
-    # Play loop
+    # Play loop - now takes step_idx for temperature scheduling
     def game_step(carry, _):
-        env_states, terminated, move_count, all_states, all_policies, all_players, all_actions, valid_mask, rng = carry
+        (env_states, terminated, move_count, all_states, all_policies, 
+         all_players, all_actions, valid_mask, rng, step_idx) = carry
         
         rng, step_rng, sample_rng = jax.random.split(rng, 3)
+        
+        # Compute effective temperature based on step count
+        # Before threshold: use exploration temperature
+        # After threshold: use exploitation temperature
+        effective_temp = jnp.where(
+            step_idx < temp_threshold,
+            temperature,
+            temp_final
+        )
         
         # Check if games have exceeded max_turns
         turns_exceeded = env_states.num_turns >= max_turns
@@ -379,7 +393,7 @@ def play_games_batched(
             # Use MCTS to get improved policy
             actions, policies, values = batched_mcts_policy(
                 params, env_states, step_rng, network, env_config,
-                num_simulations=num_simulations, temperature=temperature
+                num_simulations=num_simulations, temperature=effective_temp
             )
         else:
             # Use raw network policy
@@ -393,8 +407,8 @@ def play_games_batched(
             # Mask illegal actions
             masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
             
-            # Convert to probabilities
-            policies = jax.nn.softmax(masked_logits / temperature)
+            # Convert to probabilities with effective temperature
+            policies = jax.nn.softmax(masked_logits / effective_temp)
             
             # Sample actions
             sample_rngs = jax.random.split(sample_rng, batch_size)
@@ -432,14 +446,16 @@ def play_games_batched(
         new_move_count = move_count + active.astype(jnp.int32)
         
         carry = (new_env_states, new_terminated, new_move_count, 
-                all_states, all_policies, all_players, all_actions, valid_mask, rng)
+                all_states, all_policies, all_players, all_actions, valid_mask, 
+                rng, step_idx + jnp.int32(1))
         return carry, None
     
     # Run the game loop with early stopping.
     step0 = jnp.int32(0)
 
     def cond_fn(carry):
-        (env_states, terminated, move_count, all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
+        (env_states, terminated, move_count, all_states, all_policies, 
+         all_players, all_actions, valid_mask, rng, step_idx) = carry
 
         # Same notion of "done" as inside game_step
         turns_exceeded = env_states.num_turns >= max_turns
@@ -450,24 +466,13 @@ def play_games_batched(
         return (step_idx < max_moves) & any_active
 
     def body_fn(carry):
-        (env_states, terminated, move_count,
-         all_states, all_policies, all_players, all_actions, valid_mask, rng, step_idx) = carry
-
-        inner_carry = (env_states, terminated, move_count,
-                       all_states, all_policies, all_players, all_actions, valid_mask, rng)
-
         # Re-use the existing game_step logic
-        inner_carry, _ = game_step(inner_carry, None)
-
-        (env_states, terminated, move_count,
-         all_states, all_policies, all_players, all_actions, valid_mask, rng) = inner_carry
-
-        return (env_states, terminated, move_count,
-                all_states, all_policies, all_players, all_actions, valid_mask, rng,
-                step_idx + jnp.int32(1))
+        carry, _ = game_step(carry, None)
+        return carry
 
     initial_carry = (env_states, terminated, move_count,
-                     all_states, all_policies, all_players, all_actions, valid_mask, rng, step0)
+                     all_states, all_policies, all_players, all_actions, valid_mask, 
+                     rng, step0)
 
     final_carry = lax.while_loop(cond_fn, body_fn, initial_carry)
 
@@ -1136,6 +1141,8 @@ def test_batched_games():
         max_turns=30,     # 30 turns per game
         max_moves=200,    # Memory cap
         temperature=1.0,
+        temp_threshold=15,  # Drop temp after 15 moves
+        temp_final=0.1,
     )
     
     elapsed = time.time() - start
@@ -1210,7 +1217,8 @@ def benchmark_batched_games():
         start = time.time()
         trajectory = play_games_batched(
             params, game_rng, network, env_config,
-            batch_size=batch_size, max_turns=max_turns, max_moves=max_moves
+            batch_size=batch_size, max_turns=max_turns, max_moves=max_moves,
+            temp_threshold=20, temp_final=0.1,
         )
         # Force computation
         _ = trajectory.winners.block_until_ready()
