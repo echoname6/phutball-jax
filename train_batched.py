@@ -1066,9 +1066,8 @@ def evaluate_vs_random(trainer: AlphaZeroTrainer, num_games: int = 20) -> float:
     return win_rate
 
 
-def get_buffer_size(rows, cols, games_per_iter=256, target_staleness_iters=12):
-    estimated_moves_per_game = (rows * cols) // 3 * 2
-    examples_per_iter = games_per_iter * estimated_moves_per_game
+def get_buffer_size(rows, cols, games_per_iter=256, max_moves=512, target_staleness_iters=8):
+    examples_per_iter = games_per_iter * max_moves
     return examples_per_iter * target_staleness_iters
 
 def get_train_steps(buffer_size, batch_size=256, target_epochs_per_iter=1):
