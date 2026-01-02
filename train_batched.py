@@ -15,7 +15,6 @@ from typing import Optional, List, Tuple
 import pickle
 from mcts import MCTSConfig
 import glob
-from tqdm import tqdm
 
 from phutball_env_jax import (
     EnvConfig, reset, step, get_legal_actions, state_to_network_input,
@@ -1285,15 +1284,12 @@ class AlphaZeroTrainer:
         print("=" * 60)
         print()
         
-        pbar = tqdm(range(self.iteration, self.config.num_iterations),
-                    desc="Training", unit="iter", initial=self.iteration,
-                    total=self.config.num_iterations)
-
-        for iteration in pbar:
+        for iteration in range(self.iteration, self.config.num_iterations):
             self.iteration = iteration
             iter_start = time.time()
 
-            pbar.set_description(f"Iter {iteration + 1}/{self.config.num_iterations}")
+            print(f"Iteration {iteration + 1}/{self.config.num_iterations}")
+            print("-" * 40)
 
             # Self-play
             num_examples = self.run_self_play()
@@ -1986,7 +1982,7 @@ def make_train_config(
     train_steps_per_iteration: int = 100,
     buffer_size: Optional[int] = None,
     min_buffer_size: int = 1000,
-    max_moves_per_game: int = 512,
+    max_moves_per_game: Optional[int] = None,
     # Curriculum learning
     curriculum_enabled: bool = True,
     curriculum_initial_ratio: float = 0.5,
@@ -2001,6 +1997,9 @@ def make_train_config(
 
     if buffer_size is None:
         buffer_size = get_buffer_size(rows, cols)
+
+    if max_moves_per_game is None:
+        max_moves_per_game = rows * cols * 2
 
     return TrainConfig(
         # Environment
@@ -2513,15 +2512,12 @@ class ChimeraTrainer:
         print(f"Devices: {jax.devices()}")
         print("=" * 60)
 
-        pbar = tqdm(range(self.iteration, self.config.num_iterations),
-                    desc="Training", unit="iter", initial=self.iteration,
-                    total=self.config.num_iterations)
-
-        for iteration in pbar:
+        for iteration in range(self.iteration, self.config.num_iterations):
             self.iteration = iteration
             iter_start = time.time()
 
-            pbar.set_description(f"Iter {iteration + 1}/{self.config.num_iterations}")
+            print(f"\nIteration {iteration + 1}/{self.config.num_iterations}")
+            print("-" * 40)
 
             # Self-play for all board sizes
             examples_per_board = self.run_self_play()
