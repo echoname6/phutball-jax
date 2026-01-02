@@ -805,23 +805,32 @@ def play_vs_random_batched(
     
     winners = final_states.winner
     per_game_turns = final_states.num_turns
-    
-    # Compute wins from checkpoint's POV
-    checkpoint_win = ((winners == 1) & checkpoint_is_P1) | ((winners == 2) & ~checkpoint_is_P1)
-    random_win = ((winners == 1) & ~checkpoint_is_P1) | ((winners == 2) & checkpoint_is_P1)
+
+    # Compute side-aware stats (from checkpoint's POV)
     draw_mask = (winners == 0)
-    
-    checkpoint_wins = jnp.sum(checkpoint_win.astype(jnp.int32))
-    random_wins = jnp.sum(random_win.astype(jnp.int32))
-    draws = jnp.sum(draw_mask.astype(jnp.int32))
-    
+
+    # When checkpoint is P1: win if winner==1, loss if winner==2
+    p1_win_mask = checkpoint_is_P1 & (winners == 1)
+    p1_draw_mask = checkpoint_is_P1 & draw_mask
+    p1_loss_mask = checkpoint_is_P1 & (winners == 2)
+
+    # When checkpoint is P2: win if winner==2, loss if winner==1
+    p2_win_mask = checkpoint_is_P2 & (winners == 2)
+    p2_draw_mask = checkpoint_is_P2 & draw_mask
+    p2_loss_mask = checkpoint_is_P2 & (winners == 1)
+
+    p1_wins = jnp.sum(p1_win_mask.astype(jnp.int32))
+    p1_draws = jnp.sum(p1_draw_mask.astype(jnp.int32))
+    p1_losses = jnp.sum(p1_loss_mask.astype(jnp.int32))
+
+    p2_wins = jnp.sum(p2_win_mask.astype(jnp.int32))
+    p2_draws = jnp.sum(p2_draw_mask.astype(jnp.int32))
+    p2_losses = jnp.sum(p2_loss_mask.astype(jnp.int32))
+
     return (
-        checkpoint_wins,
-        draws,
-        random_wins,
+        p1_wins, p1_draws, p1_losses,
+        p2_wins, p2_draws, p2_losses,
         per_game_turns,
-        winners,
-        checkpoint_is_P1,
     )
 
 
