@@ -15,6 +15,7 @@ from typing import Optional, List, Tuple
 import pickle
 from mcts import MCTSConfig
 import glob
+from tqdm import tqdm
 
 from phutball_env_jax import (
     EnvConfig, reset, step, get_legal_actions, state_to_network_input,
@@ -1284,13 +1285,16 @@ class AlphaZeroTrainer:
         print("=" * 60)
         print()
         
-        for iteration in range(self.iteration, self.config.num_iterations):
+        pbar = tqdm(range(self.iteration, self.config.num_iterations),
+                    desc="Training", unit="iter", initial=self.iteration,
+                    total=self.config.num_iterations)
+
+        for iteration in pbar:
             self.iteration = iteration
             iter_start = time.time()
-            
-            print(f"Iteration {iteration + 1}/{self.config.num_iterations}")
-            print("-" * 40)
-            
+
+            pbar.set_description(f"Iter {iteration + 1}/{self.config.num_iterations}")
+
             # Self-play
             num_examples = self.run_self_play()
             
@@ -2509,12 +2513,15 @@ class ChimeraTrainer:
         print(f"Devices: {jax.devices()}")
         print("=" * 60)
 
-        for iteration in range(self.iteration, self.config.num_iterations):
+        pbar = tqdm(range(self.iteration, self.config.num_iterations),
+                    desc="Training", unit="iter", initial=self.iteration,
+                    total=self.config.num_iterations)
+
+        for iteration in pbar:
             self.iteration = iteration
             iter_start = time.time()
 
-            print(f"\nIteration {iteration + 1}/{self.config.num_iterations}")
-            print("-" * 40)
+            pbar.set_description(f"Iter {iteration + 1}/{self.config.num_iterations}")
 
             # Self-play for all board sizes
             examples_per_board = self.run_self_play()
