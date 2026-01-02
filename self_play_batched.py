@@ -441,13 +441,16 @@ def play_games_batched(
         all_actions = all_actions.at[batch_idx, safe_move_idx].set(stored_actions)
         
         # Step environments
-        new_env_states = jax.vmap(single_step)(env_states, actions)
-        
+        new_env_states_raw = jax.vmap(single_step)(env_states, actions)
+
+        # Capture termination status BEFORE freezing (includes games that just terminated)
+        just_terminated = new_env_states_raw.terminated
+
         # For terminated games, keep old state
-        new_env_states = _make_frozen_state(env_states, new_env_states, effectively_done, env_config)
-        
-        # Update termination status
-        new_terminated = terminated | new_env_states.terminated
+        new_env_states = _make_frozen_state(env_states, new_env_states_raw, effectively_done, env_config)
+
+        # Update termination status using raw terminated, not the frozen one
+        new_terminated = terminated | just_terminated
         new_move_count = move_count + active.astype(jnp.int32)
         
         carry = (new_env_states, new_terminated, new_move_count, 
