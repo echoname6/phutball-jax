@@ -31,10 +31,253 @@ class ResidualBlock(nn.Module):
         return x
 
 
+class Backbone(nn.Module):
+    """Shared convolutional backbone - fully convolutional, any board size."""
+    num_channels: int = 64
+    num_res_blocks: int = 6
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        x = nn.Conv(self.num_channels, kernel_size=(3, 3), padding='SAME', use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.relu(x)
+        for _ in range(self.num_res_blocks):
+            x = ResidualBlock(channels=self.num_channels)(x, train=train)
+        return x
+
+
+class ValueHead(nn.Module):
+    """Value head with global avg pooling - board size agnostic."""
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        x = nn.Conv(8, kernel_size=(1, 1), use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.relu(x)
+        x = jnp.mean(x, axis=(1, 2))  # Global avg pool
+        x = nn.Dense(64)(x)
+        x = nn.relu(x)
+        x = nn.Dense(1)(x)
+        return nn.tanh(x).squeeze(-1)
+
+
+class PolicyHead(nn.Module):
+    """Policy head for specific board size."""
+    rows: int
+    cols: int
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        batch_size = x.shape[0]
+        action_space_size = 2 * self.rows * self.cols + 1
+        x = nn.Conv(32, kernel_size=(1, 1), use_bias=False)(x)
+        x = nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.relu(x)
+        x = x.reshape((batch_size, -1))
+        return nn.Dense(action_space_size)(x)
+
+
+class ChimeraNetwork(nn.Module):
+    """
+    Multi-board network: shared backbone + value head, separate policy heads.
+
+    Args:
+        board_sizes: Tuple of (rows, cols) pairs, e.g. ((21,15), (15,11), (11,9))
+        num_channels: Backbone channel width
+        num_res_blocks: Number of residual blocks
+    """
+    board_sizes: tuple  # ((r1,c1), (r2,c2), ...)
+    num_channels: int = 64
+    num_res_blocks: int = 6
+
+    def setup(self):
+        self.backbone = Backbone(self.num_channels, self.num_res_blocks)
+        self.value_head = ValueHead()
+        self.policy_heads = {
+            f"{r}x{c}": PolicyHead(rows=r, cols=c)
+            for r, c in self.board_sizes
+        }
+
+    def __call__(self, x, board_key: str, train: bool = True):
+        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
+        features = self.backbone(x, train=train)
+        value = self.value_head(features, train=train)
+        policy = self.policy_heads[board_key](features, train=train)
+        return policy, value
+
+
+def create_chimera_network(
+    board_sizes: tuple,
+    num_channels: int = 64,
+    num_res_blocks: int = 6
+) -> ChimeraNetwork:
+    """Create chimera network with specified board sizes."""
+    return ChimeraNetwork(
+        board_sizes=board_sizes,
+        num_channels=num_channels,
+        num_res_blocks=num_res_blocks,
+    )
+
+
+def init_chimera_network(rng, network: ChimeraNetwork, num_input_channels: int = 6):
+    """Initialize chimera - needs dummy input for each board size."""
+    # Need to initialize all policy heads, not just one
+    # First init with largest board to get backbone/value
+    max_rows = max(r for r, c in network.board_sizes)
+    max_cols = max(c for r, c in network.board_sizes)
+
+    # Initialize each board size to create all policy heads
+    all_variables = None
+    for rows, cols in network.board_sizes:
+        rng, init_rng = jax.random.split(rng)
+        board_key = f"{rows}x{cols}"
+        dummy = jnp.zeros((1, num_input_channels, rows, cols))
+        variables = network.init(init_rng, dummy, board_key, train=False)
+
+        if all_variables is None:
+            all_variables = variables
+        else:
+            # Merge policy head params (backbone/value already exist)
+            all_variables['params']['policy_heads'][board_key] = \
+                variables['params']['policy_heads'][board_key]
+            all_variables['batch_stats']['policy_heads'][board_key] = \
+                variables['batch_stats']['policy_heads'][board_key]
+
+    return all_variables
+
+
+def expand_chimera_network(
+    old_variables: dict,
+    old_board_sizes: tuple,
+    new_network: ChimeraNetwork,
+    rng,
+    num_input_channels: int = 6,
+):
+    """
+    Expand a trained ChimeraNetwork to include new board sizes.
+
+    Copies backbone, value head, and existing policy heads from old_variables.
+    Initializes new policy heads from scratch.
+
+    Args:
+        old_variables: Checkpoint variables with 'params' and 'batch_stats'
+        old_board_sizes: Original board sizes tuple, e.g. ((11,9), (15,11))
+        new_network: New ChimeraNetwork with expanded board_sizes
+        rng: Random key for initializing new policy heads
+        num_input_channels: Input channels (default 6)
+
+    Returns:
+        new_variables: Variables for expanded network
+
+    Example:
+        # Load checkpoint trained on small boards
+        old_vars = pickle.load(...)
+        old_sizes = ((11,9), (15,11))
+
+        # Create network with new board size added
+        new_net = create_chimera_network(
+            board_sizes=((11,9), (15,11), (21,15)),  # added 21x15
+            num_channels=64,
+            num_res_blocks=6
+        )
+
+        # Expand - copies shared params, inits new policy head
+        new_vars = expand_chimera_network(old_vars, old_sizes, new_net, rng)
+    """
+    # Initialize the new network fully
+    new_variables = init_chimera_network(rng, new_network, num_input_channels)
+
+    # Copy backbone params and batch_stats
+    new_variables['params']['backbone'] = old_variables['params']['backbone']
+    new_variables['batch_stats']['backbone'] = old_variables['batch_stats']['backbone']
+
+    # Copy value head params and batch_stats
+    new_variables['params']['value_head'] = old_variables['params']['value_head']
+    new_variables['batch_stats']['value_head'] = old_variables['batch_stats']['value_head']
+
+    # Copy existing policy heads (new ones stay randomly initialized)
+    for rows, cols in old_board_sizes:
+        board_key = f"{rows}x{cols}"
+        if board_key in old_variables['params']['policy_heads']:
+            new_variables['params']['policy_heads'][board_key] = \
+                old_variables['params']['policy_heads'][board_key]
+            new_variables['batch_stats']['policy_heads'][board_key] = \
+                old_variables['batch_stats']['policy_heads'][board_key]
+
+    return new_variables
+
+
+def compute_chimera_loss(params, batch_norm_state, network, board_key, batch, rng):
+    """
+    Compute AlphaZero loss for a specific board size using ChimeraNetwork.
+
+    Args:
+        params: Network parameters
+        batch_norm_state: BatchNorm running statistics
+        network: ChimeraNetwork instance
+        board_key: String like "21x15" specifying which policy head
+        batch: Dict with 'states', 'policy_targets', 'value_targets'
+        rng: Random key
+    """
+    states = batch['states']
+    policy_targets = batch['policy_targets']
+    value_targets = batch['value_targets']
+
+    variables = {'params': params, 'batch_stats': batch_norm_state}
+    (policy_logits, value_preds), new_state = network.apply(
+        variables, states, board_key, train=True, mutable=['batch_stats']
+    )
+
+    log_probs = jax.nn.log_softmax(policy_logits)
+    policy_loss = -jnp.mean(jnp.sum(policy_targets * log_probs, axis=-1))
+    value_loss = jnp.mean(jnp.square(value_preds - value_targets))
+
+    probs = jax.nn.softmax(policy_logits)
+    entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
+    mcts_entropy = -jnp.sum(policy_targets * jnp.log(policy_targets + 1e-8), axis=-1)
+    kl_div = jnp.mean(-mcts_entropy - jnp.sum(policy_targets * log_probs, axis=-1))
+
+    total_loss = policy_loss + value_loss
+
+    metrics = {
+        'policy_loss': policy_loss,
+        'value_loss': value_loss,
+        'total_loss': total_loss,
+        'policy_entropy': entropy,
+        'mcts_entropy': jnp.mean(mcts_entropy),
+        'kl_divergence': kl_div,
+    }
+    return total_loss, (new_state['batch_stats'], metrics)
+
+
+def make_chimera_train_step_fn(network, optimizer, board_key):
+    """Create JIT-compiled train step for a specific board size."""
+
+    @jax.jit
+    def _train_step(params, batch_stats, opt_state, batch, rng):
+        def loss_fn(p):
+            return compute_chimera_loss(p, batch_stats, network, board_key, batch, rng)
+
+        (loss, (new_bn_state, metrics)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_bn_state, new_opt_state, metrics
+
+    return _train_step
+
+
+def predict_chimera(params, batch_norm_state, network, states, board_key):
+    """Run inference for ChimeraNetwork."""
+    variables = {'params': params, 'batch_stats': batch_norm_state}
+    policy_logits, values = network.apply(variables, states, board_key, train=False)
+    policy_probs = jax.nn.softmax(policy_logits)
+    return policy_probs, values
+
+
 class PhutballNetwork(nn.Module):
     """
-    Policy-Value network for Phutball.
-    
+    Policy-Value network for Phutball (single board size).
+
     Architecture:
     - Initial conv layer
     - N residual blocks
@@ -45,7 +288,7 @@ class PhutballNetwork(nn.Module):
     cols: int = 15
     num_channels: int = 64
     num_res_blocks: int = 6
-    
+
     @nn.compact
     def __call__(self, x, train: bool = True):
         """

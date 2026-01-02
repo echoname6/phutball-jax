@@ -27,9 +27,10 @@ END_HI = 2    # Row 0 - beyond goal for P2
 END_LO = -2   # Row -1 - beyond goal for P1
 OUT_OF_BOUNDS = jnp.array(3, dtype=jnp.int32)
 
-# Maximum number of jumps in a single turn (for fixed-size arrays)
-# In practice, even crazy sequences rarely exceed 20 jumps
-MAX_JUMP_SEQUENCE_LENGTH = 32
+# Fixed array size for jump sequence tracking (for JIT compilation and NN input)
+# Set to 2048 to support very large boards (covers up to ~64x64 fully, partial for 99x99)
+# Jumps can continue beyond this - this is just the tracking window size
+MAX_JUMP_SEQUENCE_LENGTH = 2048
 
 # ============================================================================
 # State Definition (with jump sequence tracking)
@@ -75,19 +76,21 @@ class EnvConfig(NamedTuple):
 def make_initial_board(config: EnvConfig) -> Array:
     """Create the initial board with end zones and ball in center."""
     rows, cols = config.rows, config.cols
-    
+
     # Start with empty board
     board = jnp.zeros((rows, cols), dtype=jnp.int32)
-    
-    # Set end zones
+
+    # Set end zones (2 rows at each end)
     board = board.at[0, :].set(END_HI)
+    board = board.at[1, :].set(END_HI)
+    board = board.at[rows - 2, :].set(END_LO)
     board = board.at[rows - 1, :].set(END_LO)
-    
+
     # Place ball in center
     center_row = rows // 2
     center_col = cols // 2
     board = board.at[center_row, center_col].set(BALL)
-    
+
     return board
 
 
@@ -455,10 +458,16 @@ def execute_jump(state: PhutballState, landing_pos: Array, config: EnvConfig) ->
         return seq, jnp.array(2, dtype=jnp.int32)
     
     # If already jumping, append the new landing position
+    # Only update array if within bounds, but don't clamp the length counter
+    # This allows unlimited jumps while keeping a fixed-size array for JIT
     def continue_sequence():
-        idx = jnp.minimum(new_length, MAX_JUMP_SEQUENCE_LENGTH - 1)
-        seq = new_jump_sequence.at[idx].set(landing_pos)
-        length = jnp.minimum(new_length + 1, MAX_JUMP_SEQUENCE_LENGTH)
+        seq = lax.cond(
+            new_length < MAX_JUMP_SEQUENCE_LENGTH,
+            lambda s: s.at[new_length].set(landing_pos),
+            lambda s: s,  # Don't update array if full, but continue tracking
+            new_jump_sequence
+        )
+        length = new_length + 1  # No clamping - allow unlimited jumps
         return seq, length
     
     new_jump_sequence, new_length = lax.cond(
