@@ -22,7 +22,10 @@ from phutball_env_jax import (
 )
 from network import (
     PhutballNetwork, create_network, init_network,
-    create_optimizer, make_train_step_fn, predict
+    create_optimizer, make_train_step_fn, predict,
+    # Chimera imports
+    ChimeraNetwork, create_chimera_network, init_chimera_network,
+    expand_chimera_network, make_chimera_train_step_fn, predict_chimera,
 )
 from self_play_batched import (
     play_games_batched,
@@ -300,116 +303,313 @@ def generate_n_move_win_state(
         adjusted_max = (playable_rows - 1) // num_jumps - 1
         max_jump_len = max(min_jump_len, adjusted_max)
 
-    # Directions toward goal
+    # Directions toward goal (for final jump into endzone)
     if player == 1:
-        directions = [(1, 0), (1, -1), (1, 1)]  # down, down-left, down-right
+        goal_directions = [(1, 0), (1, -1), (1, 1)]  # down, down-left, down-right
         endzone_rows = [rows - 2, rows - 1]
     else:
-        directions = [(-1, 0), (-1, -1), (-1, 1)]  # up, up-left, up-right
+        goal_directions = [(-1, 0), (-1, -1), (-1, 1)]  # up, up-left, up-right
         endzone_rows = [0, 1]
 
-    # We'll build the jump chain backwards: endzone <- pos_n-1 <- ... <- pos_1 <- ball
-    # positions[0] = ball, positions[1] = after jump 1, ..., positions[n] = endzone
-    positions = []  # Will hold (row, col) for each position
-    jump_lengths = []  # Length of each jump
-    jump_dirs = []  # Direction of each jump
+    # All directions for intermediate jumps (including horizontal)
+    # Validation below will ensure paths don't overlap
+    all_directions = [
+        (1, 0), (-1, 0),   # vertical
+        (0, 1), (0, -1),   # horizontal
+        (1, 1), (1, -1),   # diagonal down
+        (-1, 1), (-1, -1), # diagonal up
+    ]
 
-    # Split RNG for all random choices
-    rng_keys = jax.random.split(rng, 3 * num_jumps + 3)
-    rng_idx = 0
+    # Try multiple random configurations if needed
+    max_attempts = 10
+    for attempt in range(max_attempts):
+        # Split RNG for this attempt
+        attempt_rng, rng = jax.random.split(rng)
+        rng_keys = jax.random.split(attempt_rng, 3 * num_jumps + 3)
+        rng_idx = 0
 
-    # Start with endzone position
-    end_col = int(jax.random.randint(rng_keys[rng_idx], (), 0, cols))
-    rng_idx += 1
-    end_row = endzone_rows[int(jax.random.randint(rng_keys[rng_idx], (), 0, 2))]
-    rng_idx += 1
+        # Reset state for this attempt
+        positions = []
+        jump_lengths = []
+        jump_dirs = []
+        used_men = set()
+        generation_failed = False
 
-    positions.append((end_row, end_col))
-
-    # Work backwards from endzone to ball
-    for jump_idx in range(num_jumps):
-        # Current position (where this jump lands)
-        curr_row, curr_col = positions[-1]
-
-        # Choose direction for this jump
-        dir_idx = int(jax.random.randint(rng_keys[rng_idx], (), 0, len(directions)))
+        # Start with endzone position
+        end_col = int(jax.random.randint(rng_keys[rng_idx], (), 0, cols))
         rng_idx += 1
-        dr, dc = directions[dir_idx]
-
-        # Choose jump length
-        jump_len = int(jax.random.randint(rng_keys[rng_idx], (), min_jump_len, max_jump_len + 1))
+        end_row = endzone_rows[int(jax.random.randint(rng_keys[rng_idx], (), 0, 2))]
         rng_idx += 1
 
-        # Calculate previous position (where the ball/intermediate was before this jump)
-        # prev + (jump_len + 1) * dir = curr
-        # prev = curr - (jump_len + 1) * dir
-        prev_row = curr_row - (jump_len + 1) * dr
-        prev_col = curr_col - (jump_len + 1) * dc
+        positions.append((end_row, end_col))
 
-        # Validate column bounds
-        if prev_col < 0 or prev_col >= cols:
-            # Fallback to vertical
-            dc = 0
-            prev_col = curr_col
-            prev_row = curr_row - (jump_len + 1) * dr
+        # Work backwards from endzone to ball
+        for jump_idx in range(num_jumps):
+            # Current position (where this jump lands)
+            curr_row, curr_col = positions[-1]
 
-        # For intermediate positions (not the ball), must be in playable area
-        # For the ball (last iteration), also must be in playable area
-        if prev_row <= 1 or prev_row >= rows - 2:
-            # Need to reduce jump length to fit
-            if player == 1:
-                # Moving down, prev must be above curr
-                available_space = curr_row - 2  # rows 0,1 are P2 endzone
+            # Choose direction for this jump
+            # First jump (jump_idx=0) is the final jump INTO endzone - must be goal-directed
+            # Later jumps (jump_idx>0) are intermediate - can include horizontal
+            if jump_idx == 0:
+                directions = goal_directions
             else:
-                # Moving up, prev must be below curr
-                available_space = (rows - 3) - curr_row  # rows-2, rows-1 are P1 endzone
+                directions = all_directions
 
-            max_possible_len = available_space // abs(dr) - 1 if dr != 0 else available_space - 1
-            jump_len = max(1, min(jump_len, max(1, max_possible_len)))
+            dir_idx = int(jax.random.randint(rng_keys[rng_idx], (), 0, len(directions)))
+            rng_idx += 1
+            dr, dc = directions[dir_idx]
 
+            # Choose jump length
+            jump_len = int(jax.random.randint(rng_keys[rng_idx], (), min_jump_len, max_jump_len + 1))
+            rng_idx += 1
+
+            # Calculate previous position (where the ball/intermediate was before this jump)
+            # prev + (jump_len + 1) * dir = curr
+            # prev = curr - (jump_len + 1) * dir
             prev_row = curr_row - (jump_len + 1) * dr
             prev_col = curr_col - (jump_len + 1) * dc
 
+            # Validate column bounds
             if prev_col < 0 or prev_col >= cols:
+                if dr != 0:
+                    # Was diagonal - fallback to vertical, but avoid pure-backward
+                    dc = 0
+                    prev_col = curr_col
+                    # If dr would be backward (away from goal), flip to forward
+                    if (player == 1 and dr < 0) or (player == 2 and dr > 0):
+                        dr = 1 if player == 1 else -1  # forward toward goal
+                    prev_row = curr_row - (jump_len + 1) * dr
+                else:
+                    # Was horizontal (dr=0) - flip direction
+                    dc = -dc
+                    prev_col = curr_col - (jump_len + 1) * dc
+                    if prev_col < 0 or prev_col >= cols:
+                        # Still out of bounds, switch to goal-directed vertical
+                        dr = 1 if player == 1 else -1
+                        dc = 0
+                        prev_row = curr_row - (jump_len + 1) * dr
+                        prev_col = curr_col
+
+            # For intermediate positions (not the ball), must be in playable area
+            # For the ball (last iteration), also must be in playable area
+            # Note: for horizontal jumps (dr=0), row doesn't change so check column instead
+            if dr != 0 and (prev_row <= 1 or prev_row >= rows - 2):
+                # Need to reduce jump length to fit (vertical/diagonal case)
+                if player == 1:
+                    # Moving down, prev must be above curr
+                    available_space = curr_row - 2  # rows 0,1 are P2 endzone
+                else:
+                    # Moving up, prev must be below curr
+                    available_space = (rows - 3) - curr_row  # rows-2, rows-1 are P1 endzone
+
+                max_possible_len = available_space // abs(dr) - 1
+                jump_len = max(1, min(jump_len, max(1, max_possible_len)))
+
+                prev_row = curr_row - (jump_len + 1) * dr
+                prev_col = curr_col - (jump_len + 1) * dc
+
+                if prev_col < 0 or prev_col >= cols:
+                    dc = 0
+                    prev_col = curr_col
+                    prev_row = curr_row - (jump_len + 1) * dr
+            elif dr == 0 and (prev_col < 0 or prev_col >= cols):
+                # Horizontal jump went out of column bounds - reduce length or flip direction
+                if dc > 0:
+                    available_space = cols - 1 - curr_col
+                else:
+                    available_space = curr_col
+                if available_space >= 2:
+                    jump_len = min(jump_len, available_space - 1)
+                    prev_col = curr_col - (jump_len + 1) * dc
+                else:
+                    # Flip direction
+                    dc = -dc
+                    if dc > 0:
+                        available_space = cols - 1 - curr_col
+                    else:
+                        available_space = curr_col
+                    jump_len = min(jump_len, max(1, available_space - 1))
+                    prev_col = curr_col - (jump_len + 1) * dc
+                prev_row = curr_row  # stays same for horizontal
+
+            # Final bounds check - if still out of bounds, use fallback
+            if prev_row <= 1 or prev_row >= rows - 2:
+                # Place at a safe distance from current position using VERTICAL jump
+                # Ensure prev is exactly 2 rows away for a minimal valid jump (jump_len=1)
                 dc = 0
                 prev_col = curr_col
-                prev_row = curr_row - (jump_len + 1) * dr
-
-        # Final bounds check - if still out of bounds, use fallback
-        if prev_row <= 1 or prev_row >= rows - 2:
-            # Place at a safe distance from current position using VERTICAL jump
-            # Ensure prev is exactly 2 rows away for a minimal valid jump (jump_len=1)
-            dc = 0
-            prev_col = curr_col
-            if player == 1:
-                # P1 moves down (toward higher rows), so prev should be above curr
-                prev_row = curr_row - 2
-                dr = 1  # Ensure correct direction
-            else:
-                # P2 moves up (toward lower rows), so prev should be below curr
-                prev_row = curr_row + 2
-                dr = -1  # Ensure correct direction
-            jump_len = 1
-
-            # If still out of bounds, this jump chain isn't feasible - clamp to valid
-            prev_row = max(2, min(rows - 3, prev_row))
-
-            # Recalculate jump_len based on actual distance
-            actual_distance = abs(curr_row - prev_row)
-            if actual_distance >= 2:
-                jump_len = actual_distance - 1
-            else:
-                # Can't make a valid jump, set minimal distance
                 if player == 1:
+                    # P1 moves down (toward higher rows), so prev should be above curr
                     prev_row = curr_row - 2
+                    dr = 1  # Ensure correct direction
                 else:
+                    # P2 moves up (toward lower rows), so prev should be below curr
                     prev_row = curr_row + 2
-                prev_row = max(2, min(rows - 3, prev_row))
-                jump_len = max(1, abs(curr_row - prev_row) - 1)
+                    dr = -1  # Ensure correct direction
+                jump_len = 1
 
-        positions.append((prev_row, prev_col))
-        jump_lengths.append(jump_len)
-        jump_dirs.append((dr, dc))
+                # If still out of bounds, this jump chain isn't feasible - clamp to valid
+                prev_row = max(2, min(rows - 3, prev_row))
+
+                # Recalculate jump_len based on actual distance
+                actual_distance = abs(curr_row - prev_row)
+                if actual_distance >= 2:
+                    jump_len = actual_distance - 1
+                else:
+                    # Can't make a valid jump, set minimal distance
+                    if player == 1:
+                        prev_row = curr_row - 2
+                    else:
+                        prev_row = curr_row + 2
+                    prev_row = max(2, min(rows - 3, prev_row))
+                    jump_len = max(1, abs(curr_row - prev_row) - 1)
+
+            # Calculate men positions for this jump and check for overlap
+            men_positions = set()
+            for i in range(1, jump_len + 1):
+                mr = prev_row + i * dr
+                mc = prev_col + i * dc
+                if 0 <= mr < rows and 0 <= mc < cols:
+                    men_positions.add((mr, mc))
+
+            # Track landing positions that must stay empty for ball to land
+            landing_positions_so_far = set(positions)
+
+            # For the last jump, check if prev (ball position) conflicts with used_men
+            ball_conflict = jump_idx == num_jumps - 1 and (prev_row, prev_col) in used_men
+
+            # Check overlap with used_men AND with landing positions
+            overlap = (men_positions & used_men) | (men_positions & landing_positions_so_far)
+            if (overlap or ball_conflict) and jump_idx > 0:
+                resolved = False
+                # Try all directions with different jump lengths
+                # Prioritize goal-directed vertical, then horizontal, then diagonal
+                test_directions = [
+                    (1 if player == 1 else -1, 0),   # goal-directed vertical
+                    (0, 1), (0, -1),                  # horizontal
+                    (1 if player == 1 else -1, 1),   # goal-directed diagonal right
+                    (1 if player == 1 else -1, -1),  # goal-directed diagonal left
+                    (-1 if player == 1 else 1, 0),   # backward vertical
+                    (-1 if player == 1 else 1, 1),   # backward diagonal right
+                    (-1 if player == 1 else 1, -1),  # backward diagonal left
+                ]
+                for test_dr, test_dc in test_directions:
+                    if resolved:
+                        break
+                    for test_len in range(1, max_jump_len + 1):
+                        if test_dr != 0:
+                            test_prev_row = curr_row - (test_len + 1) * test_dr
+                            test_prev_col = curr_col - (test_len + 1) * test_dc
+                        else:
+                            # Horizontal jump
+                            test_prev_row = curr_row
+                            test_prev_col = curr_col - (test_len + 1) * test_dc
+
+                        # Check bounds
+                        if test_prev_row <= 1 or test_prev_row >= rows - 2:
+                            continue
+                        if test_prev_col < 0 or test_prev_col >= cols:
+                            continue
+
+                        test_men = set()
+                        for i in range(1, test_len + 1):
+                            mr = test_prev_row + i * test_dr
+                            mc = test_prev_col + i * test_dc
+                            if 0 <= mr < rows and 0 <= mc < cols:
+                                test_men.add((mr, mc))
+
+                        # For the last jump, the prev position becomes the ball
+                        # So also check that prev is not in used_men
+                        if jump_idx == num_jumps - 1:
+                            prev_candidate = (test_prev_row, test_prev_col)
+                            if prev_candidate in used_men:
+                                continue  # This would put ball on a men position
+
+                        if test_men and not (test_men & used_men) and not (test_men & landing_positions_so_far):
+                            prev_row, prev_col = test_prev_row, test_prev_col
+                            dr, dc = test_dr, test_dc
+                            jump_len = test_len
+                            men_positions = test_men
+                            resolved = True
+                            break
+
+                # If we couldn't resolve, mark generation as failed and try a new random config
+                if not resolved:
+                    generation_failed = True
+                    break  # Exit jump loop to try a new random configuration
+
+            # Add men positions to used set
+            used_men.update(men_positions)
+
+            positions.append((prev_row, prev_col))
+            jump_lengths.append(jump_len)
+            jump_dirs.append((dr, dc))
+
+            # After the last jump is planned, check if ball position conflicts with any men
+            # (This is the last iteration, so positions[-1] will be the ball position)
+            if jump_idx == num_jumps - 1:
+                ball_candidate = (prev_row, prev_col)
+                if ball_candidate in used_men:
+                    # Ball position conflicts with a man needed by an earlier jump
+                    # Try shifting the ball position by changing the last jump's direction/length
+                    resolved_ball = False
+                    for alt_dr, alt_dc in all_directions:
+                        if resolved_ball:
+                            break
+                        for alt_len in range(1, max_jump_len + 1):
+                            if alt_dr != 0:
+                                alt_prev_row = curr_row - (alt_len + 1) * alt_dr
+                                alt_prev_col = curr_col - (alt_len + 1) * alt_dc
+                            else:
+                                alt_prev_row = curr_row
+                                alt_prev_col = curr_col - (alt_len + 1) * alt_dc
+
+                            # Check bounds
+                            if alt_prev_row <= 1 or alt_prev_row >= rows - 2:
+                                continue
+                            if alt_prev_col < 0 or alt_prev_col >= cols:
+                                continue
+
+                            # Compute men for this alternative
+                            alt_men = set()
+                            for i in range(1, alt_len + 1):
+                                mr = alt_prev_row + i * alt_dr
+                                mc = alt_prev_col + i * alt_dc
+                                if 0 <= mr < rows and 0 <= mc < cols:
+                                    alt_men.add((mr, mc))
+
+                            alt_ball = (alt_prev_row, alt_prev_col)
+                            # Check: ball not in used_men, alt_men don't overlap used_men or landing positions
+                            other_used_men = used_men - men_positions
+                            other_landings = landing_positions_so_far - {(prev_row, prev_col)}
+                            if (alt_ball not in other_used_men and alt_men and
+                                not (alt_men & other_used_men) and not (alt_men & other_landings)):
+                                # Found a valid alternative
+                                positions[-1] = alt_ball
+                                jump_lengths[-1] = alt_len
+                                jump_dirs[-1] = (alt_dr, alt_dc)
+                                # Update used_men: remove old men, add new
+                                used_men -= men_positions
+                                used_men.update(alt_men)
+                                resolved_ball = True
+                                break
+
+        # Check if this attempt succeeded (generated all required jumps)
+        if not generation_failed and len(jump_dirs) == num_jumps:
+            # Post-validation: check that no men positions overlap with any landing positions
+            # This catches cases where a later jump (in backwards order) places men at
+            # a landing position that wasn't known when the earlier jump was planned
+            all_landing_positions = set(positions)  # positions includes all landings
+            all_men_positions = used_men.copy()
+            conflict = all_men_positions & all_landing_positions
+            if conflict:
+                # Men were placed at landing positions - retry with different config
+                generation_failed = True
+            else:
+                break  # Success! Exit attempt loop
+        # Otherwise, try another random configuration
+        # (generation_failed is already True, or we didn't get enough jumps)
 
     # Reverse to get ball -> ... -> endzone order
     positions = positions[::-1]  # [ball, pos1, pos2, ..., endzone]
@@ -443,7 +643,13 @@ def generate_n_move_win_state(
         positions[0] = (ball_row, ball_col)
 
     # Place men for each jump segment
-    for jump_idx in range(num_jumps):
+    # Note: len(jump_dirs) may be less than num_jumps if we abandoned a jump
+    actual_num_jumps = len(jump_dirs)
+
+    # Landing positions that must stay empty (all positions except the ball)
+    landing_positions = set(positions[1:])
+
+    for jump_idx in range(actual_num_jumps):
         start_row, start_col = positions[jump_idx]
         dr, dc = jump_dirs[jump_idx]
         jump_len = jump_lengths[jump_idx]
@@ -453,7 +659,9 @@ def generate_n_move_win_state(
             mc = start_col + i * dc
             # Men can be placed in first endzone rows (1 and rows-2) but not deep rows (0 and rows-1)
             if 1 <= mr <= rows - 2 and 0 <= mc < cols:
-                board[mr, mc] = MAN
+                # Safety check: never overwrite the ball or a landing position with a man
+                if (mr, mc) != (ball_row, ball_col) and (mr, mc) not in landing_positions:
+                    board[mr, mc] = MAN
                 jump_path_positions.add((mr, mc))
 
     # Add noise men that don't block any jump path
@@ -522,11 +730,27 @@ def generate_two_move_win_state(
     return state, actions[0], actions[1] if len(actions) > 1 else actions[0]
 
 
+def _stack_states(state_list: List[PhutballState]) -> PhutballState:
+    """Stack a list of PhutballState objects into a batched PhutballState."""
+    return PhutballState(
+        board=jnp.stack([s.board for s in state_list], axis=0),
+        ball_pos=jnp.stack([s.ball_pos for s in state_list], axis=0),
+        current_player=jnp.stack([s.current_player for s in state_list], axis=0),
+        is_jumping=jnp.stack([s.is_jumping for s in state_list], axis=0),
+        terminated=jnp.stack([s.terminated for s in state_list], axis=0),
+        winner=jnp.stack([s.winner for s in state_list], axis=0),
+        num_turns=jnp.stack([s.num_turns for s in state_list], axis=0),
+        jump_sequence=jnp.stack([s.jump_sequence for s in state_list], axis=0),
+        jump_sequence_length=jnp.stack([s.jump_sequence_length for s in state_list], axis=0),
+    )
+
+
 def generate_curriculum_batch(
     rng: jax.Array,
     env_config: EnvConfig,
     batch_size: int,
     jump_distribution: List[float] = None,
+    return_stats: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generate a batch of winning states for curriculum learning.
@@ -541,11 +765,13 @@ def generate_curriculum_batch(
         jump_distribution: List of 4 floats [p1, p2, p3, p4] for probability of
                           1-jump, 2-jump, 3-jump, 4-jump examples.
                           Default: [0.4, 0.3, 0.2, 0.1]
+        return_stats: If True, return statistics dict as 4th element
 
     Returns:
         states: (batch_size, 6, rows, cols) - network input format
         policy_targets: (batch_size, action_space_size) - one-hot on first action
         value_targets: (batch_size,) - all +1 (current player wins)
+        stats: (optional) dict with counts by jump type if return_stats=True
     """
     if jump_distribution is None:
         jump_distribution = [0.4, 0.3, 0.2, 0.1]  # Default: more 1-jump, fewer 4-jump
@@ -557,8 +783,9 @@ def generate_curriculum_batch(
     rows, cols = env_config.rows, env_config.cols
     action_space_size = 2 * rows * cols + 1
 
-    states_list = []
-    policy_list = []
+    # Collect states and actions
+    state_list = []
+    action_list = []
 
     # Calculate counts for each jump type
     counts = []
@@ -587,16 +814,30 @@ def generate_curriculum_batch(
                 )
                 first_action = actions[0]
 
-            obs = state_to_network_input(state, env_config)
-            states_list.append(np.array(obs))
+            state_list.append(state)
+            action_list.append(first_action)
 
-            policy = np.zeros(action_space_size, dtype=np.float32)
-            policy[first_action] = 1.0
-            policy_list.append(policy)
+    # Batch convert states to network inputs using vmap
+    batched_states = _stack_states(state_list)
+    batched_to_input = jax.vmap(lambda s: state_to_network_input(s, env_config))
+    states = np.array(batched_to_input(batched_states))
 
-    states = np.stack(states_list, axis=0)
-    policies = np.stack(policy_list, axis=0)
+    # Create policy targets
+    policies = np.zeros((batch_size, action_space_size), dtype=np.float32)
+    action_indices = np.array(action_list, dtype=np.int32)
+    policies[np.arange(batch_size), action_indices] = 1.0
+
     values = np.ones(batch_size, dtype=np.float32)  # Current player wins
+
+    if return_stats:
+        stats = {
+            'curriculum_1jump': counts[0],
+            'curriculum_2jump': counts[1],
+            'curriculum_3jump': counts[2],
+            'curriculum_4jump': counts[3],
+            'curriculum_total': batch_size,
+        }
+        return states, policies, values, stats
 
     return states, policies, values
 
@@ -906,6 +1147,15 @@ class AlphaZeroTrainer:
             'kl_divergence': 0.0,
         }
 
+        # Curriculum statistics tracking
+        curriculum_stats_sum = {
+            'curriculum_1jump': 0,
+            'curriculum_2jump': 0,
+            'curriculum_3jump': 0,
+            'curriculum_4jump': 0,
+            'curriculum_total': 0,
+        }
+
         # Calculate curriculum mix ratio
         curriculum_ratio = self.get_curriculum_ratio()
         curriculum_size = int(self.config.batch_size_train * curriculum_ratio)
@@ -927,10 +1177,14 @@ class AlphaZeroTrainer:
 
             # Generate curriculum examples
             if curriculum_size > 0:
-                curr_states, curr_policies, curr_values = generate_curriculum_batch(
+                curr_states, curr_policies, curr_values, curr_stats = generate_curriculum_batch(
                     curriculum_rng, self.env_config, curriculum_size,
-                    jump_distribution=list(self.config.curriculum_jump_distribution)
+                    jump_distribution=list(self.config.curriculum_jump_distribution),
+                    return_stats=True
                 )
+                # Accumulate curriculum stats
+                for k, v in curr_stats.items():
+                    curriculum_stats_sum[k] += v
                 # Concatenate with replay batch
                 states = np.concatenate([states, curr_states], axis=0)
                 policies = np.concatenate([policies, curr_policies], axis=0)
@@ -965,8 +1219,9 @@ class AlphaZeroTrainer:
               f"value_loss: {avg_metrics['value_loss']:.4f} | "
               f"curriculum: {curriculum_pct:.1f}%")
 
-        # Add curriculum ratio to metrics for logging
+        # Add curriculum ratio and stats to metrics for logging
         avg_metrics['curriculum_ratio'] = curriculum_ratio
+        avg_metrics.update(curriculum_stats_sum)
 
         return avg_metrics
     
@@ -1109,6 +1364,11 @@ class AlphaZeroTrainer:
                     "train/value_loss": metrics["value_loss"],
                     "train/total_loss": metrics["total_loss"],
                     "train/curriculum_ratio": metrics.get("curriculum_ratio", 0.0),
+                    "train/curriculum_1jump": metrics.get("curriculum_1jump", 0),
+                    "train/curriculum_2jump": metrics.get("curriculum_2jump", 0),
+                    "train/curriculum_3jump": metrics.get("curriculum_3jump", 0),
+                    "train/curriculum_4jump": metrics.get("curriculum_4jump", 0),
+                    "train/curriculum_total": metrics.get("curriculum_total", 0),
                     "time/iteration_sec": iter_time,
                 }
 
@@ -1784,6 +2044,503 @@ def make_train_config(
     )
 
 
+# ============================================================================
+# Chimera Trainer: Shared backbone, separate policy heads per board size
+# ============================================================================
+
+@dataclass
+class ChimeraConfig:
+    """Configuration for ChimeraTrainer (multi-board training)."""
+    # Board sizes: tuple of (rows, cols)
+    board_sizes: Tuple[Tuple[int, int], ...] = ((11, 9), (15, 11), (21, 15))
+
+    # Network architecture (shared backbone)
+    num_channels: int = 64
+    num_res_blocks: int = 6
+
+    # Self-play
+    batch_size_games: int = 64
+    max_turns_per_game: int = 2048
+    max_moves_per_game: int = 4096
+    temperature: float = 1.0
+    temp_threshold: int = 30
+    temp_final: float = 0.1
+    num_simulations: int = 50
+
+    # Training
+    batch_size_train: int = 256
+    learning_rate: float = 0.001
+    weight_decay: float = 1e-4
+    train_steps_per_iteration: int = 100
+
+    # How to mix board sizes during training
+    # 'uniform': equal samples from each size
+    # 'weighted': more samples from larger boards (proportional to board area)
+    # 'round_robin': cycle through sizes each step
+    board_mix_strategy: str = 'weighted'
+
+    # Replay buffer (per board size)
+    buffer_size: int = 200000
+    min_buffer_size: int = 500
+
+    # Iterations
+    num_iterations: int = 500
+    games_per_iteration: int = 256
+
+    # Checkpointing
+    checkpoint_dir: str = "checkpoints_chimera"
+    checkpoint_every: int = 10
+    log_every: int = 1
+
+    # Curriculum learning (applied per board size)
+    curriculum_enabled: bool = True
+    curriculum_initial_ratio: float = 0.5
+    curriculum_final_ratio: float = 0.0
+    curriculum_decay_iterations: int = 100
+    curriculum_jump_distribution: Tuple[float, float, float, float] = (0.4, 0.3, 0.2, 0.1)
+
+    use_wandb: bool = False
+    wandb_project: str = "phutball-az-chimera"
+    wandb_run_name: Optional[str] = None
+
+
+class ChimeraTrainer:
+    """
+    Multi-board trainer with shared backbone + value head, separate policy heads.
+
+    Key features:
+    - Single backbone learns features useful across all board sizes
+    - Value head uses global pooling (size-agnostic)
+    - Separate policy head per board size
+    - Can add new board sizes post-hoc via expand_chimera_network()
+    """
+
+    def __init__(self, config: ChimeraConfig):
+        self.config = config
+
+        # Create EnvConfig for each board size
+        self.env_configs = {
+            f"{r}x{c}": EnvConfig(rows=r, cols=c, max_turns=config.max_turns_per_game)
+            for r, c in config.board_sizes
+        }
+
+        # Create ChimeraNetwork
+        self.network = create_chimera_network(
+            board_sizes=config.board_sizes,
+            num_channels=config.num_channels,
+            num_res_blocks=config.num_res_blocks,
+        )
+
+        # Optimizer
+        self.optimizer = create_optimizer(
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        # Separate replay buffer per board size
+        self.replay_buffers = {
+            f"{r}x{c}": ReplayBuffer(max_size=config.buffer_size)
+            for r, c in config.board_sizes
+        }
+
+        # Initialize
+        self.rng = jax.random.PRNGKey(42)
+        self._init_network()
+
+        # Create JIT-compiled train steps for each board size
+        self.train_step_fns = {
+            board_key: make_chimera_train_step_fn(self.network, self.optimizer, board_key)
+            for board_key in self.env_configs.keys()
+        }
+
+        # Metrics
+        self.iteration = 0
+        self.total_games = {bk: 0 for bk in self.env_configs}
+        self.total_examples = {bk: 0 for bk in self.env_configs}
+        self.metrics_history = []
+
+        # Wandb
+        self.wandb_run = None
+        if self.config.use_wandb:
+            if wandb is None:
+                print("WARNING: wandb not installed, disabling")
+                self.config.use_wandb = False
+            else:
+                run_name = config.wandb_run_name or f"chimera_{int(time.time())}"
+                self.wandb_run = wandb.init(
+                    project=config.wandb_project,
+                    name=run_name,
+                    config=asdict(config),
+                )
+
+    def _init_network(self):
+        """Initialize network parameters."""
+        self.rng, init_rng = jax.random.split(self.rng)
+        variables = init_chimera_network(init_rng, self.network, num_input_channels=6)
+
+        self.params = variables['params']
+        self.batch_stats = variables['batch_stats']
+        self.opt_state = self.optimizer.init(self.params)
+
+    def get_network_params(self) -> dict:
+        """Get params dict for self-play."""
+        return {
+            'network_params': self.params,
+            'batch_stats': self.batch_stats,
+        }
+
+    def run_self_play_for_board(self, board_key: str) -> int:
+        """Run self-play for a specific board size. Returns num examples."""
+        env_config = self.env_configs[board_key]
+        rows, cols = env_config.rows, env_config.cols
+
+        # Create a wrapper network that behaves like PhutballNetwork for this board size
+        # This is needed because play_games_batched expects PhutballNetwork interface
+        class ChimeraWrapper:
+            def __init__(wrapper_self, chimera, board_key):
+                wrapper_self.chimera = chimera
+                wrapper_self.board_key = board_key
+                wrapper_self.rows = rows
+                wrapper_self.cols = cols
+
+            def apply(wrapper_self, variables, x, train=True, mutable=None):
+                if mutable:
+                    return wrapper_self.chimera.apply(
+                        variables, x, wrapper_self.board_key, train=train, mutable=mutable
+                    )
+                return wrapper_self.chimera.apply(
+                    variables, x, wrapper_self.board_key, train=train
+                )
+
+        wrapper = ChimeraWrapper(self.network, board_key)
+
+        total_states = []
+        total_policies = []
+        total_values = []
+
+        num_batches = self.config.games_per_iteration // self.config.batch_size_games
+
+        for _ in range(num_batches):
+            self.rng, game_rng = jax.random.split(self.rng)
+
+            trajectory = play_games_batched(
+                params=self.get_network_params(),
+                rng=game_rng,
+                network=wrapper,
+                env_config=env_config,
+                batch_size=self.config.batch_size_games,
+                max_turns=self.config.max_turns_per_game,
+                max_moves=self.config.max_moves_per_game,
+                temperature=self.config.temperature,
+                temp_threshold=self.config.temp_threshold,
+                temp_final=self.config.temp_final,
+                num_simulations=self.config.num_simulations,
+            )
+
+            states, policies, values = trajectory_to_training_examples(trajectory)
+            total_states.append(states)
+            total_policies.append(policies)
+            total_values.append(values)
+
+        if total_states:
+            all_states = np.concatenate(total_states, axis=0)
+            all_policies = np.concatenate(total_policies, axis=0)
+            all_values = np.concatenate(total_values, axis=0)
+
+            self.replay_buffers[board_key].add(all_states, all_policies, all_values)
+            num_examples = len(all_states)
+        else:
+            num_examples = 0
+
+        games_total = num_batches * self.config.batch_size_games
+        self.total_games[board_key] += games_total
+        self.total_examples[board_key] += num_examples
+
+        return num_examples
+
+    def run_self_play(self) -> dict:
+        """Run self-play for all board sizes. Returns examples per board."""
+        start_time = time.time()
+        examples_per_board = {}
+
+        for board_key in self.env_configs:
+            num_examples = self.run_self_play_for_board(board_key)
+            examples_per_board[board_key] = num_examples
+
+        elapsed = time.time() - start_time
+        total_examples = sum(examples_per_board.values())
+        print(f"  Self-play: {total_examples} total examples ({elapsed:.1f}s)")
+        for bk, n in examples_per_board.items():
+            print(f"    {bk}: {n} examples, buffer={len(self.replay_buffers[bk])}")
+
+        return examples_per_board
+
+    def get_curriculum_ratio(self) -> float:
+        """Calculate current curriculum ratio."""
+        if not self.config.curriculum_enabled:
+            return 0.0
+        if self.iteration >= self.config.curriculum_decay_iterations:
+            return self.config.curriculum_final_ratio
+        progress = self.iteration / self.config.curriculum_decay_iterations
+        return self.config.curriculum_initial_ratio + progress * (
+            self.config.curriculum_final_ratio - self.config.curriculum_initial_ratio
+        )
+
+    def run_training(self) -> dict:
+        """Run training steps across all board sizes."""
+        # Check all buffers have minimum size
+        for board_key, buffer in self.replay_buffers.items():
+            if len(buffer) < self.config.min_buffer_size:
+                print(f"  Skipping training: {board_key} buffer too small "
+                      f"({len(buffer)}/{self.config.min_buffer_size})")
+                return {}
+
+        start_time = time.time()
+        metrics_sum = {
+            'policy_loss': 0.0, 'value_loss': 0.0, 'total_loss': 0.0,
+            'policy_entropy': 0.0, 'mcts_entropy': 0.0, 'kl_divergence': 0.0,
+        }
+
+        # Curriculum statistics tracking
+        curriculum_stats_sum = {
+            'curriculum_1jump': 0,
+            'curriculum_2jump': 0,
+            'curriculum_3jump': 0,
+            'curriculum_4jump': 0,
+            'curriculum_total': 0,
+        }
+
+        curriculum_ratio = self.get_curriculum_ratio()
+        board_keys = list(self.env_configs.keys())
+
+        # Compute board weights for weighted sampling
+        if self.config.board_mix_strategy == 'weighted':
+            # Weight by board area (larger boards get more training)
+            areas = [r * c for r, c in self.config.board_sizes]
+            total_area = sum(areas)
+            board_weights = np.array([a / total_area for a in areas])
+            # Cumulative for sampling
+            board_cum_weights = np.cumsum(board_weights)
+
+        for step_idx in range(self.config.train_steps_per_iteration):
+            self.rng, step_rng, curriculum_rng, board_rng = jax.random.split(self.rng, 4)
+
+            # Select board size based on strategy
+            if self.config.board_mix_strategy == 'weighted':
+                # Sample proportional to board area
+                rand_val = float(jax.random.uniform(board_rng))
+                board_idx = int(np.searchsorted(board_cum_weights, rand_val))
+                board_idx = min(board_idx, len(board_keys) - 1)
+                board_key = board_keys[board_idx]
+            elif self.config.board_mix_strategy == 'round_robin':
+                board_key = board_keys[step_idx % len(board_keys)]
+            else:  # uniform
+                board_key = board_keys[step_idx % len(board_keys)]
+
+            env_config = self.env_configs[board_key]
+            rows, cols = env_config.rows, env_config.cols
+            action_space_size = 2 * rows * cols + 1
+
+            # Sample from replay buffer
+            curriculum_size = int(self.config.batch_size_train * curriculum_ratio)
+            replay_size = self.config.batch_size_train - curriculum_size
+
+            if replay_size > 0:
+                replay_batch = self.replay_buffers[board_key].sample(replay_size)
+                states = replay_batch['states']
+                policies = replay_batch['policy_targets']
+                values = replay_batch['value_targets']
+            else:
+                states = np.empty((0, 6, rows, cols), dtype=np.float32)
+                policies = np.empty((0, action_space_size), dtype=np.float32)
+                values = np.empty((0,), dtype=np.float32)
+
+            # Generate curriculum examples
+            if curriculum_size > 0:
+                curr_states, curr_policies, curr_values, curr_stats = generate_curriculum_batch(
+                    curriculum_rng, env_config, curriculum_size,
+                    jump_distribution=list(self.config.curriculum_jump_distribution),
+                    return_stats=True
+                )
+                # Accumulate curriculum stats
+                for k, v in curr_stats.items():
+                    curriculum_stats_sum[k] += v
+                states = np.concatenate([states, curr_states], axis=0)
+                policies = np.concatenate([policies, curr_policies], axis=0)
+                values = np.concatenate([values, curr_values], axis=0)
+
+            batch = {
+                'states': states,
+                'policy_targets': policies,
+                'value_targets': values,
+            }
+
+            # Train step for this board size
+            train_step_fn = self.train_step_fns[board_key]
+            self.params, self.batch_stats, self.opt_state, metrics = train_step_fn(
+                self.params, self.batch_stats, self.opt_state, batch, step_rng
+            )
+
+            for k, v in metrics.items():
+                metrics_sum[k] += float(v)
+
+        elapsed = time.time() - start_time
+        avg_metrics = {k: v / self.config.train_steps_per_iteration for k, v in metrics_sum.items()}
+        avg_metrics['curriculum_ratio'] = curriculum_ratio
+        avg_metrics.update(curriculum_stats_sum)
+
+        print(f"  Training: {self.config.train_steps_per_iteration} steps ({elapsed:.1f}s) | "
+              f"policy_loss: {avg_metrics['policy_loss']:.4f}, "
+              f"value_loss: {avg_metrics['value_loss']:.4f}")
+
+        return avg_metrics
+
+    def save_checkpoint(self, path: Optional[str] = None):
+        """Save checkpoint."""
+        if path is None:
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            path = os.path.join(self.config.checkpoint_dir, f"chimera_{self.iteration:06d}.pkl")
+
+        checkpoint = {
+            'params': self.params,
+            'batch_stats': self.batch_stats,
+            'opt_state': self.opt_state,
+            'iteration': self.iteration,
+            'total_games': self.total_games,
+            'total_examples': self.total_examples,
+            'config': self.config,
+            'board_sizes': self.config.board_sizes,
+            'metrics_history': self.metrics_history,
+        }
+
+        with open(path, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        print(f"  Saved checkpoint: {path}")
+
+    def load_checkpoint(self, path: str):
+        """Load checkpoint."""
+        with open(path, 'rb') as f:
+            checkpoint = pickle.load(f)
+
+        self.params = checkpoint['params']
+        self.batch_stats = checkpoint['batch_stats']
+        self.opt_state = checkpoint['opt_state']
+        self.iteration = checkpoint['iteration']
+        self.total_games = checkpoint['total_games']
+        self.total_examples = checkpoint['total_examples']
+        self.metrics_history = checkpoint.get('metrics_history', [])
+
+        print(f"Loaded checkpoint from iteration {self.iteration}")
+
+    def add_board_size(self, new_rows: int, new_cols: int):
+        """Add a new board size to the chimera (post-hoc expansion)."""
+        board_key = f"{new_rows}x{new_cols}"
+        if board_key in self.env_configs:
+            print(f"Board size {board_key} already exists")
+            return
+
+        old_board_sizes = self.config.board_sizes
+        new_board_sizes = old_board_sizes + ((new_rows, new_cols),)
+
+        # Create new expanded network
+        new_network = create_chimera_network(
+            board_sizes=new_board_sizes,
+            num_channels=self.config.num_channels,
+            num_res_blocks=self.config.num_res_blocks,
+        )
+
+        # Expand parameters
+        self.rng, expand_rng = jax.random.split(self.rng)
+        old_variables = {'params': self.params, 'batch_stats': self.batch_stats}
+        new_variables = expand_chimera_network(
+            old_variables, old_board_sizes, new_network, expand_rng
+        )
+
+        # Update state
+        self.network = new_network
+        self.params = new_variables['params']
+        self.batch_stats = new_variables['batch_stats']
+        self.config.board_sizes = new_board_sizes
+
+        # Add new env config and buffer
+        self.env_configs[board_key] = EnvConfig(
+            rows=new_rows, cols=new_cols, max_turns=self.config.max_turns_per_game
+        )
+        self.replay_buffers[board_key] = ReplayBuffer(max_size=self.config.buffer_size)
+        self.total_games[board_key] = 0
+        self.total_examples[board_key] = 0
+
+        # Add new train step fn
+        self.train_step_fns[board_key] = make_chimera_train_step_fn(
+            self.network, self.optimizer, board_key
+        )
+
+        print(f"Added board size {board_key}. Now training on: {list(self.env_configs.keys())}")
+
+    def train(self):
+        """Main training loop."""
+        # Auto-resume
+        existing = glob.glob(os.path.join(self.config.checkpoint_dir, "chimera_*.pkl"))
+        if existing:
+            latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            self.load_checkpoint(latest)
+            self.iteration += 1
+
+        print("=" * 60)
+        print("Chimera Training for Phutball")
+        print("=" * 60)
+        print(f"Board sizes: {list(self.env_configs.keys())}")
+        print(f"Shared backbone: {self.config.num_channels}ch, {self.config.num_res_blocks} blocks")
+        print(f"Devices: {jax.devices()}")
+        print("=" * 60)
+
+        for iteration in range(self.iteration, self.config.num_iterations):
+            self.iteration = iteration
+            iter_start = time.time()
+
+            print(f"\nIteration {iteration + 1}/{self.config.num_iterations}")
+            print("-" * 40)
+
+            # Self-play for all board sizes
+            examples_per_board = self.run_self_play()
+
+            # Training
+            metrics = self.run_training()
+
+            if metrics:
+                self.metrics_history.append({
+                    'iteration': iteration,
+                    'total_games': dict(self.total_games),
+                    'total_examples': dict(self.total_examples),
+                    **metrics,
+                })
+
+            # Checkpoint
+            if (iteration + 1) % self.config.checkpoint_every == 0:
+                self.save_checkpoint()
+
+            iter_time = time.time() - iter_start
+            print(f"  Iteration time: {iter_time:.1f}s")
+
+            if self.config.use_wandb and self.wandb_run and metrics:
+                log_data = {
+                    "iteration": iteration,
+                    "train/policy_loss": metrics["policy_loss"],
+                    "train/value_loss": metrics["value_loss"],
+                    "train/curriculum_ratio": metrics.get("curriculum_ratio", 0),
+                    "train/curriculum_1jump": metrics.get("curriculum_1jump", 0),
+                    "train/curriculum_2jump": metrics.get("curriculum_2jump", 0),
+                    "train/curriculum_3jump": metrics.get("curriculum_3jump", 0),
+                    "train/curriculum_4jump": metrics.get("curriculum_4jump", 0),
+                    "train/curriculum_total": metrics.get("curriculum_total", 0),
+                }
+                for bk in self.env_configs:
+                    log_data[f"selfplay/{bk}/examples"] = examples_per_board.get(bk, 0)
+                    log_data[f"selfplay/{bk}/buffer_size"] = len(self.replay_buffers[bk])
+                wandb.log(log_data)
+
+        self.save_checkpoint()
+        print("\nChimera training complete!")
 
 
 # ============================================================================
