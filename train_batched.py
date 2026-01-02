@@ -1963,11 +1963,26 @@ def make_train_config(
     checkpoint_every: int = 20,
     use_wandb: bool = False,
     wandb_run_name: Optional[str] = None,
+    wandb_project: str = "phutball-az",
     eval_vs_random_threshold: Optional[float] = 0.90,
+    eval_vs_random_games: int = 100,
     stop_when_beating_random: bool = True,
     num_simulations: int = 50,
     temp_threshold: int = 30,
     temp_final: float = 0.1,
+    # Network
+    num_channels: int = 64,
+    num_res_blocks: int = 8,
+    # Batch sizes
+    batch_size_games: int = 128,
+    batch_size_train: int = 256,
+    # Training params
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    train_steps_per_iteration: int = 100,
+    buffer_size: Optional[int] = None,
+    min_buffer_size: int = 1000,
+    max_moves_per_game: int = 512,
     # Curriculum learning
     curriculum_enabled: bool = True,
     curriculum_initial_ratio: float = 0.5,
@@ -1980,8 +1995,8 @@ def make_train_config(
     in every notebook/script.
     """
 
-    buffer_size = get_buffer_size(rows, cols)
-
+    if buffer_size is None:
+        buffer_size = get_buffer_size(rows, cols)
 
     return TrainConfig(
         # Environment
@@ -1989,28 +2004,28 @@ def make_train_config(
         cols=cols,
 
         # Network
-        num_channels=64,
-        num_res_blocks=8,
+        num_channels=num_channels,
+        num_res_blocks=num_res_blocks,
 
         # Self-play
-        batch_size_games=128,
-        games_per_iteration=256,
+        batch_size_games=batch_size_games,
+        games_per_iteration=batch_size_games * 2,
         max_turns_per_game=512,
-        max_moves_per_game=512,
+        max_moves_per_game=max_moves_per_game,
         temperature=1.0,
         temp_threshold=temp_threshold,
         temp_final=temp_final,
         num_simulations=num_simulations,
 
         # Training
-        batch_size_train=256,
-        learning_rate=1e-3,
-        weight_decay=1e-4,
-        train_steps_per_iteration=100,
+        batch_size_train=batch_size_train,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        train_steps_per_iteration=train_steps_per_iteration,
 
         # Replay buffer
         buffer_size=buffer_size,
-        min_buffer_size=1_000,
+        min_buffer_size=min_buffer_size,
 
         # Iterations / checkpoints
         num_iterations=num_iterations,
@@ -2020,7 +2035,7 @@ def make_train_config(
 
         # Eval vs random
         eval_enable=True,
-        eval_vs_random_games=100,
+        eval_vs_random_games=eval_vs_random_games,
         eval_vs_random_threshold=eval_vs_random_threshold,
         stop_when_beating_random=stop_when_beating_random,
         eval_max_prev_checkpoints=5,
@@ -2038,7 +2053,7 @@ def make_train_config(
 
         # Wandb
         use_wandb=use_wandb,
-        wandb_project="phutball-az",
+        wandb_project=wandb_project,
         wandb_run_name=wandb_run_name,
         wandb_mode="online" if use_wandb else "disabled",
     )
