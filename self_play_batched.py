@@ -901,7 +901,7 @@ def play_games_vs_random_training(
     def single_legal(state):
         return get_legal_actions(state, env_config)
 
-    def game_step(carry, _):
+    def game_step(carry):
         (env_states, terminated, move_count, all_states, all_policies,
          all_players, all_actions, valid_mask, rng, step_idx) = carry
 
@@ -989,7 +989,7 @@ def play_games_vs_random_training(
         carry = (new_env_states, new_terminated, new_move_count,
                 all_states, all_policies, all_players, all_actions, valid_mask,
                 rng, step_idx + jnp.int32(1))
-        return carry, None
+        return carry
 
     step0 = jnp.int32(0)
 
