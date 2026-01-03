@@ -29,11 +29,12 @@ from network import (
 )
 from self_play_batched import (
     play_games_batched,
+    play_games_vs_random_training,
     trajectory_to_training_examples,
     ReplayBuffer,
     compute_phutball_stats,
     play_match_batched,
-    play_vs_random_batched, 
+    play_vs_random_batched,
     batched_mcts_policy,
     batched_reset,
 )
@@ -905,6 +906,12 @@ class TrainConfig:
     # Jump distribution: [p1, p2, p3, p4] = probability for 1,2,3,4-jump examples
     curriculum_jump_distribution: Tuple[float, float, float, float] = (0.4, 0.3, 0.2, 0.1)
 
+    # Random opponent mixing: adds diversity to break passive self-play equilibrium
+    random_opponent_enabled: bool = False
+    random_opponent_initial_ratio: float = 0.33   # Initial fraction of games vs random
+    random_opponent_final_ratio: float = 0.003    # Final fraction (decays to this)
+    random_opponent_decay_iterations: int = 100   # Iterations to decay from initial to final
+
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
     wandb_run_name: Optional[str] = None
@@ -991,7 +998,7 @@ class AlphaZeroTrainer:
     def run_self_play(self) -> int:
         """Run batched self-play games. Returns number of new examples."""
         start_time = time.time()
-        
+
         total_states = []
         total_policies = []
         total_values = []
@@ -1011,27 +1018,64 @@ class AlphaZeroTrainer:
         p1_wins = 0
         p2_wins = 0
         draws = 0
-        
+        vs_random_games = 0
+        self_play_games = 0
+
+        # Calculate current random opponent ratio (decays over iterations)
+        if self.config.random_opponent_enabled:
+            decay_progress = min(1.0, self.iteration / max(1, self.config.random_opponent_decay_iterations))
+            random_opp_ratio = (
+                self.config.random_opponent_initial_ratio
+                + (self.config.random_opponent_final_ratio - self.config.random_opponent_initial_ratio)
+                * decay_progress
+            )
+        else:
+            random_opp_ratio = 0.0
+
         # Run multiple batches to get desired number of games
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
-        
+
         for batch_idx in range(num_batches):
-            self.rng, game_rng = jax.random.split(self.rng)
-            
-            # Play games in parallel with temperature scheduling
-            trajectory = play_games_batched(
-                params=self.get_network_params(),
-                rng=game_rng,
-                network=self.network,
-                env_config=self.env_config,
-                batch_size=self.config.batch_size_games,
-                max_turns=self.config.max_turns_per_game,
-                max_moves=self.config.max_moves_per_game,
-                temperature=self.config.temperature,
-                temp_threshold=self.config.temp_threshold,
-                temp_final=self.config.temp_final,
-                num_simulations=self.config.num_simulations,
+            self.rng, game_rng, choice_rng = jax.random.split(self.rng, 3)
+
+            # Decide whether this batch should be vs random
+            use_random_opponent = (
+                random_opp_ratio > 0 and
+                float(jax.random.uniform(choice_rng)) < random_opp_ratio
             )
+
+            if use_random_opponent:
+                # Play games vs random opponent
+                trajectory = play_games_vs_random_training(
+                    params=self.get_network_params(),
+                    rng=game_rng,
+                    network=self.network,
+                    env_config=self.env_config,
+                    batch_size=self.config.batch_size_games,
+                    max_turns=self.config.max_turns_per_game,
+                    max_moves=self.config.max_moves_per_game,
+                    temperature=self.config.temperature,
+                    temp_threshold=self.config.temp_threshold,
+                    temp_final=self.config.temp_final,
+                    num_simulations=self.config.num_simulations,
+                )
+                vs_random_games += self.config.batch_size_games
+            else:
+                # Play normal self-play games
+                trajectory = play_games_batched(
+                    params=self.get_network_params(),
+                    rng=game_rng,
+                    network=self.network,
+                    env_config=self.env_config,
+                    batch_size=self.config.batch_size_games,
+                    max_turns=self.config.max_turns_per_game,
+                    max_moves=self.config.max_moves_per_game,
+                    temperature=self.config.temperature,
+                    temp_threshold=self.config.temp_threshold,
+                    temp_final=self.config.temp_final,
+                    num_simulations=self.config.num_simulations,
+                )
+                self_play_games += self.config.batch_size_games
 
             batch_stats = compute_phutball_stats(trajectory, self.env_config)
             for k in stats_totals:
@@ -1096,17 +1140,21 @@ class AlphaZeroTrainer:
 
         self.last_self_play_stats = {
             "games_total": games_total,
+            "self_play_games": self_play_games,
+            "vs_random_games": vs_random_games,
+            "random_opp_ratio": random_opp_ratio,
             "avg_moves_per_game": avg_moves_per_game,
             "avg_placements_per_jump": avg_placements_per_jump,
             "avg_jump_sequence_len": avg_jump_seq_len,
             "avg_jump_length": avg_jump_length,
             "adjacent_conversion_rate": adj_conv_rate,
         }
-        
+
         games_per_sec = games_total / elapsed if elapsed > 0 else 0
+        vs_rand_str = f", vs_rand={vs_random_games}" if vs_random_games > 0 else ""
         print(
             f"  Self-play: {num_examples} examples from {games_total} games "
-            f"({games_per_sec:.1f} games/sec, {elapsed:.1f}s) | "
+            f"({games_per_sec:.1f} games/sec, {elapsed:.1f}s){vs_rand_str} | "
             f"W1/W2/D={p1_wins}/{p2_wins}/{draws} | "
             f"avg_moves/game={avg_moves_per_game:.1f}, "
             f"avg_jump_seq={avg_jump_seq_len:.2f}, "
@@ -1989,6 +2037,11 @@ def make_train_config(
     curriculum_final_ratio: float = 0.0,
     curriculum_decay_iterations: int = 100,
     curriculum_jump_distribution: Tuple[float, float, float, float] = (0.4, 0.3, 0.2, 0.1),
+    # Random opponent mixing
+    random_opponent_enabled: bool = False,
+    random_opponent_initial_ratio: float = 0.33,
+    random_opponent_final_ratio: float = 0.003,
+    random_opponent_decay_iterations: int = 100,
 ) -> TrainConfig:
     """
     Convenience factory for TrainConfig so we don't duplicate hyperparams
@@ -2053,6 +2106,12 @@ def make_train_config(
         curriculum_final_ratio=curriculum_final_ratio,
         curriculum_decay_iterations=curriculum_decay_iterations,
         curriculum_jump_distribution=curriculum_jump_distribution,
+
+        # Random opponent mixing
+        random_opponent_enabled=random_opponent_enabled,
+        random_opponent_initial_ratio=random_opponent_initial_ratio,
+        random_opponent_final_ratio=random_opponent_final_ratio,
+        random_opponent_decay_iterations=random_opponent_decay_iterations,
 
         # Wandb
         use_wandb=use_wandb,

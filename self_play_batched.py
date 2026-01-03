@@ -834,6 +834,187 @@ def play_vs_random_batched(
     )
 
 
+def play_games_vs_random_training(
+    params: dict,
+    rng: jnp.ndarray,
+    network: PhutballNetwork,
+    env_config: EnvConfig,
+    batch_size: int = 64,
+    max_turns: int = 7200,
+    max_moves: int = 50000,
+    temperature: float = 1.0,
+    temp_threshold: int = 30,
+    temp_final: float = 0.1,
+    num_simulations: int = 0,
+) -> TrajectoryData:
+    """
+    Play games against a random opponent and collect training data.
+
+    Half the games have network as P1 (random as P2), half have random as P1.
+    Collects trajectory data from ALL moves (both network and random) - learning
+    from random's moves with correct outcome signal can teach what NOT to do.
+
+    Args:
+        params: Network parameters
+        rng: Random key
+        network: Neural network
+        env_config: Environment config
+        batch_size: Number of games to play in parallel
+        max_turns: Maximum turns per game
+        max_moves: Maximum moves to store (memory cap)
+        temperature: Initial sampling temperature
+        temp_threshold: Moves before temperature drops
+        temp_final: Temperature after threshold
+        num_simulations: MCTS simulations per move (0 = raw network)
+
+    Returns:
+        TrajectoryData with all game trajectories
+    """
+    action_space_size = 2 * env_config.rows * env_config.cols + 1
+    num_channels = 6
+    rows, cols = env_config.rows, env_config.cols
+    use_mcts = num_simulations > 0
+
+    # Which games have network as P1?
+    games_per_side = batch_size // 2
+    network_is_P1 = jnp.concatenate([
+        jnp.ones((games_per_side,), dtype=jnp.bool_),
+        jnp.zeros((batch_size - games_per_side,), dtype=jnp.bool_),
+    ])
+    network_is_P2 = ~network_is_P1
+
+    # Initialize storage
+    all_states = jnp.zeros((batch_size, max_moves, num_channels, rows, cols))
+    all_policies = jnp.zeros((batch_size, max_moves, action_space_size))
+    all_players = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
+    all_actions = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
+    valid_mask = jnp.zeros((batch_size, max_moves), dtype=jnp.bool_)
+
+    # Initialize game states
+    env_states = batched_reset(env_config, batch_size)
+    terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
+    move_count = jnp.zeros(batch_size, dtype=jnp.int32)
+
+    def single_step(state, action):
+        return step(state, action, env_config)
+
+    def single_legal(state):
+        return get_legal_actions(state, env_config)
+
+    def game_step(carry, _):
+        (env_states, terminated, move_count, all_states, all_policies,
+         all_players, all_actions, valid_mask, rng, step_idx) = carry
+
+        rng, step_rng, sample_rng, rand_rng = jax.random.split(rng, 4)
+
+        # Temperature schedule
+        effective_temp = jnp.where(step_idx < temp_threshold, temperature, temp_final)
+
+        # Check if games are done
+        turns_exceeded = env_states.num_turns >= max_turns
+        effectively_done = terminated | turns_exceeded
+        active = ~effectively_done
+
+        # Current observations
+        current_obs = jax.vmap(lambda s: state_to_network_input(s, env_config))(env_states)
+        current_players = env_states.current_player
+
+        # Determine if network should play this move
+        use_network = jnp.where(
+            current_players == 1,
+            network_is_P1,
+            network_is_P2,
+        )
+
+        # Get legal actions
+        legal_mask = jax.vmap(single_legal)(env_states)
+
+        if use_mcts:
+            # Network actions via MCTS
+            actions_net, policies_net, _ = batched_mcts_policy(
+                params, env_states, step_rng, network, env_config,
+                num_simulations=num_simulations, temperature=effective_temp
+            )
+        else:
+            # Network actions via raw policy
+            variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
+            policy_logits, _ = network.apply(variables, current_obs, train=False)
+            masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+            policies_net = jax.nn.softmax(masked_logits / effective_temp)
+            sample_rngs = jax.random.split(sample_rng, batch_size)
+            actions_net = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies_net)
+
+        # Random actions (uniform over legal)
+        def get_random_action(state, rng_key):
+            legal = get_legal_actions(state, env_config)
+            probs = legal.astype(jnp.float32)
+            probs = probs / jnp.sum(probs)
+            return jax.random.choice(rng_key, action_space_size, p=probs)
+
+        rand_rngs = jax.random.split(rand_rng, batch_size)
+        actions_rand = jax.vmap(get_random_action)(env_states, rand_rngs)
+
+        # Random policy (for storage)
+        policies_rand = legal_mask.astype(jnp.float32)
+        policies_rand = policies_rand / jnp.sum(policies_rand, axis=-1, keepdims=True)
+
+        # Select actions and policies based on who's moving
+        actions = jnp.where(use_network, actions_net, actions_rand)
+        policies = jnp.where(use_network[:, None], policies_net, policies_rand)
+
+        # Update trajectories
+        safe_move_idx = jnp.minimum(move_count, max_moves - 1)
+        batch_idx = jnp.arange(batch_size)
+
+        all_states = all_states.at[batch_idx, safe_move_idx].set(
+            jnp.where(active[:, None, None, None], current_obs, all_states[batch_idx, safe_move_idx])
+        )
+        all_policies = all_policies.at[batch_idx, safe_move_idx].set(
+            jnp.where(active[:, None], policies, all_policies[batch_idx, safe_move_idx])
+        )
+        all_players = all_players.at[batch_idx, safe_move_idx].set(
+            jnp.where(active, current_players, all_players[batch_idx, safe_move_idx])
+        )
+        valid_mask = valid_mask.at[batch_idx, safe_move_idx].set(active)
+        stored_actions = jnp.where(active, actions, all_actions[batch_idx, safe_move_idx])
+        all_actions = all_actions.at[batch_idx, safe_move_idx].set(stored_actions)
+
+        # Step environments
+        new_env_states_raw = jax.vmap(single_step)(env_states, actions)
+        just_terminated = new_env_states_raw.terminated
+        new_env_states = _make_frozen_state(env_states, new_env_states_raw, effectively_done, env_config)
+        new_terminated = terminated | just_terminated
+        new_move_count = move_count + active.astype(jnp.int32)
+
+        carry = (new_env_states, new_terminated, new_move_count,
+                all_states, all_policies, all_players, all_actions, valid_mask,
+                rng, step_idx + jnp.int32(1))
+        return carry, None
+
+    step0 = jnp.int32(0)
+
+    def cond_fn(carry):
+        (env_states, terminated, move_count, *_) = carry
+        any_active = jnp.any(~terminated)
+        moves_ok = jnp.all(move_count < max_moves)
+        return jnp.logical_and(any_active, moves_ok)
+
+    init_carry = (env_states, terminated, move_count, all_states, all_policies,
+                  all_players, all_actions, valid_mask, rng, step0)
+
+    final_carry = lax.while_loop(cond_fn, game_step, init_carry)
+    (final_states, _, _, all_states, all_policies, all_players, all_actions, valid_mask, _, _) = final_carry
+
+    return TrajectoryData(
+        states=all_states,
+        policies=all_policies,
+        players=all_players,
+        valid_mask=valid_mask,
+        winners=final_states.winner,
+        actions=all_actions,
+    )
+
+
 def trajectory_to_training_examples(
     trajectory: TrajectoryData,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
