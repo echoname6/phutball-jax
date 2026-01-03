@@ -324,10 +324,11 @@ def play_games_batched(
     temp_threshold: int = 30,  # Moves before temperature drops
     temp_final: float = 0.1,   # Temperature after threshold
     num_simulations: int = 0,  # 0 = no MCTS, >0 = use MCTS with this many sims
+    random_opponent_ratio: float = 0.0,  # Fraction of games vs random opponent
 ) -> TrajectoryData:
     """
-    Play multiple games in parallel.
-    
+    Play multiple games in parallel with optional random opponents.
+
     Args:
         params: Network parameters
         rng: Random key
@@ -340,7 +341,8 @@ def play_games_batched(
         temp_threshold: Number of moves before temperature drops
         temp_final: Temperature after threshold (for exploitation)
         num_simulations: MCTS simulations per move (0 = raw network policy)
-        
+        random_opponent_ratio: Fraction of games where opponent plays randomly (0.0 = all self-play)
+
     Returns:
         TrajectoryData with all game trajectories
     """
@@ -348,76 +350,122 @@ def play_games_batched(
     num_channels = 6
     rows, cols = env_config.rows, env_config.cols
     use_mcts = num_simulations > 0
-    
+
+    # Determine which games have random opponents
+    rng, mask_rng, side_rng = jax.random.split(rng, 3)
+    # Ensure at least 1 random game when ratio > 0
+    num_vs_random = int(batch_size * random_opponent_ratio)
+    if random_opponent_ratio > 0 and num_vs_random == 0:
+        num_vs_random = 1
+
+    # has_random_opponent[i] = True if game i has random opponent
+    has_random_opponent = jnp.arange(batch_size) < num_vs_random
+
+    # For vs-random games, randomly decide if network plays P1 (50/50)
+    random_sides = jax.random.uniform(side_rng, (batch_size,)) < 0.5
+    network_is_P1 = jnp.where(
+        has_random_opponent,
+        random_sides,  # Random assignment for vs-random games
+        jnp.ones(batch_size, dtype=jnp.bool_),  # Self-play: network plays both
+    )
+    network_is_P2 = jnp.where(
+        has_random_opponent,
+        ~random_sides,
+        jnp.ones(batch_size, dtype=jnp.bool_),
+    )
+
     # Initialize storage for trajectories
     all_states = jnp.zeros((batch_size, max_moves, num_channels, rows, cols))
     all_policies = jnp.zeros((batch_size, max_moves, action_space_size))
     all_players = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
     all_actions = jnp.zeros((batch_size, max_moves), dtype=jnp.int32)
     valid_mask = jnp.zeros((batch_size, max_moves), dtype=jnp.bool_)
-    
+
     # Initialize game states
     env_states = batched_reset(env_config, batch_size)
     terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
     move_count = jnp.zeros(batch_size, dtype=jnp.int32)
-    
+
     # Pre-create batched functions outside the loop
     def single_step(state, action):
         return step(state, action, env_config)
-    
+
     def single_legal(state):
         return get_legal_actions(state, env_config)
-    
+
     # Play loop - now takes step_idx for temperature scheduling
     def game_step(carry, _):
-        (env_states, terminated, move_count, all_states, all_policies, 
+        (env_states, terminated, move_count, all_states, all_policies,
          all_players, all_actions, valid_mask, rng, step_idx) = carry
-        
-        rng, step_rng, sample_rng = jax.random.split(rng, 3)
-        
+
+        rng, step_rng, sample_rng, rand_rng = jax.random.split(rng, 4)
+
         # Compute effective temperature based on step count
-        # Before threshold: use exploration temperature
-        # After threshold: use exploitation temperature
         effective_temp = jnp.where(
             step_idx < temp_threshold,
             temperature,
             temp_final
         )
-        
+
         # Check if games have exceeded max_turns
         turns_exceeded = env_states.num_turns >= max_turns
         effectively_done = terminated | turns_exceeded
         active = ~effectively_done
-        
+
         # Get current observations: (batch, 6, rows, cols)
-        # Uses state_to_network_input with jump sequence
         current_obs = jax.vmap(lambda s: state_to_network_input(s, env_config))(env_states)
         current_players = env_states.current_player
-        
+
+        # Determine if network should make this move (or random opponent)
+        # For self-play games: always use network
+        # For vs-random games: use network only when it's network's turn
+        use_network = jnp.where(
+            has_random_opponent,
+            jnp.where(current_players == 1, network_is_P1, network_is_P2),
+            jnp.ones(batch_size, dtype=jnp.bool_),  # Self-play: always network
+        )
+
+        # Get legal action mask
+        legal_mask = jax.vmap(single_legal)(env_states)
+
         if use_mcts:
             # Use MCTS to get improved policy
-            actions, policies, values = batched_mcts_policy(
+            actions_net, policies_net, values = batched_mcts_policy(
                 params, env_states, step_rng, network, env_config,
                 num_simulations=num_simulations, temperature=effective_temp
             )
         else:
             # Use raw network policy
-            # Get network predictions
             variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
             policy_logits, values = network.apply(variables, current_obs, train=False)
-            
-            # Get legal action mask
-            legal_mask = jax.vmap(single_legal)(env_states)
-            
+
             # Mask illegal actions
             masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
-            
+
             # Convert to probabilities with effective temperature
-            policies = jax.nn.softmax(masked_logits / effective_temp)
-            
+            policies_net = jax.nn.softmax(masked_logits / effective_temp)
+
             # Sample actions
             sample_rngs = jax.random.split(sample_rng, batch_size)
-            actions = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies)
+            actions_net = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies_net)
+
+        # Random actions (uniform over legal)
+        def get_random_action(state, rng_key):
+            legal = get_legal_actions(state, env_config)
+            probs = legal.astype(jnp.float32)
+            probs = probs / jnp.maximum(jnp.sum(probs), 1e-8)
+            return jax.random.choice(rng_key, action_space_size, p=probs)
+
+        rand_rngs = jax.random.split(rand_rng, batch_size)
+        actions_rand = jax.vmap(get_random_action)(env_states, rand_rngs)
+
+        # Random policy (for storage - uniform over legal moves)
+        policies_rand = legal_mask.astype(jnp.float32)
+        policies_rand = policies_rand / jnp.maximum(jnp.sum(policies_rand, axis=-1, keepdims=True), 1e-8)
+
+        # Select actions and policies based on who's moving
+        actions = jnp.where(use_network, actions_net, actions_rand)
+        policies = jnp.where(use_network[:, None], policies_net, policies_rand)
         
         # Clamp move_count to valid range for indexing
         safe_move_idx = jnp.minimum(move_count, max_moves - 1)

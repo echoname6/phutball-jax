@@ -29,7 +29,6 @@ from network import (
 )
 from self_play_batched import (
     play_games_batched,
-    play_games_vs_random_training,
     trajectory_to_training_examples,
     ReplayBuffer,
     compute_phutball_stats,
@@ -1036,46 +1035,30 @@ class AlphaZeroTrainer:
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
 
         for batch_idx in range(num_batches):
-            self.rng, game_rng, choice_rng = jax.random.split(self.rng, 3)
+            self.rng, game_rng = jax.random.split(self.rng)
 
-            # Decide whether this batch should be vs random
-            use_random_opponent = (
-                random_opp_ratio > 0 and
-                float(jax.random.uniform(choice_rng)) < random_opp_ratio
+            # Play games with mixed self-play and random opponents within each batch
+            trajectory = play_games_batched(
+                params=self.get_network_params(),
+                rng=game_rng,
+                network=self.network,
+                env_config=self.env_config,
+                batch_size=self.config.batch_size_games,
+                max_turns=self.config.max_turns_per_game,
+                max_moves=self.config.max_moves_per_game,
+                temperature=self.config.temperature,
+                temp_threshold=self.config.temp_threshold,
+                temp_final=self.config.temp_final,
+                num_simulations=self.config.num_simulations,
+                random_opponent_ratio=random_opp_ratio,
             )
 
-            if use_random_opponent:
-                # Play games vs random opponent
-                trajectory = play_games_vs_random_training(
-                    params=self.get_network_params(),
-                    rng=game_rng,
-                    network=self.network,
-                    env_config=self.env_config,
-                    batch_size=self.config.batch_size_games,
-                    max_turns=self.config.max_turns_per_game,
-                    max_moves=self.config.max_moves_per_game,
-                    temperature=self.config.temperature,
-                    temp_threshold=self.config.temp_threshold,
-                    temp_final=self.config.temp_final,
-                    num_simulations=self.config.num_simulations,
-                )
-                vs_random_games += self.config.batch_size_games
-            else:
-                # Play normal self-play games
-                trajectory = play_games_batched(
-                    params=self.get_network_params(),
-                    rng=game_rng,
-                    network=self.network,
-                    env_config=self.env_config,
-                    batch_size=self.config.batch_size_games,
-                    max_turns=self.config.max_turns_per_game,
-                    max_moves=self.config.max_moves_per_game,
-                    temperature=self.config.temperature,
-                    temp_threshold=self.config.temp_threshold,
-                    temp_final=self.config.temp_final,
-                    num_simulations=self.config.num_simulations,
-                )
-                self_play_games += self.config.batch_size_games
+            # Track game counts (same logic as play_games_batched)
+            num_vs_random_this_batch = int(self.config.batch_size_games * random_opp_ratio)
+            if random_opp_ratio > 0 and num_vs_random_this_batch == 0:
+                num_vs_random_this_batch = 1
+            vs_random_games += num_vs_random_this_batch
+            self_play_games += self.config.batch_size_games - num_vs_random_this_batch
 
             batch_stats = compute_phutball_stats(trajectory, self.env_config)
             for k in stats_totals:
