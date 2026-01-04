@@ -867,7 +867,13 @@ class TrainConfig:
     learning_rate: float = 0.001
     weight_decay: float = 1e-4
     train_steps_per_iteration: int = 100
-    
+
+    # LR decay on loss plateau
+    lr_decay_enabled: bool = False
+    lr_decay_factor: float = 0.5       # Multiply LR by this when loss stalls
+    lr_decay_patience: int = 10        # Iterations without improvement before decay
+    lr_min: float = 1e-5               # Don't decay below this
+
     # Replay buffer
     buffer_size: int = 500000
     min_buffer_size: int = 1000  # Min examples before training starts
@@ -959,6 +965,11 @@ class AlphaZeroTrainer:
         self.metrics_history = []
         self.last_self_play_stats = None
 
+        # LR decay on plateau tracking
+        self.current_lr = config.learning_rate
+        self.best_loss = float('inf')
+        self.iters_without_improvement = 0
+
         self.wandb_run = None
         if self.config.use_wandb:
             if wandb is None:
@@ -993,7 +1004,34 @@ class AlphaZeroTrainer:
             'network_params': self.params,
             'batch_stats': self.batch_stats,
         }
-    
+
+    def _maybe_decay_lr(self, total_loss: float):
+        """Decay learning rate if loss has stalled."""
+        if not self.config.lr_decay_enabled:
+            return
+
+        if total_loss < self.best_loss:
+            self.best_loss = total_loss
+            self.iters_without_improvement = 0
+        else:
+            self.iters_without_improvement += 1
+
+        if self.iters_without_improvement >= self.config.lr_decay_patience:
+            new_lr = max(self.current_lr * self.config.lr_decay_factor, self.config.lr_min)
+            if new_lr < self.current_lr:
+                print(f"  [LR decay] Loss stalled for {self.config.lr_decay_patience} iters, "
+                      f"reducing LR: {self.current_lr:.2e} -> {new_lr:.2e}")
+                self.current_lr = new_lr
+                # Recreate optimizer with new LR
+                self.optimizer = create_optimizer(
+                    learning_rate=self.current_lr,
+                    weight_decay=self.config.weight_decay,
+                )
+                self.opt_state = self.optimizer.init(self.params)
+                self.train_step_fn = make_train_step_fn(self.network, self.optimizer)
+                self.iters_without_improvement = 0
+                self.best_loss = total_loss  # Reset best loss after decay
+
     def run_self_play(self) -> int:
         """Run batched self-play games. Returns number of new examples."""
         start_time = time.time()
@@ -1337,7 +1375,10 @@ class AlphaZeroTrainer:
                     'buffer_size': len(self.replay_buffer),
                     **metrics,
                 })
-            
+                # Check for LR decay on loss plateau
+                total_loss = metrics.get('total_loss', metrics.get('policy_loss', 0) + metrics.get('value_loss', 0))
+                self._maybe_decay_lr(total_loss)
+
             # Checkpoint
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
@@ -2014,6 +2055,11 @@ def make_train_config(
     buffer_size: Optional[int] = None,
     min_buffer_size: int = 1000,
     max_moves_per_game: Optional[int] = None,
+    # LR decay on plateau
+    lr_decay_enabled: bool = False,
+    lr_decay_factor: float = 0.5,
+    lr_decay_patience: int = 10,
+    lr_min: float = 1e-5,
     # Curriculum learning
     curriculum_enabled: bool = True,
     curriculum_initial_ratio: float = 0.5,
@@ -2061,6 +2107,12 @@ def make_train_config(
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         train_steps_per_iteration=train_steps_per_iteration,
+
+        # LR decay on plateau
+        lr_decay_enabled=lr_decay_enabled,
+        lr_decay_factor=lr_decay_factor,
+        lr_decay_patience=lr_decay_patience,
+        lr_min=lr_min,
 
         # Replay buffer
         buffer_size=buffer_size,
