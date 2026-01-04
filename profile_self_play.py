@@ -227,26 +227,31 @@ def run_tpu_profile():
     print("\n--- Full board (21x15, 128ch, 10blk) ---")
     profile_network_throughput([32, 64, 128], 21, 15, 128, 10)
 
-    # MCTS scaling
-    print("\n--- MCTS Scaling (11x9) ---")
-    profile_mcts_policy([16, 32, 64, 128, 256], 11, 9, 64, 4, num_simulations=50)
+    # MCTS scaling with Gumbel-optimal sim counts
+    print("\n--- MCTS Scaling (11x9, 16 sims) ---")
+    profile_mcts_policy([64, 128, 256, 512, 1024], 11, 9, 64, 4, num_simulations=16)
 
-    # Full games
+    print("\n--- MCTS Scaling (11x9, 32 sims) ---")
+    profile_mcts_policy([64, 128, 256, 512], 11, 9, 64, 4, num_simulations=32)
+
+    # Full games with Gumbel-optimal settings
     print("\n--- Full Games ---")
-    sims_per_sec_small = profile_full_games(11, 9, 64, 4,
-                                             batch_size=64, num_simulations=50, max_turns=100)
+    sims_per_sec_16 = profile_full_games(11, 9, 64, 4,
+                                          batch_size=256, num_simulations=16, max_turns=100)
+
+    sims_per_sec_32 = profile_full_games(11, 9, 64, 4,
+                                          batch_size=512, num_simulations=32, max_turns=100)
 
     sims_per_sec_full = profile_full_games(11, 9, 128, 10,
-                                            batch_size=128, num_simulations=100, max_turns=150)
+                                            batch_size=256, num_simulations=32, max_turns=150)
 
     # Extrapolation
     print("\n" + "-" * 40)
-    print("EXTRAPOLATION TO 21x15 TRAINING")
+    print("EXTRAPOLATION TO TRAINING")
     print("-" * 40)
-    train_sims = 256 * 170 * 100  # batch * moves * sims
-    estimated_time = train_sims / sims_per_sec_full
-    print(f"  Config: 256 batch, 100 sims, ~170 moves/game")
-    print(f"  Estimated time at current rate: {estimated_time:.0f}s ({estimated_time/60:.1f}min)")
+    train_moves = 256 * 170  # batch * moves/game
+    print(f"  Config: 256 batch, 32 sims, ~170 moves/game")
+    print(f"  At {sims_per_sec_full:,.0f} sims/sec: {train_moves * 32 / sims_per_sec_full:.0f}s per iteration")
 
 
 def run_full_training_profile():
