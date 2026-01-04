@@ -21,13 +21,13 @@ class ResidualBlock(nn.Module):
         
         x = nn.Conv(self.channels, kernel_size=(3, 3), padding='SAME', use_bias=False)(x)
         x = nn.BatchNorm(use_running_average=not train)(x)
-        x = nn.relu(x)
+        x = nn.swish(x)
         
         x = nn.Conv(self.channels, kernel_size=(3, 3), padding='SAME', use_bias=False)(x)
         x = nn.BatchNorm(use_running_average=not train)(x)
         
         x = x + residual
-        x = nn.relu(x)
+        x = nn.swish(x)
         return x
 
 
@@ -40,7 +40,7 @@ class Backbone(nn.Module):
     def __call__(self, x, train: bool = True):
         x = nn.Conv(self.num_channels, kernel_size=(3, 3), padding='SAME', use_bias=False)(x)
         x = nn.BatchNorm(use_running_average=not train)(x)
-        x = nn.relu(x)
+        x = nn.swish(x)
         for _ in range(self.num_res_blocks):
             x = ResidualBlock(channels=self.num_channels)(x, train=train)
         return x
@@ -53,10 +53,10 @@ class ValueHead(nn.Module):
     def __call__(self, x, train: bool = True):
         x = nn.Conv(8, kernel_size=(1, 1), use_bias=False)(x)
         x = nn.BatchNorm(use_running_average=not train)(x)
-        x = nn.relu(x)
+        x = nn.swish(x)
         x = jnp.mean(x, axis=(1, 2))  # Global avg pool
         x = nn.Dense(64)(x)
-        x = nn.relu(x)
+        x = nn.swish(x)
         x = nn.Dense(1)(x)
         return nn.tanh(x).squeeze(-1)
 
@@ -72,7 +72,7 @@ class PolicyHead(nn.Module):
         action_space_size = 2 * self.rows * self.cols + 1
         x = nn.Conv(32, kernel_size=(1, 1), use_bias=False)(x)
         x = nn.BatchNorm(use_running_average=not train)(x)
-        x = nn.relu(x)
+        x = nn.swish(x)
         x = x.reshape((batch_size, -1))
         return nn.Dense(action_space_size)(x)
 
@@ -313,7 +313,7 @@ class PhutballNetwork(nn.Module):
         # Initial convolution
         x = nn.Conv(self.num_channels, kernel_size=(3, 3), padding='SAME', use_bias=False)(x)
         x = nn.BatchNorm(use_running_average=not train)(x)
-        x = nn.relu(x)
+        x = nn.swish(x)
         
         # Residual tower
         for _ in range(self.num_res_blocks):
@@ -322,17 +322,17 @@ class PhutballNetwork(nn.Module):
         # Policy head
         policy = nn.Conv(32, kernel_size=(1, 1), use_bias=False)(x)
         policy = nn.BatchNorm(use_running_average=not train)(policy)
-        policy = nn.relu(policy)
+        policy = nn.swish(policy)
         policy = policy.reshape((batch_size, -1))  # Flatten
         policy_logits = nn.Dense(action_space_size)(policy)
         
         # Value head
         value = nn.Conv(8, kernel_size=(1, 1), use_bias=False)(x)
         value = nn.BatchNorm(use_running_average=not train)(value)
-        value = nn.relu(value)
+        value = nn.swish(value)
         value = value.reshape((batch_size, -1))  # Flatten
         value = nn.Dense(64)(value)
-        value = nn.relu(value)
+        value = nn.swish(value)
         value = nn.Dense(1)(value)
         value = nn.tanh(value)
         value = value.squeeze(-1)  # (batch, 1) -> (batch,)
