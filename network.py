@@ -105,6 +105,21 @@ class ChimeraNetwork(nn.Module):
         policy = self.policy_heads[board_key](features, train=train)
         return policy, value
 
+    def init_all_heads(self, inputs_dict: dict, train: bool = False):
+        """
+        Initialize all policy heads by calling each one.
+        inputs_dict: {board_key: input_tensor} for each board size.
+        Returns dict of (policy, value) for each board.
+        """
+        results = {}
+        for board_key, x in inputs_dict.items():
+            x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
+            features = self.backbone(x, train=train)
+            value = self.value_head(features, train=train)
+            policy = self.policy_heads[board_key](features, train=train)
+            results[board_key] = (policy, value)
+        return results
+
 
 def create_chimera_network(
     board_sizes: tuple,
@@ -121,29 +136,15 @@ def create_chimera_network(
 
 def init_chimera_network(rng, network: ChimeraNetwork, num_input_channels: int = 6):
     """Initialize chimera - needs dummy input for each board size."""
-    # Need to initialize all policy heads, not just one
-    # First init with largest board to get backbone/value
-    max_rows = max(r for r, c in network.board_sizes)
-    max_cols = max(c for r, c in network.board_sizes)
-
-    # Initialize each board size to create all policy heads
-    all_variables = None
+    # Create dummy inputs for all board sizes
+    inputs_dict = {}
     for rows, cols in network.board_sizes:
-        rng, init_rng = jax.random.split(rng)
         board_key = f"{rows}x{cols}"
-        dummy = jnp.zeros((1, num_input_channels, rows, cols))
-        variables = network.init(init_rng, dummy, board_key, train=False)
+        inputs_dict[board_key] = jnp.zeros((1, num_input_channels, rows, cols))
 
-        if all_variables is None:
-            all_variables = variables
-        else:
-            # Merge policy head params (backbone/value already exist)
-            all_variables['params']['policy_heads'][board_key] = \
-                variables['params']['policy_heads'][board_key]
-            all_variables['batch_stats']['policy_heads'][board_key] = \
-                variables['batch_stats']['policy_heads'][board_key]
-
-    return all_variables
+    # Initialize using init_all_heads which touches all policy heads
+    variables = network.init(rng, inputs_dict, train=False, method=network.init_all_heads)
+    return variables
 
 
 def expand_chimera_network(
