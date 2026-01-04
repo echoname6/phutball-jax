@@ -2185,6 +2185,12 @@ class ChimeraConfig:
     weight_decay: float = 1e-4
     train_steps_per_iteration: int = 100
 
+    # LR decay on loss plateau
+    lr_decay_enabled: bool = False
+    lr_decay_factor: float = 0.5
+    lr_decay_patience: int = 10
+    lr_min: float = 1e-5
+
     # How to mix board sizes during training
     # 'uniform': equal samples from each size
     # 'weighted': more samples from larger boards (proportional to board area)
@@ -2271,6 +2277,11 @@ class ChimeraTrainer:
         self.total_examples = {bk: 0 for bk in self.env_configs}
         self.metrics_history = []
 
+        # LR decay on plateau tracking
+        self.current_lr = config.learning_rate
+        self.best_loss = float('inf')
+        self.iters_without_improvement = 0
+
         # Wandb
         self.wandb_run = None
         if self.config.use_wandb:
@@ -2300,6 +2311,37 @@ class ChimeraTrainer:
             'network_params': self.params,
             'batch_stats': self.batch_stats,
         }
+
+    def _maybe_decay_lr(self, total_loss: float):
+        """Decay learning rate if loss has stalled."""
+        if not self.config.lr_decay_enabled:
+            return
+
+        if total_loss < self.best_loss:
+            self.best_loss = total_loss
+            self.iters_without_improvement = 0
+        else:
+            self.iters_without_improvement += 1
+
+        if self.iters_without_improvement >= self.config.lr_decay_patience:
+            new_lr = max(self.current_lr * self.config.lr_decay_factor, self.config.lr_min)
+            if new_lr < self.current_lr:
+                print(f"  [LR decay] Loss stalled for {self.config.lr_decay_patience} iters, "
+                      f"reducing LR: {self.current_lr:.2e} -> {new_lr:.2e}")
+                self.current_lr = new_lr
+                # Recreate optimizer with new LR
+                self.optimizer = create_optimizer(
+                    learning_rate=self.current_lr,
+                    weight_decay=self.config.weight_decay,
+                )
+                self.opt_state = self.optimizer.init(self.params)
+                # Recreate train step functions
+                self.train_step_fns = {
+                    board_key: make_chimera_train_step_fn(self.network, self.optimizer, board_key)
+                    for board_key in self.env_configs.keys()
+                }
+                self.iters_without_improvement = 0
+                self.best_loss = total_loss
 
     def run_self_play_for_board(self, board_key: str) -> int:
         """Run self-play for a specific board size. Returns num examples."""
@@ -2626,6 +2668,9 @@ class ChimeraTrainer:
                     'total_examples': dict(self.total_examples),
                     **metrics,
                 })
+                # Check for LR decay on loss plateau
+                total_loss = metrics.get('total_loss', metrics.get('policy_loss', 0) + metrics.get('value_loss', 0))
+                self._maybe_decay_lr(total_loss)
 
             # Checkpoint
             if (iteration + 1) % self.config.checkpoint_every == 0:
