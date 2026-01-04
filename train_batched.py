@@ -2221,6 +2221,14 @@ class ChimeraConfig:
     wandb_project: str = "phutball-az-chimera"
     wandb_run_name: Optional[str] = None
 
+    # MCTS simulation curriculum: double sims when avg win rate vs random hits threshold
+    sim_curriculum_enabled: bool = False
+    sim_curriculum_initial: int = 16       # Starting sims
+    sim_curriculum_target: int = 32        # Target sims after threshold
+    sim_curriculum_threshold: float = 0.90  # Avg win rate to trigger doubling
+    sim_curriculum_eval_every: int = 10    # Evaluate vs random every N iterations
+    sim_curriculum_eval_games: int = 50    # Games per board size for evaluation
+
 
 class ChimeraTrainer:
     """
@@ -2281,6 +2289,14 @@ class ChimeraTrainer:
         self.current_lr = config.learning_rate
         self.best_loss = float('inf')
         self.iters_without_improvement = 0
+
+        # Sim curriculum tracking
+        if config.sim_curriculum_enabled:
+            self.current_sims = config.sim_curriculum_initial
+            self.sims_doubled = False
+        else:
+            self.current_sims = config.num_simulations
+            self.sims_doubled = False
 
         # Wandb
         self.wandb_run = None
@@ -2388,7 +2404,7 @@ class ChimeraTrainer:
                 temperature=self.config.temperature,
                 temp_threshold=self.config.temp_threshold,
                 temp_final=self.config.temp_final,
-                num_simulations=self.config.num_simulations,
+                num_simulations=self.current_sims,  # Use curriculum-controlled sims
             )
 
             states, policies, values = trajectory_to_training_examples(trajectory)
@@ -2439,6 +2455,84 @@ class ChimeraTrainer:
         return self.config.curriculum_initial_ratio + progress * (
             self.config.curriculum_final_ratio - self.config.curriculum_initial_ratio
         )
+
+    def evaluate_vs_random_for_board(self, board_key: str) -> float:
+        """Evaluate current model vs random for a specific board size. Returns win rate."""
+        env_config = self.env_configs[board_key]
+        rows, cols = env_config.rows, env_config.cols
+
+        # Create wrapper for this board size (same as in run_self_play_for_board)
+        class ChimeraWrapper:
+            def __init__(wrapper_self, chimera, board_key):
+                wrapper_self.chimera = chimera
+                wrapper_self.board_key = board_key
+                wrapper_self.rows = rows
+                wrapper_self.cols = cols
+
+            def apply(wrapper_self, variables, x, train=True, mutable=None):
+                if mutable:
+                    return wrapper_self.chimera.apply(
+                        variables, x, wrapper_self.board_key, train=train, mutable=mutable
+                    )
+                return wrapper_self.chimera.apply(
+                    variables, x, wrapper_self.board_key, train=train
+                )
+
+        wrapper = ChimeraWrapper(self.network, board_key)
+
+        self.rng, eval_rng = jax.random.split(self.rng)
+        (
+            p1_wins, p1_draws, p1_losses,
+            p2_wins, p2_draws, p2_losses,
+            turns,
+        ) = play_vs_random_batched(
+            checkpoint_params=self.get_network_params(),
+            rng=eval_rng,
+            network=wrapper,
+            env_config=env_config,
+            num_games=self.config.sim_curriculum_eval_games,
+            max_moves=rows * cols * 2,
+            num_simulations=self.current_sims,
+            temperature=0.1,
+        )
+
+        total = int(p1_wins + p1_draws + p1_losses + p2_wins + p2_draws + p2_losses)
+        total_wins = int(p1_wins + p2_wins)
+        win_rate = total_wins / total if total > 0 else 0.0
+
+        print(f"    {board_key}: {total_wins}/{total} wins ({win_rate:.1%})")
+        return win_rate
+
+    def maybe_double_sims(self):
+        """Check if avg win rate across board sizes triggers sim doubling."""
+        if not self.config.sim_curriculum_enabled or self.sims_doubled:
+            return
+
+        if self.iteration % self.config.sim_curriculum_eval_every != 0:
+            return
+
+        print(f"  [Sim curriculum] Evaluating vs random (current sims: {self.current_sims})...")
+
+        win_rates = []
+        for board_key in self.env_configs:
+            win_rate = self.evaluate_vs_random_for_board(board_key)
+            win_rates.append(win_rate)
+
+        avg_win_rate = sum(win_rates) / len(win_rates)
+        print(f"  [Sim curriculum] Avg win rate: {avg_win_rate:.1%}")
+
+        if avg_win_rate >= self.config.sim_curriculum_threshold:
+            old_sims = self.current_sims
+            self.current_sims = self.config.sim_curriculum_target
+            self.sims_doubled = True
+            print(f"  [Sim curriculum] THRESHOLD REACHED! Doubling sims: {old_sims} -> {self.current_sims}")
+
+            if self.config.use_wandb and self.wandb_run:
+                wandb.log({
+                    "sim_curriculum/sims_doubled": 1,
+                    "sim_curriculum/new_sims": self.current_sims,
+                    "sim_curriculum/trigger_win_rate": avg_win_rate,
+                })
 
     def run_training(self) -> dict:
         """Run training steps across all board sizes."""
@@ -2565,6 +2659,11 @@ class ChimeraTrainer:
             'config': self.config,
             'board_sizes': self.config.board_sizes,
             'metrics_history': self.metrics_history,
+            # Curriculum state
+            'current_sims': self.current_sims,
+            'sims_doubled': self.sims_doubled,
+            'current_lr': self.current_lr,
+            'best_loss': self.best_loss,
         }
 
         with open(path, 'wb') as f:
@@ -2584,7 +2683,13 @@ class ChimeraTrainer:
         self.total_examples = checkpoint['total_examples']
         self.metrics_history = checkpoint.get('metrics_history', [])
 
-        print(f"Loaded checkpoint from iteration {self.iteration}")
+        # Restore curriculum state
+        self.current_sims = checkpoint.get('current_sims', self.config.num_simulations)
+        self.sims_doubled = checkpoint.get('sims_doubled', False)
+        self.current_lr = checkpoint.get('current_lr', self.config.learning_rate)
+        self.best_loss = checkpoint.get('best_loss', float('inf'))
+
+        print(f"Loaded checkpoint from iteration {self.iteration} (sims={self.current_sims}, lr={self.current_lr:.2e})")
 
     def add_board_size(self, new_rows: int, new_cols: int):
         """Add a new board size to the chimera (post-hoc expansion)."""
@@ -2645,6 +2750,9 @@ class ChimeraTrainer:
         print("=" * 60)
         print(f"Board sizes: {list(self.env_configs.keys())}")
         print(f"Shared backbone: {self.config.num_channels}ch, {self.config.num_res_blocks} blocks")
+        print(f"MCTS sims: {self.current_sims}" +
+              (f" (curriculum: {self.config.sim_curriculum_initial} -> {self.config.sim_curriculum_target})"
+               if self.config.sim_curriculum_enabled else ""))
         print(f"Devices: {jax.devices()}")
         print("=" * 60)
 
@@ -2672,6 +2780,9 @@ class ChimeraTrainer:
                 total_loss = metrics.get('total_loss', metrics.get('policy_loss', 0) + metrics.get('value_loss', 0))
                 self._maybe_decay_lr(total_loss)
 
+            # Check for sim curriculum (double sims when avg win rate hits threshold)
+            self.maybe_double_sims()
+
             # Checkpoint
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
@@ -2690,6 +2801,8 @@ class ChimeraTrainer:
                     "train/curriculum_3jump": metrics.get("curriculum_3jump", 0),
                     "train/curriculum_4jump": metrics.get("curriculum_4jump", 0),
                     "train/curriculum_total": metrics.get("curriculum_total", 0),
+                    "train/current_sims": self.current_sims,
+                    "train/learning_rate": self.current_lr,
                 }
                 for bk in self.env_configs:
                     log_data[f"selfplay/{bk}/examples"] = examples_per_board.get(bk, 0)
