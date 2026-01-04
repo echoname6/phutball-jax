@@ -150,6 +150,7 @@ def batched_mcts_policy(
     temperature: float = 1.0,
     dirichlet_alpha: float = 0.3,
     dirichlet_fraction: float = 0.25,
+    recurrent_fn=None,  # Pass pre-created recurrent_fn to avoid recompilation
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Get MCTS-improved policy for a batch of states.
@@ -195,15 +196,17 @@ def batched_mcts_policy(
 
     noisy_logits = jnp.log(noisy_priors + 1e-8)
     noisy_logits = jnp.where(legal_mask == 1, noisy_logits, -1e9)
-    
+
     root = mctx.RootFnOutput(
         prior_logits=noisy_logits,
         value=values,
         embedding=states,
     )
-    
-    recurrent_fn = make_mcts_recurrent_fn(network, env_config)
-    
+
+    # Use pre-created recurrent_fn if provided, otherwise create one
+    if recurrent_fn is None:
+        recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+
     rng, mcts_rng = jax.random.split(rng)
     policy_output = mctx.muzero_policy(
     params=params,
@@ -393,6 +396,9 @@ def play_games_batched(
     def single_legal(state):
         return get_legal_actions(state, env_config)
 
+    # Pre-create recurrent_fn once to avoid recompilation inside the loop
+    mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config) if use_mcts else None
+
     # Play loop - now takes step_idx for temperature scheduling
     def game_step(carry, _):
         (env_states, terminated, move_count, all_states, all_policies,
@@ -432,7 +438,8 @@ def play_games_batched(
             # Use MCTS to get improved policy
             actions_net, policies_net, values = batched_mcts_policy(
                 params, env_states, step_rng, network, env_config,
-                num_simulations=num_simulations, temperature=effective_temp
+                num_simulations=num_simulations, temperature=effective_temp,
+                recurrent_fn=mcts_recurrent_fn,
             )
         else:
             # Use raw network policy
@@ -609,6 +616,9 @@ def play_match_batched(
 
     step0 = jnp.int32(0)
 
+    # Pre-create recurrent_fn once to avoid recompilation inside the loop
+    mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+
     def cond_fn(carry):
         (states, terminated, rng, step_idx,
          jumps_p1, jumps_p2, jumps_total, jump_removed_total) = carry
@@ -640,6 +650,7 @@ def play_match_batched(
             env_config,
             num_simulations=num_simulations,
             temperature=temperature,
+            recurrent_fn=mcts_recurrent_fn,
         )
         actions_away, _, _ = batched_mcts_policy(
             away_params,
@@ -649,6 +660,7 @@ def play_match_batched(
             env_config,
             num_simulations=num_simulations,
             temperature=temperature,
+            recurrent_fn=mcts_recurrent_fn,
         )
 
         actions = jnp.where(use_home, actions_home, actions_away)  # (batch,)
@@ -793,26 +805,29 @@ def play_vs_random_batched(
     states = batched_reset(env_config, batch_size)
     terminated = jnp.zeros((batch_size,), dtype=jnp.bool_)
     step0 = jnp.int32(0)
-    
+
+    # Pre-create recurrent_fn once to avoid recompilation inside the loop
+    mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+
     def cond_fn(carry):
         states, terminated, rng, step_idx = carry
         any_active = jnp.any(~terminated)
         return jnp.logical_and(step_idx < max_moves, any_active)
-    
+
     def body_fn(carry):
         states, terminated, rng, step_idx = carry
-        
+
         current_player = states.current_player
-        
+
         # Determine if checkpoint is to move
         use_checkpoint = jnp.where(
             current_player == 1,
             checkpoint_is_P1,
             checkpoint_is_P2,
         )
-        
+
         rng, rng_ckpt, rng_rand = jax.random.split(rng, 3)
-        
+
         # Get checkpoint actions via MCTS
         actions_ckpt, _, _ = batched_mcts_policy(
             checkpoint_params,
@@ -822,6 +837,7 @@ def play_vs_random_batched(
             env_config,
             num_simulations=num_simulations,
             temperature=temperature,
+            recurrent_fn=mcts_recurrent_fn,
         )
         
         # Get random actions (uniform over legal)
@@ -949,6 +965,9 @@ def play_games_vs_random_training(
     def single_legal(state):
         return get_legal_actions(state, env_config)
 
+    # Pre-create recurrent_fn once to avoid recompilation inside the loop
+    mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config) if use_mcts else None
+
     def game_step(carry):
         (env_states, terminated, move_count, all_states, all_policies,
          all_players, all_actions, valid_mask, rng, step_idx) = carry
@@ -981,7 +1000,8 @@ def play_games_vs_random_training(
             # Network actions via MCTS
             actions_net, policies_net, _ = batched_mcts_policy(
                 params, env_states, step_rng, network, env_config,
-                num_simulations=num_simulations, temperature=effective_temp
+                num_simulations=num_simulations, temperature=effective_temp,
+                recurrent_fn=mcts_recurrent_fn,
             )
         else:
             # Network actions via raw policy
