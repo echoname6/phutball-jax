@@ -150,7 +150,7 @@ def batched_mcts_policy(
     temperature: float = 1.0,
     dirichlet_alpha: float = 0.3,
     dirichlet_fraction: float = 0.25,
-    max_num_considered_actions: int = 16,
+    max_num_considered_actions: int = 32,
     recurrent_fn=None,  # Pass pre-created recurrent_fn to avoid recompilation
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
