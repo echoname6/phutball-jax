@@ -191,21 +191,21 @@ def is_man(board: Array, row: Array, col: Array) -> Array:
 def check_winner(ball_pos: Array, config: EnvConfig) -> Array:
     """
     Check if the ball has reached a goal line.
-    
-    Player 1 wins by getting ball to row >= rows-2
-    Player 2 wins by getting ball to row <= 1
+
+    Player 1 wins by getting ball to row <= 1 (top end zone, END_HI)
+    Player 2 wins by getting ball to row >= rows-2 (bottom end zone, END_LO)
     """
     ball_row = ball_pos[0]
-    
-    p2_wins = ball_row <= 1
-    p1_wins = ball_row >= config.rows - 2
-    
+
+    p1_wins = ball_row <= 1
+    p2_wins = ball_row >= config.rows - 2
+
     winner = lax.cond(
-        p2_wins,
-        lambda: jnp.array(2, dtype=jnp.int32),
+        p1_wins,
+        lambda: jnp.array(1, dtype=jnp.int32),
         lambda: lax.cond(
-            p1_wins,
-            lambda: jnp.array(1, dtype=jnp.int32),
+            p2_wins,
+            lambda: jnp.array(2, dtype=jnp.int32),
             lambda: jnp.array(0, dtype=jnp.int32)
         )
     )
