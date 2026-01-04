@@ -150,6 +150,7 @@ def batched_mcts_policy(
     temperature: float = 1.0,
     dirichlet_alpha: float = 0.3,
     dirichlet_fraction: float = 0.25,
+    max_num_considered_actions: int = 16,
     recurrent_fn=None,  # Pass pre-created recurrent_fn to avoid recompilation
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
@@ -208,12 +209,14 @@ def batched_mcts_policy(
         recurrent_fn = make_mcts_recurrent_fn(network, env_config)
 
     rng, mcts_rng = jax.random.split(rng)
-    policy_output = mctx.muzero_policy(
-    params=params,
-    rng_key=mcts_rng,
-    root=root,
-    recurrent_fn=recurrent_fn,
-    num_simulations=num_simulations,
+    policy_output = mctx.gumbel_muzero_policy(
+        params=params,
+        rng_key=mcts_rng,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        gumbel_scale=1.0,
     )
 
     mcts_policy = policy_output.action_weights
