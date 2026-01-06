@@ -2359,13 +2359,11 @@ class ChimeraTrainer:
                 self.iters_without_improvement = 0
                 self.best_loss = total_loss
 
-    def run_self_play_for_board(self, board_key: str) -> int:
-        """Run self-play for a specific board size. Returns num examples."""
+    def run_self_play_for_board(self, board_key: str) -> dict:
+        """Run self-play for a specific board size. Returns stats dict."""
         env_config = self.env_configs[board_key]
         rows, cols = env_config.rows, env_config.cols
 
-        # Create a wrapper network that behaves like PhutballNetwork for this board size
-        # This is needed because play_games_batched expects PhutballNetwork interface
         class ChimeraWrapper:
             def __init__(wrapper_self, chimera, board_key):
                 wrapper_self.chimera = chimera
@@ -2388,7 +2386,16 @@ class ChimeraTrainer:
         total_policies = []
         total_values = []
 
+        # Stats tracking
+        stats_totals = {
+            "num_games": 0, "total_moves": 0, "total_placements": 0,
+            "total_jumps": 0, "num_jump_sequences": 0, "sum_jump_sequence_lengths": 0,
+            "sum_jump_removed_tiles": 0, "adjacency_opportunities": 0, "adjacency_conversions": 0,
+        }
+        p1_wins, p2_wins, draws = 0, 0, 0
+
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
+        start_time = time.time()
 
         for _ in range(num_batches):
             self.rng, game_rng = jax.random.split(self.rng)
@@ -2404,19 +2411,30 @@ class ChimeraTrainer:
                 temperature=self.config.temperature,
                 temp_threshold=self.config.temp_threshold,
                 temp_final=self.config.temp_final,
-                num_simulations=self.current_sims,  # Use curriculum-controlled sims
+                num_simulations=self.current_sims,
             )
+
+            # Compute stats
+            batch_stats = compute_phutball_stats(trajectory, env_config)
+            for k in stats_totals:
+                stats_totals[k] += batch_stats[k]
+
+            winners_np = np.array(trajectory.winners)
+            p1_wins += int(np.sum(winners_np == 1))
+            p2_wins += int(np.sum(winners_np == 2))
+            draws += int(np.sum(winners_np == 0))
 
             states, policies, values = trajectory_to_training_examples(trajectory)
             total_states.append(states)
             total_policies.append(policies)
             total_values.append(values)
 
+        elapsed = time.time() - start_time
+
         if total_states:
             all_states = np.concatenate(total_states, axis=0)
             all_policies = np.concatenate(total_policies, axis=0)
             all_values = np.concatenate(total_values, axis=0)
-
             self.replay_buffers[board_key].add(all_states, all_policies, all_values)
             num_examples = len(all_states)
         else:
@@ -2426,24 +2444,51 @@ class ChimeraTrainer:
         self.total_games[board_key] += games_total
         self.total_examples[board_key] += num_examples
 
-        return num_examples
+        # Compute averages
+        ng = stats_totals["num_games"] if stats_totals["num_games"] > 0 else 1
+        total_jumps = stats_totals["total_jumps"]
+        num_seq = stats_totals["num_jump_sequences"]
+        avg_moves = stats_totals["total_moves"] / ng
+        avg_jump_seq = stats_totals["sum_jump_sequence_lengths"] / num_seq if num_seq > 0 else 0
+        avg_jump_len = stats_totals["sum_jump_removed_tiles"] / total_jumps if total_jumps > 0 else 0
+        adj_ops = stats_totals["adjacency_opportunities"]
+        adj_conv = stats_totals["adjacency_conversions"] / adj_ops if adj_ops > 0 else 0
+
+        return {
+            "examples": num_examples,
+            "games": games_total,
+            "elapsed": elapsed,
+            "p1_wins": p1_wins,
+            "p2_wins": p2_wins,
+            "draws": draws,
+            "avg_moves": avg_moves,
+            "avg_jump_seq": avg_jump_seq,
+            "avg_jump_len": avg_jump_len,
+            "adj_conv": adj_conv,
+            "buffer_size": len(self.replay_buffers[board_key]),
+        }
 
     def run_self_play(self) -> dict:
-        """Run self-play for all board sizes. Returns examples per board."""
+        """Run self-play for all board sizes. Returns stats per board."""
         start_time = time.time()
-        examples_per_board = {}
+        stats_per_board = {}
 
         for board_key in self.env_configs:
-            num_examples = self.run_self_play_for_board(board_key)
-            examples_per_board[board_key] = num_examples
+            stats = self.run_self_play_for_board(board_key)
+            stats_per_board[board_key] = stats
 
         elapsed = time.time() - start_time
-        total_examples = sum(examples_per_board.values())
-        print(f"  Self-play: {total_examples} total examples ({elapsed:.1f}s)")
-        for bk, n in examples_per_board.items():
-            print(f"    {bk}: {n} examples, buffer={len(self.replay_buffers[bk])}")
+        total_examples = sum(s["examples"] for s in stats_per_board.values())
+        total_games = sum(s["games"] for s in stats_per_board.values())
+        games_per_sec = total_games / elapsed if elapsed > 0 else 0
 
-        return examples_per_board
+        print(f"  Self-play: {total_examples} examples from {total_games} games ({games_per_sec:.2f} games/sec, {elapsed:.1f}s)")
+        for bk, s in stats_per_board.items():
+            print(f"    {bk}: {s['examples']} ex | W1/W2/D={s['p1_wins']}/{s['p2_wins']}/{s['draws']} | "
+                  f"moves={s['avg_moves']:.1f}, jump_seq={s['avg_jump_seq']:.2f}, "
+                  f"jump_len={s['avg_jump_len']:.2f}, adj={s['adj_conv']*100:.1f}% | buf={s['buffer_size']}")
+
+        return stats_per_board
 
     def get_curriculum_ratio(self) -> float:
         """Calculate current curriculum ratio."""
@@ -2764,7 +2809,7 @@ class ChimeraTrainer:
             print("-" * 40)
 
             # Self-play for all board sizes
-            examples_per_board = self.run_self_play()
+            stats_per_board = self.run_self_play()
 
             # Training
             metrics = self.run_training()
@@ -2804,9 +2849,16 @@ class ChimeraTrainer:
                     "train/current_sims": self.current_sims,
                     "train/learning_rate": self.current_lr,
                 }
-                for bk in self.env_configs:
-                    log_data[f"selfplay/{bk}/examples"] = examples_per_board.get(bk, 0)
-                    log_data[f"selfplay/{bk}/buffer_size"] = len(self.replay_buffers[bk])
+                for bk, stats in stats_per_board.items():
+                    log_data[f"selfplay/{bk}/examples"] = stats["examples"]
+                    log_data[f"selfplay/{bk}/buffer_size"] = stats["buffer_size"]
+                    log_data[f"selfplay/{bk}/p1_wins"] = stats["p1_wins"]
+                    log_data[f"selfplay/{bk}/p2_wins"] = stats["p2_wins"]
+                    log_data[f"selfplay/{bk}/draws"] = stats["draws"]
+                    log_data[f"selfplay/{bk}/avg_moves"] = stats["avg_moves"]
+                    log_data[f"selfplay/{bk}/avg_jump_seq"] = stats["avg_jump_seq"]
+                    log_data[f"selfplay/{bk}/avg_jump_len"] = stats["avg_jump_len"]
+                    log_data[f"selfplay/{bk}/adj_conv"] = stats["adj_conv"]
                 wandb.log(log_data)
 
         self.save_checkpoint()
