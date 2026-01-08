@@ -2229,6 +2229,10 @@ class ChimeraConfig:
     sim_curriculum_eval_every: int = 10    # Evaluate vs random every N iterations
     sim_curriculum_eval_games: int = 50    # Games per board size for evaluation
 
+    # Eval vs random (independent of sim curriculum)
+    eval_vs_random_every: int = 0          # 0 = disabled, 1 = every iter
+    eval_vs_random_games: int = 50         # Games per board size
+
 
 class ChimeraTrainer:
     """
@@ -2579,6 +2583,61 @@ class ChimeraTrainer:
                     "sim_curriculum/trigger_win_rate": avg_win_rate,
                 })
 
+    def run_eval_vs_random(self) -> dict:
+        """Evaluate current model vs random for all board sizes. Returns win rates dict."""
+        if self.config.eval_vs_random_every <= 0:
+            return {}
+        if (self.iteration + 1) % self.config.eval_vs_random_every != 0:
+            return {}
+
+        print(f"  [Eval] vs random ({self.config.eval_vs_random_games} games/board)...")
+        win_rates = {}
+        for board_key in self.env_configs:
+            env_config = self.env_configs[board_key]
+            rows, cols = env_config.rows, env_config.cols
+
+            class ChimeraWrapper:
+                def __init__(wrapper_self, chimera, board_key):
+                    wrapper_self.chimera = chimera
+                    wrapper_self.board_key = board_key
+                    wrapper_self.rows = rows
+                    wrapper_self.cols = cols
+
+                def apply(wrapper_self, variables, x, train=True, mutable=None):
+                    if mutable:
+                        return wrapper_self.chimera.apply(
+                            variables, x, wrapper_self.board_key, train=train, mutable=mutable
+                        )
+                    return wrapper_self.chimera.apply(
+                        variables, x, wrapper_self.board_key, train=train
+                    )
+
+            wrapper = ChimeraWrapper(self.network, board_key)
+            self.rng, eval_rng = jax.random.split(self.rng)
+
+            (p1_wins, p1_draws, p1_losses,
+             p2_wins, p2_draws, p2_losses, turns) = play_vs_random_batched(
+                checkpoint_params=self.get_network_params(),
+                rng=eval_rng,
+                network=wrapper,
+                env_config=env_config,
+                num_games=self.config.eval_vs_random_games,
+                max_moves=rows * cols * 2,
+                num_simulations=self.current_sims,
+                temperature=0.1,
+            )
+
+            total = int(p1_wins + p1_draws + p1_losses + p2_wins + p2_draws + p2_losses)
+            total_wins = int(p1_wins + p2_wins)
+            win_rate = total_wins / total if total > 0 else 0.0
+            win_rates[board_key] = win_rate
+            print(f"    {board_key}: {total_wins}/{total} wins ({win_rate:.1%})")
+
+        avg_win_rate = sum(win_rates.values()) / len(win_rates) if win_rates else 0.0
+        print(f"  [Eval] Avg win rate: {avg_win_rate:.1%}")
+        win_rates['avg'] = avg_win_rate
+        return win_rates
+
     def run_training(self) -> dict:
         """Run training steps across all board sizes."""
         # Check all buffers have minimum size
@@ -2828,6 +2887,9 @@ class ChimeraTrainer:
             # Check for sim curriculum (double sims when avg win rate hits threshold)
             self.maybe_double_sims()
 
+            # Eval vs random
+            eval_win_rates = self.run_eval_vs_random()
+
             # Checkpoint
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
@@ -2859,6 +2921,8 @@ class ChimeraTrainer:
                     log_data[f"selfplay/{bk}/avg_jump_seq"] = stats["avg_jump_seq"]
                     log_data[f"selfplay/{bk}/avg_jump_len"] = stats["avg_jump_len"]
                     log_data[f"selfplay/{bk}/adj_conv"] = stats["adj_conv"]
+                for bk, wr in eval_win_rates.items():
+                    log_data[f"eval/{bk}/win_rate"] = wr
                 wandb.log(log_data)
 
         self.save_checkpoint()
