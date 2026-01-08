@@ -2712,6 +2712,7 @@ class ChimeraTrainer:
 
         curriculum_ratio = self.get_curriculum_ratio()
         board_keys = list(self.env_configs.keys())
+        curriculum_size_per_step = int(self.config.batch_size_train * curriculum_ratio)
 
         # Compute board weights for weighted sampling
         if self.config.board_mix_strategy == 'weighted':
@@ -2722,8 +2723,33 @@ class ChimeraTrainer:
             # Cumulative for sampling
             board_cum_weights = np.cumsum(board_weights)
 
+        # PRE-GENERATE all curriculum examples for this iteration (once per board size)
+        # This avoids the slow Python loop inside generate_curriculum_batch being called every step
+        curriculum_cache = {}
+        curriculum_idx = {}  # Track how many we've used per board
+        if curriculum_size_per_step > 0:
+            # Generate enough for all steps (worst case: all steps use same board)
+            total_curriculum_per_board = curriculum_size_per_step * self.config.train_steps_per_iteration
+            for board_key in board_keys:
+                self.rng, curr_rng = jax.random.split(self.rng)
+                env_config = self.env_configs[board_key]
+                curr_states, curr_policies, curr_values, curr_stats = generate_curriculum_batch(
+                    curr_rng, env_config, total_curriculum_per_board,
+                    jump_distribution=list(self.config.curriculum_jump_distribution),
+                    return_stats=True
+                )
+                curriculum_cache[board_key] = {
+                    'states': curr_states,
+                    'policies': curr_policies,
+                    'values': curr_values,
+                }
+                curriculum_idx[board_key] = 0
+                # Accumulate stats (will be for all pre-generated, but that's fine)
+                for k, v in curr_stats.items():
+                    curriculum_stats_sum[k] += v
+
         for step_idx in range(self.config.train_steps_per_iteration):
-            self.rng, step_rng, curriculum_rng, board_rng = jax.random.split(self.rng, 4)
+            self.rng, step_rng, board_rng = jax.random.split(self.rng, 3)
 
             # Select board size based on strategy
             if self.config.board_mix_strategy == 'weighted':
@@ -2742,8 +2768,7 @@ class ChimeraTrainer:
             action_space_size = 2 * rows * cols + 1
 
             # Sample from replay buffer
-            curriculum_size = int(self.config.batch_size_train * curriculum_ratio)
-            replay_size = self.config.batch_size_train - curriculum_size
+            replay_size = self.config.batch_size_train - curriculum_size_per_step
 
             if replay_size > 0:
                 replay_batch = self.replay_buffers[board_key].sample(replay_size)
@@ -2755,16 +2780,15 @@ class ChimeraTrainer:
                 policies = np.empty((0, action_space_size), dtype=np.float32)
                 values = np.empty((0,), dtype=np.float32)
 
-            # Generate curriculum examples
-            if curriculum_size > 0:
-                curr_states, curr_policies, curr_values, curr_stats = generate_curriculum_batch(
-                    curriculum_rng, env_config, curriculum_size,
-                    jump_distribution=list(self.config.curriculum_jump_distribution),
-                    return_stats=True
-                )
-                # Accumulate curriculum stats
-                for k, v in curr_stats.items():
-                    curriculum_stats_sum[k] += v
+            # Slice from pre-generated curriculum cache
+            if curriculum_size_per_step > 0:
+                idx = curriculum_idx[board_key]
+                curr_cache = curriculum_cache[board_key]
+                curr_states = curr_cache['states'][idx:idx + curriculum_size_per_step]
+                curr_policies = curr_cache['policies'][idx:idx + curriculum_size_per_step]
+                curr_values = curr_cache['values'][idx:idx + curriculum_size_per_step]
+                curriculum_idx[board_key] = idx + curriculum_size_per_step
+
                 states = np.concatenate([states, curr_states], axis=0)
                 policies = np.concatenate([policies, curr_policies], axis=0)
                 values = np.concatenate([values, curr_values], axis=0)
