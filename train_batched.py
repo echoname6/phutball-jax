@@ -946,9 +946,13 @@ class AlphaZeroTrainer:
             weight_decay=config.weight_decay,
         )
         
-        # Replay buffer
-        self.replay_buffer = ReplayBuffer(max_size=config.buffer_size)
-        
+        # Replay buffer (with flip + rotation augmentation)
+        self.replay_buffer = ReplayBuffer(
+            max_size=config.buffer_size,
+            cols=config.cols,
+            augment_flip=True,
+        )
+
         # Initialize random key
         self.rng = jax.random.PRNGKey(42)
         
@@ -2267,9 +2271,9 @@ class ChimeraTrainer:
             weight_decay=config.weight_decay,
         )
 
-        # Separate replay buffer per board size
+        # Separate replay buffer per board size (with flip + rotation augmentation)
         self.replay_buffers = {
-            f"{r}x{c}": ReplayBuffer(max_size=config.buffer_size)
+            f"{r}x{c}": ReplayBuffer(max_size=config.buffer_size, cols=c, augment_flip=True)
             for r, c in config.board_sizes
         }
 
@@ -2829,7 +2833,9 @@ class ChimeraTrainer:
         self.env_configs[board_key] = EnvConfig(
             rows=new_rows, cols=new_cols, max_turns=self.config.max_turns_per_game
         )
-        self.replay_buffers[board_key] = ReplayBuffer(max_size=self.config.buffer_size)
+        self.replay_buffers[board_key] = ReplayBuffer(
+            max_size=self.config.buffer_size, cols=new_cols, augment_flip=True
+        )
         self.total_games[board_key] = 0
         self.total_examples[board_key] = 0
 

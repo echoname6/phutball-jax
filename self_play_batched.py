@@ -1292,14 +1292,17 @@ def compute_phutball_stats(
 
 class ReplayBuffer:
     """Simple replay buffer for training examples."""
-    
-    def __init__(self, max_size: int = 500000):
+
+    def __init__(self, max_size: int = 500000, cols: int = None, augment_flip: bool = True):
         self.max_size = max_size
+        self.cols = cols  # needed for policy flip augmentation
+        self.augment_flip = augment_flip
         self.states = None
         self.policies = None
         self.values = None
         self.size = 0
         self.idx = 0
+        self._flip_indices = None  # cached policy flip mapping
     
     def add(self, states: np.ndarray, policies: np.ndarray, values: np.ndarray):
         """Add examples to buffer."""
@@ -1343,16 +1346,74 @@ class ReplayBuffer:
         
         self.size = min(self.size + n, self.max_size)
     
+    def _get_hflip_indices(self, policy_size: int) -> np.ndarray:
+        """Get cached index mapping for horizontal flip of policy vector."""
+        if not hasattr(self, '_hflip_indices') or self._hflip_indices is None:
+            if self.cols is not None:
+                rows = policy_size // self.cols
+                indices = np.arange(policy_size)
+                row = indices // self.cols
+                col = indices % self.cols
+                flipped_col = self.cols - 1 - col
+                self._hflip_indices = row * self.cols + flipped_col
+            else:
+                self._hflip_indices = None
+        return self._hflip_indices
+
+    def _get_rot180_indices(self, policy_size: int) -> np.ndarray:
+        """Get cached index mapping for 180° rotation of policy vector."""
+        if not hasattr(self, '_rot180_indices') or self._rot180_indices is None:
+            if self.cols is not None:
+                rows = policy_size // self.cols
+                # 180° rotation: (r, c) -> (rows-1-r, cols-1-c)
+                indices = np.arange(policy_size)
+                row = indices // self.cols
+                col = indices % self.cols
+                new_row = rows - 1 - row
+                new_col = self.cols - 1 - col
+                self._rot180_indices = new_row * self.cols + new_col
+            else:
+                self._rot180_indices = None
+        return self._rot180_indices
+
     def sample(self, batch_size: int) -> dict:
-        """Sample a batch for training."""
+        """Sample a batch for training with augmentation (horizontal flip + 180° rotation)."""
         indices = np.random.choice(self.size, size=min(batch_size, self.size), replace=False)
-        
+
+        states = self.states[indices].copy()
+        policies = self.policies[indices].copy()
+        values = self.values[indices].copy()
+
+        if self.augment_flip and self.cols is not None:
+            # Random augmentation: 0=none, 1=hflip, 2=rot180, 3=hflip+rot180
+            aug_choice = np.random.randint(0, 4, size=len(indices))
+
+            # Horizontal flip (choices 1 and 3)
+            hflip_mask = (aug_choice == 1) | (aug_choice == 3)
+            if hflip_mask.any():
+                states[hflip_mask] = np.flip(states[hflip_mask], axis=-1)
+                hflip_idx = self._get_hflip_indices(policies.shape[-1])
+                if hflip_idx is not None:
+                    policies[hflip_mask] = policies[hflip_mask][:, hflip_idx]
+
+            # 180° rotation (choices 2 and 3)
+            rot180_mask = (aug_choice == 2) | (aug_choice == 3)
+            if rot180_mask.any():
+                # Flip state along both axes (rows and cols)
+                states[rot180_mask] = np.flip(states[rot180_mask], axis=(-2, -1))
+                # Swap current player indicator (channel 4: 1s <-> 0s)
+                states[rot180_mask, 4, :, :] = 1.0 - states[rot180_mask, 4, :, :]
+                # Flip policy
+                rot180_idx = self._get_rot180_indices(policies.shape[-1])
+                if rot180_idx is not None:
+                    policies[rot180_mask] = policies[rot180_mask][:, rot180_idx]
+
         return {
-            'states': jnp.array(self.states[indices]),
-            'policy_targets': jnp.array(self.policies[indices]),
-            'value_targets': jnp.array(self.values[indices]),
+            'states': jnp.array(states),
+            'policy_targets': jnp.array(policies),
+            'value_targets': jnp.array(values),
         }
-    
+
     def __len__(self):
         return self.size
 
