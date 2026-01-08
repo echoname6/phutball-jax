@@ -331,12 +331,14 @@ def play_games_batched(
     temp_final: float = 0.1,   # Temperature after threshold
     num_simulations: int = 0,  # 0 = no MCTS, >0 = use MCTS with this many sims
     random_opponent_ratio: float = 0.0,  # Fraction of games vs random opponent
+    opponent_params: dict = None,  # If provided, use for P2 (league play)
+    opponent_ratio: float = 0.0,  # Fraction of games vs opponent_params
 ) -> TrajectoryData:
     """
-    Play multiple games in parallel with optional random opponents.
+    Play multiple games in parallel with optional random/league opponents.
 
     Args:
-        params: Network parameters
+        params: Network parameters (used for P1, and P2 in self-play)
         rng: Random key
         network: Neural network
         env_config: Environment config
@@ -347,7 +349,9 @@ def play_games_batched(
         temp_threshold: Number of moves before temperature drops
         temp_final: Temperature after threshold (for exploitation)
         num_simulations: MCTS simulations per move (0 = raw network policy)
-        random_opponent_ratio: Fraction of games where opponent plays randomly (0.0 = all self-play)
+        random_opponent_ratio: Fraction of games where opponent plays randomly
+        opponent_params: If provided, use these params for P2 in some games (league play)
+        opponent_ratio: Fraction of games where P2 uses opponent_params
 
     Returns:
         TrajectoryData with all game trajectories
@@ -357,25 +361,33 @@ def play_games_batched(
     rows, cols = env_config.rows, env_config.cols
     use_mcts = num_simulations > 0
 
-    # Determine which games have random opponents
-    rng, mask_rng, side_rng = jax.random.split(rng, 3)
-    # Ensure at least 1 random game when ratio > 0
+    # Determine which games have random/league opponents
+    rng, mask_rng, side_rng, league_rng = jax.random.split(rng, 4)
+
+    # Random opponents
     num_vs_random = int(batch_size * random_opponent_ratio)
     if random_opponent_ratio > 0 and num_vs_random == 0:
         num_vs_random = 1
-
-    # has_random_opponent[i] = True if game i has random opponent
     has_random_opponent = jnp.arange(batch_size) < num_vs_random
 
-    # For vs-random games, randomly decide if network plays P1 (50/50)
+    # League opponents (only if opponent_params provided)
+    num_vs_league = int(batch_size * opponent_ratio) if opponent_params is not None else 0
+    if opponent_ratio > 0 and num_vs_league == 0 and opponent_params is not None:
+        num_vs_league = 1
+    # League games start after random games
+    has_league_opponent = (jnp.arange(batch_size) >= num_vs_random) & \
+                          (jnp.arange(batch_size) < num_vs_random + num_vs_league)
+
+    # For vs-random/league games, randomly decide if main network plays P1 (50/50)
     random_sides = jax.random.uniform(side_rng, (batch_size,)) < 0.5
+    has_any_opponent = has_random_opponent | has_league_opponent
     network_is_P1 = jnp.where(
-        has_random_opponent,
-        random_sides,  # Random assignment for vs-random games
+        has_any_opponent,
+        random_sides,  # Random assignment for vs-opponent games
         jnp.ones(batch_size, dtype=jnp.bool_),  # Self-play: network plays both
     )
     network_is_P2 = jnp.where(
-        has_random_opponent,
+        has_any_opponent,
         ~random_sides,
         jnp.ones(batch_size, dtype=jnp.bool_),
     )
@@ -425,39 +437,57 @@ def play_games_batched(
         current_obs = jax.vmap(lambda s: state_to_network_input(s, env_config))(env_states)
         current_players = env_states.current_player
 
-        # Determine if network should make this move (or random opponent)
-        # For self-play games: always use network
-        # For vs-random games: use network only when it's network's turn
-        use_network = jnp.where(
-            has_random_opponent,
-            jnp.where(current_players == 1, network_is_P1, network_is_P2),
-            jnp.ones(batch_size, dtype=jnp.bool_),  # Self-play: always network
+        # Determine who makes this move:
+        # - use_main_network: current params (self-play or main side of opponent game)
+        # - use_league_opponent: opponent_params (league game, opponent's turn)
+        # - use_random: random (random game, opponent's turn)
+        is_network_turn = jnp.where(current_players == 1, network_is_P1, network_is_P2)
+        use_main_network = jnp.where(
+            has_any_opponent,
+            is_network_turn,
+            jnp.ones(batch_size, dtype=jnp.bool_),  # Self-play: always main
         )
+        use_league_opponent = has_league_opponent & ~is_network_turn
+        use_random = has_random_opponent & ~is_network_turn
 
         # Get legal action mask
         legal_mask = jax.vmap(single_legal)(env_states)
 
         if use_mcts:
-            # Use MCTS to get improved policy
+            # Use MCTS to get improved policy (main network)
             actions_net, policies_net, values = batched_mcts_policy(
                 params, env_states, step_rng, network, env_config,
                 num_simulations=num_simulations, temperature=effective_temp,
                 recurrent_fn=mcts_recurrent_fn,
             )
+            # League opponent MCTS (if needed)
+            if opponent_params is not None:
+                actions_league, policies_league, _ = batched_mcts_policy(
+                    opponent_params, env_states, step_rng, network, env_config,
+                    num_simulations=num_simulations, temperature=effective_temp,
+                    recurrent_fn=mcts_recurrent_fn,
+                )
+            else:
+                actions_league, policies_league = actions_net, policies_net
         else:
-            # Use raw network policy
+            # Use raw network policy (main)
             variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
             policy_logits, values = network.apply(variables, current_obs, train=False)
-
-            # Mask illegal actions
             masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
-
-            # Convert to probabilities with effective temperature
             policies_net = jax.nn.softmax(masked_logits / effective_temp)
-
-            # Sample actions
             sample_rngs = jax.random.split(sample_rng, batch_size)
             actions_net = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(sample_rngs, policies_net)
+
+            # League opponent policy (if provided)
+            if opponent_params is not None:
+                opp_variables = {'params': opponent_params['network_params'], 'batch_stats': opponent_params['batch_stats']}
+                opp_logits, _ = network.apply(opp_variables, current_obs, train=False)
+                opp_masked = jnp.where(legal_mask == 1, opp_logits, -1e9)
+                policies_league = jax.nn.softmax(opp_masked / effective_temp)
+                opp_rngs = jax.random.split(sample_rng, batch_size)
+                actions_league = jax.vmap(lambda r, p: jax.random.choice(r, action_space_size, p=p))(opp_rngs, policies_league)
+            else:
+                actions_league, policies_league = actions_net, policies_net
 
         # Random actions (uniform over legal)
         def get_random_action(state, rng_key):
@@ -473,9 +503,11 @@ def play_games_batched(
         policies_rand = legal_mask.astype(jnp.float32)
         policies_rand = policies_rand / jnp.maximum(jnp.sum(policies_rand, axis=-1, keepdims=True), 1e-8)
 
-        # Select actions and policies based on who's moving
-        actions = jnp.where(use_network, actions_net, actions_rand)
-        policies = jnp.where(use_network[:, None], policies_net, policies_rand)
+        # Select actions and policies: main > league > random
+        actions = jnp.where(use_main_network, actions_net,
+                  jnp.where(use_league_opponent, actions_league, actions_rand))
+        policies = jnp.where(use_main_network[:, None], policies_net,
+                   jnp.where(use_league_opponent[:, None], policies_league, policies_rand))
         
         # Clamp move_count to valid range for indexing
         safe_move_idx = jnp.minimum(move_count, max_moves - 1)

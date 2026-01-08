@@ -2237,6 +2237,12 @@ class ChimeraConfig:
     eval_vs_random_every: int = 0          # 0 = disabled, 1 = every iter
     eval_vs_random_games: int = 50         # Games per board size
 
+    # League (opponent sampling from past checkpoints)
+    league_enabled: bool = False
+    league_pool_size: int = 10             # Max past checkpoints to keep
+    league_opponent_ratio: float = 0.5     # Fraction of games vs past opponent
+    league_save_every: int = 5             # Save to pool every N iterations
+
 
 class ChimeraTrainer:
     """
@@ -2305,6 +2311,9 @@ class ChimeraTrainer:
         else:
             self.current_sims = config.num_simulations
             self.sims_doubled = False
+
+        # League (past opponent pool)
+        self.league_pool = []  # List of (iteration, params) tuples
 
         # Wandb
         self.wandb_run = None
@@ -2405,6 +2414,13 @@ class ChimeraTrainer:
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
         start_time = time.time()
 
+        # Get league opponent if enabled
+        league_opponent = None
+        league_ratio = 0.0
+        if self.config.league_enabled and len(self.league_pool) > 0:
+            league_opponent = self.get_league_opponent_params()
+            league_ratio = self.config.league_opponent_ratio
+
         for _ in range(num_batches):
             self.rng, game_rng = jax.random.split(self.rng)
 
@@ -2420,6 +2436,8 @@ class ChimeraTrainer:
                 temp_threshold=self.config.temp_threshold,
                 temp_final=self.config.temp_final,
                 num_simulations=self.current_sims,
+                opponent_params=league_opponent,
+                opponent_ratio=league_ratio,
             )
 
             # Compute stats
@@ -2508,6 +2526,32 @@ class ChimeraTrainer:
         return self.config.curriculum_initial_ratio + progress * (
             self.config.curriculum_final_ratio - self.config.curriculum_initial_ratio
         )
+
+    def maybe_save_to_league(self):
+        """Save current params to league pool if enabled."""
+        if not self.config.league_enabled:
+            return
+        if (self.iteration + 1) % self.config.league_save_every != 0:
+            return
+
+        # Deep copy params to avoid issues with later updates
+        import copy
+        params_copy = copy.deepcopy(self.params)
+        self.league_pool.append((self.iteration, params_copy))
+
+        # Trim pool if over capacity
+        if len(self.league_pool) > self.config.league_pool_size:
+            self.league_pool = self.league_pool[-self.config.league_pool_size:]
+
+        print(f"  [League] Saved checkpoint to pool (size={len(self.league_pool)})")
+
+    def get_league_opponent_params(self) -> dict:
+        """Get random params from league pool, or None if pool is empty."""
+        if not self.league_pool:
+            return None
+        idx = np.random.randint(len(self.league_pool))
+        iter_num, params = self.league_pool[idx]
+        return params
 
     def evaluate_vs_random_for_board(self, board_key: str) -> float:
         """Evaluate current model vs random for a specific board size. Returns win rate."""
@@ -2892,6 +2936,9 @@ class ChimeraTrainer:
 
             # Check for sim curriculum (double sims when avg win rate hits threshold)
             self.maybe_double_sims()
+
+            # Save to league pool if enabled
+            self.maybe_save_to_league()
 
             # Eval vs random
             eval_win_rates = self.run_eval_vs_random()
