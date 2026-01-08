@@ -2931,6 +2931,7 @@ class ChimeraTrainer:
         print(f"MCTS sims: {self.current_sims}" +
               (f" (curriculum: {self.config.sim_curriculum_initial} -> {self.config.sim_curriculum_target})"
                if self.config.sim_curriculum_enabled else ""))
+        print(f"Training: {self.config.train_steps_per_iteration} steps x {self.config.batch_size_train} batch = {self.config.train_steps_per_iteration * self.config.batch_size_train:,} samples/iter")
         print(f"Devices: {jax.devices()}")
         print("=" * 60)
 
