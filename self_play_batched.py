@@ -1347,15 +1347,35 @@ class ReplayBuffer:
         self.size = min(self.size + n, self.max_size)
     
     def _get_hflip_indices(self, policy_size: int) -> np.ndarray:
-        """Get cached index mapping for horizontal flip of policy vector."""
+        """Get cached index mapping for horizontal flip of policy vector.
+
+        Phutball action space: 2 * rows * cols + 1
+        - [0, rows*cols): placements
+        - [rows*cols, 2*rows*cols): jumps
+        - 2*rows*cols: halt
+        """
         if not hasattr(self, '_hflip_indices') or self._hflip_indices is None:
             if self.cols is not None:
-                rows = policy_size // self.cols
-                indices = np.arange(policy_size)
-                row = indices // self.cols
-                col = indices % self.cols
-                flipped_col = self.cols - 1 - col
-                self._hflip_indices = row * self.cols + flipped_col
+                # Infer rows from policy_size = 2 * rows * cols + 1
+                total_positions = (policy_size - 1) // 2
+                rows = total_positions // self.cols
+
+                flip_indices = np.arange(policy_size)
+
+                # Flip placements (0 to total_positions-1)
+                place_idx = np.arange(total_positions)
+                place_row = place_idx // self.cols
+                place_col = place_idx % self.cols
+                place_flipped = place_row * self.cols + (self.cols - 1 - place_col)
+                flip_indices[:total_positions] = place_flipped
+
+                # Flip jumps (total_positions to 2*total_positions-1)
+                flip_indices[total_positions:2*total_positions] = total_positions + place_flipped
+
+                # Halt action stays the same (last index)
+                # flip_indices[-1] = policy_size - 1  (already set)
+
+                self._hflip_indices = flip_indices
             else:
                 self._hflip_indices = None
         return self._hflip_indices
@@ -1364,14 +1384,27 @@ class ReplayBuffer:
         """Get cached index mapping for 180° rotation of policy vector."""
         if not hasattr(self, '_rot180_indices') or self._rot180_indices is None:
             if self.cols is not None:
-                rows = policy_size // self.cols
-                # 180° rotation: (r, c) -> (rows-1-r, cols-1-c)
-                indices = np.arange(policy_size)
-                row = indices // self.cols
-                col = indices % self.cols
-                new_row = rows - 1 - row
-                new_col = self.cols - 1 - col
-                self._rot180_indices = new_row * self.cols + new_col
+                # Infer rows from policy_size = 2 * rows * cols + 1
+                total_positions = (policy_size - 1) // 2
+                rows = total_positions // self.cols
+
+                rot_indices = np.arange(policy_size)
+
+                # Rotate placements: (r, c) -> (rows-1-r, cols-1-c)
+                place_idx = np.arange(total_positions)
+                place_row = place_idx // self.cols
+                place_col = place_idx % self.cols
+                new_row = rows - 1 - place_row
+                new_col = self.cols - 1 - place_col
+                place_rotated = new_row * self.cols + new_col
+                rot_indices[:total_positions] = place_rotated
+
+                # Rotate jumps
+                rot_indices[total_positions:2*total_positions] = total_positions + place_rotated
+
+                # Halt action stays the same
+
+                self._rot180_indices = rot_indices
             else:
                 self._rot180_indices = None
         return self._rot180_indices
