@@ -1462,12 +1462,13 @@ class ReplayBuffer:
                     policies[hflip_mask] = policies[hflip_mask][:, hflip_idx]
 
             # 180° rotation (choices 2 and 3)
+            # This effectively shows the board from opponent's perspective
             rot180_mask = (aug_choice == 2) | (aug_choice == 3)
             if rot180_mask.any():
                 # Flip state along both axes (rows and cols)
                 states[rot180_mask] = np.flip(states[rot180_mask], axis=(-2, -1))
-                # Swap current player indicator (channel 4: 1s <-> 0s)
-                states[rot180_mask, 4, :, :] = 1.0 - states[rot180_mask, 4, :, :]
+                # Negate value (opponent's perspective has opposite outcome)
+                values[rot180_mask] = -values[rot180_mask]
                 # Flip policy
                 rot180_idx = self._get_rot180_indices(policies.shape[-1])
                 if rot180_idx is not None:

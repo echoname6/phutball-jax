@@ -558,82 +558,87 @@ def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
         3. If positions were revisited (multiple layers marked)
     """
     rows, cols = config.rows, config.cols
-    
+    is_p2 = state.current_player == 2
+
     # Channel 0: board state
     board_channel = state.board.astype(jnp.float32)
-    
+
     # Channels 1-5: jump sequence encoding
     num_jump_layers = 5
-    jump_layers = jnp.zeros((num_jump_layers, rows, cols), dtype=jnp.float32)
-    
-    # Only encode if we're in a jump sequence
+
     def encode_jump_sequence():
         layers = jnp.zeros((num_jump_layers, rows, cols), dtype=jnp.float32)
-        
+
         # Count how many times each position has been visited so far
         # This determines which layer to use
         visit_counts = jnp.zeros((rows, cols), dtype=jnp.int32)
-        
+
         def process_step(carry, step_idx):
             layers, visit_counts = carry
-            
+
             # Get position for this step
             pos = state.jump_sequence[step_idx]
             r, c = pos[0], pos[1]
-            
+
             # Check if this step is valid (within sequence length and valid coords)
             is_valid = (step_idx < state.jump_sequence_length) & (r >= 0) & (c >= 0) & (r < rows) & (c < cols)
-            
+
             # Get which layer to use (based on how many times we've visited this position)
             safe_r = jnp.clip(r, 0, rows - 1)
             safe_c = jnp.clip(c, 0, cols - 1)
             layer_idx = jnp.clip(visit_counts[safe_r, safe_c], 0, num_jump_layers - 1)
-            
+
             # Update layers: set the value at (layer_idx, r, c) to step_idx
-            # We need to normalize step_idx to a reasonable range (e.g., 0-1 scale or small integers)
-            # Using raw step index for now; can normalize later if needed
             step_value = step_idx.astype(jnp.float32)
-            
+
             # Conditional update
             new_layers = jnp.where(
                 is_valid,
                 layers.at[layer_idx, safe_r, safe_c].set(step_value + 1.0),  # +1 so 0 means "not visited"
                 layers
             )
-            
+
             # Update visit count for this position
             new_visit_counts = jnp.where(
                 is_valid,
                 visit_counts.at[safe_r, safe_c].add(1),
                 visit_counts
             )
-            
+
             return (new_layers, new_visit_counts), None
-        
+
         # Process all possible steps (up to MAX_JUMP_SEQUENCE_LENGTH)
         (final_layers, _), _ = lax.scan(
             process_step,
             (layers, visit_counts),
             jnp.arange(MAX_JUMP_SEQUENCE_LENGTH, dtype=jnp.int32)
         )
-        
+
         return final_layers
-    
+
     def no_sequence():
         return jnp.zeros((num_jump_layers, rows, cols), dtype=jnp.float32)
-    
+
     jump_layers = lax.cond(
         state.jump_sequence_length > 0,
         encode_jump_sequence,
         no_sequence
     )
-    
+
     # Stack all channels: (6, rows, cols)
     observation = jnp.concatenate([
         board_channel[None, :, :],  # (1, rows, cols)
         jump_layers                  # (5, rows, cols)
     ], axis=0)
-    
+
+    # Perspective normalization: P1 attacks towards row 0, P2 attacks towards row max
+    # For P2, rotate ALL channels 180° so they also see themselves "attacking up"
+    observation = lax.cond(
+        is_p2,
+        lambda: jnp.flip(jnp.flip(observation, axis=1), axis=2),  # 180° rotation on (C,H,W)
+        lambda: observation
+    )
+
     return observation
 
 
