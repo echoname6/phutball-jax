@@ -1290,9 +1290,9 @@ class AlphaZeroTrainer:
         curriculum_pct = curriculum_ratio * 100
         print(f"  Training: {self.config.train_steps_per_iteration} steps "
               f"({steps_per_sec:.1f} steps/sec) | "
-              f"policy_loss: {avg_metrics['policy_loss']:.4f}, "
-              f"value_loss: {avg_metrics['value_loss']:.4f} | "
-              f"curriculum: {curriculum_pct:.1f}%")
+              f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
+              f"kl: {avg_metrics['kl_divergence']:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
+              f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
 
         # Add curriculum ratio and stats to metrics for logging
         avg_metrics['curriculum_ratio'] = curriculum_ratio
@@ -2709,6 +2709,7 @@ class ChimeraTrainer:
         metrics_sum = {
             'policy_loss': 0.0, 'value_loss': 0.0, 'total_loss': 0.0,
             'policy_entropy': 0.0, 'mcts_entropy': 0.0, 'kl_divergence': 0.0,
+            'value_pred_mean': 0.0, 'value_pred_std': 0.0,
         }
 
         # Curriculum statistics tracking
@@ -2824,8 +2825,9 @@ class ChimeraTrainer:
         avg_metrics.update(curriculum_stats_sum)
 
         print(f"  Training: {self.config.train_steps_per_iteration} steps ({elapsed:.1f}s) | "
-              f"policy_loss: {avg_metrics['policy_loss']:.4f}, "
-              f"value_loss: {avg_metrics['value_loss']:.4f}")
+              f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
+              f"kl: {avg_metrics['kl_divergence']:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
+              f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
 
         return avg_metrics
 
@@ -2990,6 +2992,11 @@ class ChimeraTrainer:
                     "iteration": iteration,
                     "train/policy_loss": metrics["policy_loss"],
                     "train/value_loss": metrics["value_loss"],
+                    "train/policy_entropy": metrics["policy_entropy"],
+                    "train/mcts_entropy": metrics["mcts_entropy"],
+                    "train/kl_divergence": metrics["kl_divergence"],
+                    "train/value_pred_mean": metrics["value_pred_mean"],
+                    "train/value_pred_std": metrics["value_pred_std"],
                     "train/curriculum_ratio": metrics.get("curriculum_ratio", 0),
                     "train/curriculum_1jump": metrics.get("curriculum_1jump", 0),
                     "train/curriculum_2jump": metrics.get("curriculum_2jump", 0),
