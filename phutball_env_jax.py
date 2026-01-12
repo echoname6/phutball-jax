@@ -28,9 +28,9 @@ END_LO = -2   # Row -1 - beyond goal for P1
 OUT_OF_BOUNDS = jnp.array(3, dtype=jnp.int32)
 
 # Fixed array size for jump sequence tracking (for JIT compilation and NN input)
-# Set to 2048 to support very large boards (covers up to ~64x64 fully, partial for 99x99)
-# Jumps can continue beyond this - this is just the tracking window size
-MAX_JUMP_SEQUENCE_LENGTH = 2048
+# Must be large enough for biggest supported board. 256 covers up to ~22x22.
+# The scan in state_to_network_input uses (rows*cols)//2 for actual iteration count
+MAX_JUMP_SEQUENCE_LENGTH = 256
 
 # ============================================================================
 # State Definition (with jump sequence tracking)
@@ -607,11 +607,13 @@ def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
 
             return (new_layers, new_visit_counts), None
 
-        # Process all possible steps (up to MAX_JUMP_SEQUENCE_LENGTH)
+        # Process steps up to max possible jumps for this board size
+        # (rows * cols) // 2 is theoretical max - can't jump more men than half the board
+        max_jumps = (rows * cols) // 2
         (final_layers, _), _ = lax.scan(
             process_step,
             (layers, visit_counts),
-            jnp.arange(MAX_JUMP_SEQUENCE_LENGTH, dtype=jnp.int32)
+            jnp.arange(max_jumps, dtype=jnp.int32)
         )
 
         return final_layers
