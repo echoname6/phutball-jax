@@ -422,9 +422,14 @@ def compute_loss(params, batch_norm_state, network, batch, rng):
     mcts_entropy = -jnp.sum(policy_targets * jnp.log(policy_targets + 1e-8), axis=-1)
     kl_div = jnp.mean(-mcts_entropy - jnp.sum(policy_targets * log_probs, axis=-1))
     # Simplifies to: kl_div = policy_loss - mean(mcts_entropy)
-    
+
+    # Value prediction stats - check if value head is actually learning
+    # (if outputting ~0 for everything, value_loss is low but it's not learning)
+    value_pred_mean = jnp.mean(value_preds)
+    value_pred_std = jnp.std(value_preds)
+
     total_loss = policy_loss + value_loss
-    
+
     metrics = {
         'policy_loss': policy_loss,
         'value_loss': value_loss,
@@ -432,6 +437,8 @@ def compute_loss(params, batch_norm_state, network, batch, rng):
         'policy_entropy': entropy,
         'mcts_entropy': jnp.mean(mcts_entropy),
         'kl_divergence': kl_div,
+        'value_pred_mean': value_pred_mean,
+        'value_pred_std': value_pred_std,
     }
     
     return total_loss, (new_state['batch_stats'], metrics)

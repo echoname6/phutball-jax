@@ -1218,6 +1218,8 @@ class AlphaZeroTrainer:
             'policy_entropy': 0.0,
             'mcts_entropy': 0.0,
             'kl_divergence': 0.0,
+            'value_pred_mean': 0.0,
+            'value_pred_std': 0.0,
         }
 
         # Curriculum statistics tracking
@@ -1439,6 +1441,11 @@ class AlphaZeroTrainer:
                     "train/policy_loss": metrics["policy_loss"],
                     "train/value_loss": metrics["value_loss"],
                     "train/total_loss": metrics["total_loss"],
+                    "train/policy_entropy": metrics["policy_entropy"],
+                    "train/mcts_entropy": metrics["mcts_entropy"],
+                    "train/kl_divergence": metrics["kl_divergence"],
+                    "train/value_pred_mean": metrics["value_pred_mean"],
+                    "train/value_pred_std": metrics["value_pred_std"],
                     "train/curriculum_ratio": metrics.get("curriculum_ratio", 0.0),
                     "train/curriculum_1jump": metrics.get("curriculum_1jump", 0),
                     "train/curriculum_2jump": metrics.get("curriculum_2jump", 0),
