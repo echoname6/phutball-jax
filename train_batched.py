@@ -2543,7 +2543,10 @@ class ChimeraTrainer:
 
         # Deep copy params to avoid issues with later updates
         import copy
-        params_copy = copy.deepcopy(self.params)
+        params_copy = {
+            'network_params': copy.deepcopy(self.params),
+            'batch_stats': copy.deepcopy(self.batch_stats),
+        }
         self.league_pool.append((self.iteration, params_copy))
 
         # Trim pool if over capacity
