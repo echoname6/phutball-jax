@@ -60,7 +60,7 @@ def snapshot_to_state(snapshot: dict, config: EnvConfig) -> PhutballState:
 
 
 def text_render(state: PhutballState, for_player: int = 1) -> str:
-    """Render board as text."""
+    """Render board as text with row/column coordinates."""
     board = np.array(state.board)
     rows, cols = board.shape
 
@@ -78,19 +78,41 @@ def text_render(state: PhutballState, for_player: int = 1) -> str:
             elif tile == MAN:
                 row_chars.append("x")
             else:
-                row_chars.append("┼")
-        grid.append("".join(row_chars))
+                row_chars.append(".")
+        grid.append(row_chars)
+
+    # Build row indices for display (matrix coordinates)
+    row_indices = list(range(rows))
+    col_indices = list(range(cols))
 
     if for_player == 2:
-        swap = str.maketrans({"+": "-", "-": "+"})
-        grid = [row[::-1].translate(swap) for row in reversed(grid)]
+        # Flip board visually but keep matrix coordinate labels
+        swap = {"+": "-", "-": "+"}
+        grid = [[swap.get(c, c) for c in row[::-1]] for row in reversed(grid)]
+        row_indices = list(reversed(row_indices))
+        col_indices = list(reversed(col_indices))
 
     header = f"TURN: {int(state.num_turns) + 1} PLAYER: {int(state.current_player)}"
     lines = ["<board_state>", header]
     if bool(state.is_jumping):
         lines.append("JUMP SEQUENCE ACTIVE")
-    lines.extend(grid)
+
+    # Column header with stacked tens/ones digits for alignment
+    tens_row = "   " + " ".join(str(c // 10) if c >= 10 else " " for c in col_indices)
+    ones_row = "   " + " ".join(str(c % 10) for c in col_indices)
+    lines.append(tens_row)
+    lines.append(ones_row)
+
+    # Board rows with row index on left only
+    for row_chars, row_idx in zip(grid, row_indices):
+        row_str = f"{row_idx:2d} " + " ".join(row_chars)
+        lines.append(row_str)
     lines.append("</board_state>")
+
+    # Ball position in matrix coordinates
+    ball_row, ball_col = int(state.ball_pos[0]), int(state.ball_pos[1])
+    lines.append(f"Ball at: ({ball_row}, {ball_col})")
+
     if int(state.winner) > 0:
         lines.append(f"Winner: {int(state.winner)}")
 

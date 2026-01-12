@@ -254,6 +254,71 @@ def run_tpu_profile():
     print(f"  At {sims_per_sec_full:,.0f} sims/sec: {train_moves * 32 / sims_per_sec_full:.0f}s per iteration")
 
 
+def profile_game_logic_vs_nn(env_config, network, params, batch_size=256):
+    """Time game logic vs NN separately."""
+    states = batched_reset(env_config, batch_size)
+    rng = jax.random.PRNGKey(0)
+    
+    # Dummy actions
+    actions = jnp.zeros(batch_size, dtype=jnp.int32)
+    
+    batched_step_fn = make_batched_step(env_config)
+    batched_legal_fn = make_batched_legal_actions(env_config)
+    batched_input_fn = make_batched_network_input(env_config)
+    
+    variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
+    
+    @jax.jit
+    def nn_forward(inputs):
+        return network.apply(variables, inputs, train=False)
+    
+    # Warmup
+    _ = batched_step_fn(states, actions).board.block_until_ready()
+    _ = batched_legal_fn(states).block_until_ready()
+    inputs = batched_input_fn(states)
+    _ = nn_forward(inputs)[0].block_until_ready()
+    
+    import time
+    N = 100
+    
+    # Time step
+    t0 = time.perf_counter()
+    for _ in range(N):
+        _ = batched_step_fn(states, actions)
+    _.board.block_until_ready()
+    t_step = (time.perf_counter() - t0) / N
+    
+    # Time legal actions
+    t0 = time.perf_counter()
+    for _ in range(N):
+        _ = batched_legal_fn(states)
+    _.block_until_ready()
+    t_legal = (time.perf_counter() - t0) / N
+    
+    # Time state conversion
+    t0 = time.perf_counter()
+    for _ in range(N):
+        inputs = batched_input_fn(states)
+    inputs.block_until_ready()
+    t_convert = (time.perf_counter() - t0) / N
+    
+    # Time NN
+    t0 = time.perf_counter()
+    for _ in range(N):
+        policy, value = nn_forward(inputs)
+    policy.block_until_ready()
+    t_nn = (time.perf_counter() - t0) / N
+    
+    total = t_step + t_legal + t_convert + t_nn
+    
+    print(f"\nPer-call timing (batch={batch_size}):")
+    print(f"  step:         {t_step*1000:6.2f}ms ({100*t_step/total:5.1f}%)")
+    print(f"  legal_actions:{t_legal*1000:6.2f}ms ({100*t_legal/total:5.1f}%)")
+    print(f"  state_convert:{t_convert*1000:6.2f}ms ({100*t_convert/total:5.1f}%)")
+    print(f"  NN forward:   {t_nn*1000:6.2f}ms ({100*t_nn/total:5.1f}%)")
+    print(f"  TOTAL:        {total*1000:6.2f}ms")
+
+
 def run_full_training_profile():
     """Benchmark at actual training config."""
     print("\n" + "=" * 60)
