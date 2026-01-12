@@ -34,6 +34,9 @@ from self_play_batched import (
     make_mcts_recurrent_fn,
     batched_mcts_policy,
     batched_reset,
+    make_batched_step,
+    make_batched_legal_actions,
+    make_batched_network_input,
 )
 
 
