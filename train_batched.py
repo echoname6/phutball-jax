@@ -1222,6 +1222,13 @@ class AlphaZeroTrainer:
             'value_pred_std': 0.0,
         }
 
+        # Sample probe batch to measure policy change before/after training
+        probe_batch = self.replay_buffer.sample(min(256, len(self.replay_buffer)))
+        probe_states = probe_batch['states']
+        variables = {'params': self.params, 'batch_stats': self.batch_stats}
+        old_logits, _ = self.network.apply(variables, probe_states, train=False)
+        old_probs = jax.nn.softmax(old_logits)
+
         # Curriculum statistics tracking
         curriculum_stats_sum = {
             'curriculum_1jump': 0,
@@ -1287,11 +1294,18 @@ class AlphaZeroTrainer:
         # Average metrics
         avg_metrics = {k: v / self.config.train_steps_per_iteration for k, v in metrics_sum.items()}
 
+        # Measure policy change: KL(old || new) on probe batch
+        variables = {'params': self.params, 'batch_stats': self.batch_stats}
+        new_logits, _ = self.network.apply(variables, probe_states, train=False)
+        new_probs = jax.nn.softmax(new_logits)
+        policy_kl = float(jnp.mean(jnp.sum(old_probs * (jnp.log(old_probs + 1e-8) - jnp.log(new_probs + 1e-8)), axis=-1)))
+        avg_metrics['policy_kl'] = policy_kl
+
         curriculum_pct = curriculum_ratio * 100
         print(f"  Training: {self.config.train_steps_per_iteration} steps "
               f"({steps_per_sec:.1f} steps/sec) | lr: {self.current_lr:.0e} | "
               f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
-              f"kl: {avg_metrics['kl_divergence']:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
+              f"policy_kl: {policy_kl:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
               f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
 
         # Add curriculum ratio and stats to metrics for logging
@@ -1444,6 +1458,7 @@ class AlphaZeroTrainer:
                     "train/policy_entropy": metrics["policy_entropy"],
                     "train/mcts_entropy": metrics["mcts_entropy"],
                     "train/kl_divergence": metrics["kl_divergence"],
+                    "train/policy_kl": metrics.get("policy_kl", 0),
                     "train/value_pred_mean": metrics["value_pred_mean"],
                     "train/value_pred_std": metrics["value_pred_std"],
                     "train/curriculum_ratio": metrics.get("curriculum_ratio", 0.0),
@@ -2712,6 +2727,17 @@ class ChimeraTrainer:
             'value_pred_mean': 0.0, 'value_pred_std': 0.0,
         }
 
+        # Sample probe batch to measure policy change before/after training
+        probe_board_key = list(self.env_configs.keys())[0]
+        probe_buffer = self.replay_buffers[probe_board_key]
+        probe_batch = probe_buffer.sample(min(256, len(probe_buffer)))
+        probe_states = probe_batch['states']
+
+        # Get old policy (before training)
+        variables = {'params': self.params, 'batch_stats': self.batch_stats}
+        old_logits, _ = self.network.apply(variables, probe_states, probe_board_key, train=False)
+        old_probs = jax.nn.softmax(old_logits)
+
         # Curriculum statistics tracking
         curriculum_stats_sum = {
             'curriculum_1jump': 0,
@@ -2824,9 +2850,17 @@ class ChimeraTrainer:
         avg_metrics['curriculum_ratio'] = curriculum_ratio
         avg_metrics.update(curriculum_stats_sum)
 
+        # Measure policy change: KL(old || new) on probe batch
+        variables = {'params': self.params, 'batch_stats': self.batch_stats}
+        new_logits, _ = self.network.apply(variables, probe_states, probe_board_key, train=False)
+        new_probs = jax.nn.softmax(new_logits)
+        # KL(old || new) = sum(old * log(old / new))
+        policy_kl = float(jnp.mean(jnp.sum(old_probs * (jnp.log(old_probs + 1e-8) - jnp.log(new_probs + 1e-8)), axis=-1)))
+        avg_metrics['policy_kl'] = policy_kl
+
         print(f"  Training: {self.config.train_steps_per_iteration} steps ({elapsed:.1f}s) | lr: {self.current_lr:.0e} | "
               f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
-              f"kl: {avg_metrics['kl_divergence']:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
+              f"policy_kl: {policy_kl:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
               f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
 
         return avg_metrics
@@ -2995,6 +3029,7 @@ class ChimeraTrainer:
                     "train/policy_entropy": metrics["policy_entropy"],
                     "train/mcts_entropy": metrics["mcts_entropy"],
                     "train/kl_divergence": metrics["kl_divergence"],
+                    "train/policy_kl": metrics.get("policy_kl", 0),
                     "train/value_pred_mean": metrics["value_pred_mean"],
                     "train/value_pred_std": metrics["value_pred_std"],
                     "train/curriculum_ratio": metrics.get("curriculum_ratio", 0),
