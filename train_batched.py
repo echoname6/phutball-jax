@@ -1289,7 +1289,7 @@ class AlphaZeroTrainer:
 
         curriculum_pct = curriculum_ratio * 100
         print(f"  Training: {self.config.train_steps_per_iteration} steps "
-              f"({steps_per_sec:.1f} steps/sec) | "
+              f"({steps_per_sec:.1f} steps/sec) | lr: {self.current_lr:.0e} | "
               f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
               f"kl: {avg_metrics['kl_divergence']:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
               f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
@@ -2824,7 +2824,7 @@ class ChimeraTrainer:
         avg_metrics['curriculum_ratio'] = curriculum_ratio
         avg_metrics.update(curriculum_stats_sum)
 
-        print(f"  Training: {self.config.train_steps_per_iteration} steps ({elapsed:.1f}s) | "
+        print(f"  Training: {self.config.train_steps_per_iteration} steps ({elapsed:.1f}s) | lr: {self.current_lr:.0e} | "
               f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
               f"kl: {avg_metrics['kl_divergence']:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
               f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
