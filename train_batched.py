@@ -2989,14 +2989,15 @@ class ChimeraTrainer:
 
         print(f"Added board size {board_key}. Now training on: {list(self.env_configs.keys())}")
 
-    def train(self):
+    def train(self, skip_auto_resume: bool = False):
         """Main training loop."""
-        # Auto-resume
-        existing = glob.glob(os.path.join(self.config.checkpoint_dir, "chimera_*.pkl"))
-        if existing:
-            latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-            self.load_checkpoint(latest)
-            self.iteration += 1
+        # Auto-resume (skip if caller already loaded a specific checkpoint)
+        if not skip_auto_resume:
+            existing = glob.glob(os.path.join(self.config.checkpoint_dir, "chimera_*.pkl"))
+            if existing:
+                latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                self.load_checkpoint(latest)
+                self.iteration += 1
 
         print("=" * 60)
         print("Chimera Training for Phutball")
