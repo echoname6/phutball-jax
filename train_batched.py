@@ -2265,6 +2265,10 @@ class ChimeraConfig:
     league_opponent_ratio: float = 0.5     # Fraction of games vs past opponent
     league_save_every: int = 5             # Save to pool every N iterations
 
+    # Random opponent mixing (decays as win rate vs random improves)
+    random_opponent_enabled: bool = False
+    random_opponent_initial_ratio: float = 0.25  # Start with 25% games vs random
+
 
 class ChimeraTrainer:
     """
@@ -2336,6 +2340,9 @@ class ChimeraTrainer:
 
         # League (past opponent pool)
         self.league_pool = []  # List of (iteration, params) tuples
+
+        # Random opponent tracking (best win rate seen, for monotonic decay)
+        self.best_win_rate_vs_random = 0.5  # Start at 50% (random level)
 
         # Wandb
         self.wandb_run = None
@@ -2443,6 +2450,13 @@ class ChimeraTrainer:
             league_opponent = self.get_league_opponent_params()
             league_ratio = self.config.league_opponent_ratio
 
+        # Calculate random opponent ratio (decays as win rate improves above 50%)
+        random_opp_ratio = 0.0
+        if self.config.random_opponent_enabled:
+            # Decay: full ratio at 50% win rate, 0 at 100%
+            excess = max(0.0, self.best_win_rate_vs_random - 0.5) / 0.5
+            random_opp_ratio = self.config.random_opponent_initial_ratio * (1.0 - excess)
+
         for _ in range(num_batches):
             self.rng, game_rng = jax.random.split(self.rng)
 
@@ -2458,6 +2472,7 @@ class ChimeraTrainer:
                 temp_threshold=self.config.temp_threshold,
                 temp_final=self.config.temp_final,
                 num_simulations=self.current_sims,
+                random_opponent_ratio=random_opp_ratio,
                 opponent_params=league_opponent,
                 opponent_ratio=league_ratio,
             )
@@ -2530,7 +2545,14 @@ class ChimeraTrainer:
         total_games = sum(s["games"] for s in stats_per_board.values())
         games_per_sec = total_games / elapsed if elapsed > 0 else 0
 
-        print(f"  Self-play: {total_examples} examples from {total_games} games ({games_per_sec:.2f} games/sec, {elapsed:.1f}s)")
+        # Calculate random opponent ratio for logging
+        random_ratio_str = ""
+        if self.config.random_opponent_enabled:
+            excess = max(0.0, self.best_win_rate_vs_random - 0.5) / 0.5
+            current_random_ratio = self.config.random_opponent_initial_ratio * (1.0 - excess)
+            random_ratio_str = f", rand_opp={current_random_ratio:.1%}"
+
+        print(f"  Self-play: {total_examples} examples from {total_games} games ({games_per_sec:.2f} games/sec, {elapsed:.1f}s){random_ratio_str}")
         for bk, s in stats_per_board.items():
             print(f"    {bk}: {s['examples']} ex | W1/W2/D={s['p1_wins']}/{s['p2_wins']}/{s['draws']} | "
                   f"moves={s['avg_moves']:.1f}, jump_seq={s['avg_jump_seq']:.2f}, "
@@ -2709,6 +2731,11 @@ class ChimeraTrainer:
         avg_win_rate = sum(win_rates.values()) / len(win_rates) if win_rates else 0.0
         print(f"  [Eval] Avg win rate: {avg_win_rate:.1%}")
         win_rates['avg'] = avg_win_rate
+
+        # Update best win rate for random opponent decay (monotonic)
+        if avg_win_rate > self.best_win_rate_vs_random:
+            self.best_win_rate_vs_random = avg_win_rate
+
         return win_rates
 
     def run_training(self) -> dict:
@@ -2886,6 +2913,7 @@ class ChimeraTrainer:
             'sims_doubled': self.sims_doubled,
             'current_lr': self.current_lr,
             'best_loss': self.best_loss,
+            'best_win_rate_vs_random': self.best_win_rate_vs_random,
         }
 
         with open(path, 'wb') as f:
@@ -2910,6 +2938,7 @@ class ChimeraTrainer:
         self.sims_doubled = checkpoint.get('sims_doubled', False)
         self.current_lr = checkpoint.get('current_lr', self.config.learning_rate)
         self.best_loss = checkpoint.get('best_loss', float('inf'))
+        self.best_win_rate_vs_random = checkpoint.get('best_win_rate_vs_random', 0.5)
 
         print(f"Loaded checkpoint from iteration {self.iteration} (sims={self.current_sims}, lr={self.current_lr:.2e})")
 
