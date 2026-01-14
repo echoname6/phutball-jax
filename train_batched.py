@@ -3051,6 +3051,13 @@ class ChimeraTrainer:
             print(f"  Iteration time: {iter_time:.1f}s")
 
             if self.config.use_wandb and self.wandb_run and metrics:
+                # Calculate current random opponent ratio for logging
+                if self.config.random_opponent_enabled:
+                    excess = max(0.0, self.best_win_rate_vs_random - 0.5) / 0.5
+                    current_random_ratio = self.config.random_opponent_initial_ratio * (1.0 - excess)
+                else:
+                    current_random_ratio = 0.0
+
                 log_data = {
                     "iteration": iteration,
                     "train/policy_loss": metrics["policy_loss"],
@@ -3069,6 +3076,8 @@ class ChimeraTrainer:
                     "train/curriculum_total": metrics.get("curriculum_total", 0),
                     "train/current_sims": self.current_sims,
                     "train/learning_rate": self.current_lr,
+                    "train/random_opp_ratio": current_random_ratio,
+                    "train/best_win_rate_vs_random": self.best_win_rate_vs_random,
                 }
                 for bk, stats in stats_per_board.items():
                     log_data[f"selfplay/{bk}/examples"] = stats["examples"]
