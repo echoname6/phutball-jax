@@ -2550,7 +2550,7 @@ class ChimeraTrainer:
         if self.config.random_opponent_enabled:
             excess = max(0.0, self.best_win_rate_vs_random - 0.5) / 0.5
             current_random_ratio = self.config.random_opponent_initial_ratio * (1.0 - excess)
-            random_ratio_str = f", rand_opp={current_random_ratio:.1%}"
+            random_ratio_str = f", rand_opp={current_random_ratio:.1%} (best_wr={self.best_win_rate_vs_random:.1%})"
 
         print(f"  Self-play: {total_examples} examples from {total_games} games ({games_per_sec:.2f} games/sec, {elapsed:.1f}s){random_ratio_str}")
         for bk, s in stats_per_board.items():
