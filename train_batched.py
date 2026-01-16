@@ -2269,6 +2269,10 @@ class ChimeraConfig:
     random_opponent_enabled: bool = False
     random_opponent_initial_ratio: float = 0.25  # Start with 25% games vs random
 
+    # Heartbeat notifications via ntfy.sh
+    ntfy_topic: Optional[str] = None           # e.g. "phutball-training"
+    heartbeat_minutes: int = 30                # Send heartbeat every N minutes (0 = disabled)
+
 
 class ChimeraTrainer:
     """
@@ -2357,6 +2361,30 @@ class ChimeraTrainer:
                     name=run_name,
                     config=asdict(config),
                 )
+
+        # Heartbeat tracking for ntfy notifications
+        self._last_heartbeat = time.time()
+
+    def _maybe_send_heartbeat(self):
+        """Send heartbeat notification via ntfy.sh if configured."""
+        if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
+            return
+
+        now = time.time()
+        if now - self._last_heartbeat >= self.config.heartbeat_minutes * 60:
+            try:
+                import requests
+                wr = getattr(self, 'best_win_rate_vs_random', 0)
+                requests.post(
+                    f"https://ntfy.sh/{self.config.ntfy_topic}",
+                    data=f"Iter {self.iteration}, WR={wr:.1%} - still running",
+                    headers={"Title": "Heartbeat", "Priority": "default"},
+                    timeout=10
+                )
+                print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
+            except Exception as e:
+                print(f"[ntfy] Heartbeat failed: {e}")
+            self._last_heartbeat = now
 
     def _init_network(self):
         """Initialize network parameters."""
@@ -3047,6 +3075,9 @@ class ChimeraTrainer:
             # Checkpoint
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
+
+            # Heartbeat notification
+            self._maybe_send_heartbeat()
 
             iter_time = time.time() - iter_start
             print(f"  Iteration time: {iter_time:.1f}s")
