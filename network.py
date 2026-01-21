@@ -1,14 +1,187 @@
 """
 Flax Neural Network for Phutball AlphaZero
 
-ResNet-style policy-value network.
+Includes:
+- ResNet-style policy-value network (CNN)
+- Transformer-based policy-value network
 """
 
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Sequence
+from typing import Sequence, Optional
 import optax
+
+
+# ============================================================================
+# Transformer Architecture
+# ============================================================================
+
+class TransformerBlock(nn.Module):
+    """Single transformer encoder block with pre-norm."""
+    d_model: int
+    n_heads: int
+    ffn_dim: int
+    dropout_rate: float = 0.0
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        # Pre-norm self-attention
+        y = nn.LayerNorm()(x)
+        y = nn.MultiHeadDotProductAttention(
+            num_heads=self.n_heads,
+            qkv_features=self.d_model,
+            dropout_rate=self.dropout_rate if train else 0.0,
+            deterministic=not train,
+        )(y, y)
+        x = x + y
+
+        # Pre-norm FFN
+        y = nn.LayerNorm()(x)
+        y = nn.Dense(self.ffn_dim)(y)
+        y = nn.gelu(y)
+        y = nn.Dense(self.d_model)(y)
+        x = x + y
+
+        return x
+
+
+class PhutballTransformer(nn.Module):
+    """
+    Transformer-based Policy-Value network for Phutball.
+
+    Input: (batch, channels, rows, cols) where channels = 6 (board + 5 jump layers)
+
+    Tokenization:
+    - Each cell (r, c) becomes a token with 8 dims:
+      [occupancy, jump_seq[0:5], row_enc, col_enc]
+    - Full board: (rows × cols, 8)
+
+    Architecture:
+    - Linear projection to d_model
+    - N transformer encoder blocks
+    - Per-cell policy heads (placement + jump)
+    - Global value head (mean pooling)
+    """
+    rows: int = 21
+    cols: int = 15
+    d_model: int = 128
+    n_layers: int = 4
+    n_heads: int = 4
+    ffn_dim: int = 256
+    dropout_rate: float = 0.0
+
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        """
+        Args:
+            x: Input (batch, 6, rows, cols) - board state + 5 jump layers
+        Returns:
+            policy_logits: (batch, 2 * rows * cols + 1)
+            value: (batch,)
+        """
+        batch_size = x.shape[0]
+        num_cells = self.rows * self.cols
+        action_space_size = 2 * num_cells + 1
+
+        # Transpose to (batch, rows, cols, channels)
+        x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
+
+        # Extract components:
+        # x[:, :, :, 0] = board occupancy (encoded as -1=ball, 0=empty, 1=man)
+        # x[:, :, :, 1:6] = jump sequence channels
+        occupancy = x[:, :, :, 0:1]  # (batch, rows, cols, 1)
+        jump_seq = x[:, :, :, 1:6]    # (batch, rows, cols, 5)
+
+        # Create positional encodings (normalized to [0, 1])
+        row_pos = jnp.arange(self.rows) / (self.rows - 1)  # (rows,)
+        col_pos = jnp.arange(self.cols) / (self.cols - 1)  # (cols,)
+
+        # Broadcast to (rows, cols)
+        row_enc = jnp.broadcast_to(row_pos[:, None], (self.rows, self.cols))
+        col_enc = jnp.broadcast_to(col_pos[None, :], (self.rows, self.cols))
+
+        # Add batch dimension and channel dimension
+        row_enc = jnp.broadcast_to(row_enc[None, :, :, None], (batch_size, self.rows, self.cols, 1))
+        col_enc = jnp.broadcast_to(col_enc[None, :, :, None], (batch_size, self.rows, self.cols, 1))
+
+        # Concatenate all features: (batch, rows, cols, 8)
+        tokens = jnp.concatenate([occupancy, jump_seq, row_enc, col_enc], axis=-1)
+
+        # Flatten spatial dims: (batch, rows * cols, 8)
+        tokens = tokens.reshape(batch_size, num_cells, 8)
+
+        # Linear projection to d_model: (batch, num_cells, d_model)
+        x = nn.Dense(self.d_model)(tokens)
+
+        # Transformer encoder blocks
+        for _ in range(self.n_layers):
+            x = TransformerBlock(
+                d_model=self.d_model,
+                n_heads=self.n_heads,
+                ffn_dim=self.ffn_dim,
+                dropout_rate=self.dropout_rate,
+            )(x, train=train)
+
+        # Final layer norm
+        x = nn.LayerNorm()(x)
+
+        # === Policy Head ===
+        # Per-cell outputs: (batch, num_cells, d_model) -> (batch, num_cells, 1)
+        placement_logits = nn.Dense(1)(x).squeeze(-1)  # (batch, num_cells)
+        jump_logits = nn.Dense(1)(x).squeeze(-1)       # (batch, num_cells)
+
+        # Global pooling for halt logit
+        pooled = jnp.mean(x, axis=1)  # (batch, d_model)
+        halt_logit = nn.Dense(1)(pooled).squeeze(-1)  # (batch,)
+
+        # Concatenate: [placements, jumps, halt]
+        policy_logits = jnp.concatenate([
+            placement_logits,  # (batch, num_cells)
+            jump_logits,       # (batch, num_cells)
+            halt_logit[:, None],  # (batch, 1)
+        ], axis=-1)  # (batch, 2 * num_cells + 1)
+
+        # === Value Head ===
+        value = nn.Dense(64)(pooled)
+        value = nn.gelu(value)
+        value = nn.Dense(1)(value)
+        value = nn.tanh(value).squeeze(-1)  # (batch,)
+
+        return policy_logits, value
+
+
+def create_transformer_network(
+    rows: int = 21,
+    cols: int = 15,
+    d_model: int = 128,
+    n_layers: int = 4,
+    n_heads: int = 4,
+    ffn_dim: int = 256,
+    dropout_rate: float = 0.0,
+) -> PhutballTransformer:
+    """Factory function to create transformer network."""
+    return PhutballTransformer(
+        rows=rows,
+        cols=cols,
+        d_model=d_model,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        ffn_dim=ffn_dim,
+        dropout_rate=dropout_rate,
+    )
+
+
+def init_transformer_network(rng, network: PhutballTransformer, num_input_channels: int = 6):
+    """Initialize transformer network parameters."""
+    dummy_input = jnp.zeros((1, num_input_channels, network.rows, network.cols))
+    variables = network.init(rng, dummy_input, train=False)
+    return variables
+
+
+# ============================================================================
+# CNN Architecture (Original)
+# ============================================================================
 
 
 class ResidualBlock(nn.Module):
@@ -633,15 +806,237 @@ def test_different_board_sizes():
         print(f"✓ {rows}x{cols}: policy shape {policy.shape}, value shape {value.shape}")
 
 
+def test_transformer_shapes():
+    """Test that transformer network produces correct output shapes."""
+    rows, cols = 21, 15
+    batch_size = 8
+    num_input_channels = 6
+    action_space_size = 2 * rows * cols + 1  # 631
+
+    # Create transformer network
+    network = create_transformer_network(
+        rows=rows, cols=cols,
+        d_model=128, n_layers=4, n_heads=4, ffn_dim=256
+    )
+
+    # Initialize
+    rng = jax.random.PRNGKey(42)
+    variables = init_transformer_network(rng, network, num_input_channels)
+
+    # Check params exist (no batch_stats for transformer - uses LayerNorm)
+    assert 'params' in variables, "Should have params"
+
+    params = variables['params']
+
+    # Create dummy input
+    dummy_input = jax.random.normal(rng, (batch_size, num_input_channels, rows, cols))
+
+    # Forward pass
+    policy_logits, values = network.apply(variables, dummy_input, train=False)
+
+    # Check shapes
+    assert policy_logits.shape == (batch_size, action_space_size), \
+        f"Policy shape: expected {(batch_size, action_space_size)}, got {policy_logits.shape}"
+    assert values.shape == (batch_size,), \
+        f"Value shape: expected {(batch_size,)}, got {values.shape}"
+
+    # Check value range (tanh output)
+    assert jnp.all(values >= -1) and jnp.all(values <= 1), \
+        f"Values should be in [-1, 1], got min={values.min()}, max={values.max()}"
+
+    # Check policy sums to 1 after softmax
+    policy_probs = jax.nn.softmax(policy_logits)
+    prob_sums = jnp.sum(policy_probs, axis=-1)
+    assert jnp.allclose(prob_sums, 1.0, atol=1e-5), \
+        f"Policy probs should sum to 1, got {prob_sums}"
+
+    print(f"✓ Transformer shapes correct")
+    print(f"  Policy: {policy_logits.shape}")
+    print(f"  Values: {values.shape}")
+    print(f"  Policy probs sum: {prob_sums[0]:.6f}")
+
+    # Count parameters
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(params))
+    print(f"  Total parameters: {param_count:,}")
+
+
+def test_transformer_training():
+    """Test transformer training step."""
+    rows, cols = 11, 9  # Smaller for faster test
+    batch_size = 4
+    num_input_channels = 6
+    action_space_size = 2 * rows * cols + 1
+
+    # Create network and optimizer
+    network = create_transformer_network(
+        rows=rows, cols=cols,
+        d_model=64, n_layers=2, n_heads=4, ffn_dim=128
+    )
+    optimizer = create_optimizer(learning_rate=0.001)
+
+    # Initialize
+    rng = jax.random.PRNGKey(42)
+    variables = init_transformer_network(rng, network, num_input_channels)
+    params = variables['params']
+    opt_state = optimizer.init(params)
+
+    # Create dummy batch
+    rng, key1, key2, key3 = jax.random.split(rng, 4)
+    dummy_states = jax.random.normal(key1, (batch_size, num_input_channels, rows, cols))
+
+    dummy_policy = jax.random.uniform(key2, (batch_size, action_space_size))
+    dummy_policy = dummy_policy / dummy_policy.sum(axis=-1, keepdims=True)
+
+    dummy_values = jax.random.uniform(key3, (batch_size,), minval=-1, maxval=1)
+
+    batch = {
+        'states': dummy_states,
+        'policy_targets': dummy_policy,
+        'value_targets': dummy_values,
+    }
+
+    # Define loss function for transformer (no batch_stats)
+    def compute_transformer_loss(params, network, batch):
+        states = batch['states']
+        policy_targets = batch['policy_targets']
+        value_targets = batch['value_targets']
+
+        policy_logits, value_preds = network.apply({'params': params}, states, train=True)
+
+        log_probs = jax.nn.log_softmax(policy_logits)
+        policy_loss = -jnp.mean(jnp.sum(policy_targets * log_probs, axis=-1))
+        value_loss = jnp.mean(jnp.square(value_preds - value_targets))
+
+        return policy_loss + value_loss
+
+    # JIT-compiled train step
+    @jax.jit
+    def train_step(params, opt_state, batch):
+        loss, grads = jax.value_and_grad(compute_transformer_loss)(params, network, batch)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss
+
+    # Run training steps
+    losses = []
+    for i in range(5):
+        params, opt_state, loss = train_step(params, opt_state, batch)
+        losses.append(float(loss))
+
+    print(f"✓ Transformer training runs")
+    print(f"  Losses: {[f'{l:.4f}' for l in losses]}")
+
+    assert all(l < 100 for l in losses), f"Loss exploded: {losses}"
+
+
+def benchmark_networks():
+    """Benchmark CNN vs Transformer performance."""
+    import time
+
+    rows, cols = 21, 15
+    batch_size = 32
+    num_input_channels = 6
+    num_warmup = 5
+    num_iterations = 50
+
+    rng = jax.random.PRNGKey(42)
+    dummy_input = jax.random.normal(rng, (batch_size, num_input_channels, rows, cols))
+
+    print(f"Board: {rows}x{cols}, Batch size: {batch_size}")
+    print(f"Warmup: {num_warmup}, Iterations: {num_iterations}")
+    print()
+
+    # === CNN Benchmark ===
+    print("=== CNN (PhutballNetwork) ===")
+    cnn = create_network(rows=rows, cols=cols, num_channels=64, num_res_blocks=6)
+    cnn_vars = init_network(rng, cnn, num_input_channels)
+    cnn_params = cnn_vars['params']
+    cnn_batch_stats = cnn_vars['batch_stats']
+
+    cnn_param_count = sum(x.size for x in jax.tree_util.tree_leaves(cnn_params))
+    print(f"Parameters: {cnn_param_count:,}")
+
+    # JIT compile
+    @jax.jit
+    def cnn_forward(params, batch_stats, x):
+        return predict(params, batch_stats, cnn, x)
+
+    # Warmup
+    for _ in range(num_warmup):
+        _ = cnn_forward(cnn_params, cnn_batch_stats, dummy_input)
+    jax.block_until_ready(cnn_forward(cnn_params, cnn_batch_stats, dummy_input))
+
+    # Benchmark
+    start = time.perf_counter()
+    for _ in range(num_iterations):
+        policy, value = cnn_forward(cnn_params, cnn_batch_stats, dummy_input)
+    jax.block_until_ready(policy)
+    cnn_time = (time.perf_counter() - start) / num_iterations * 1000
+    print(f"Inference: {cnn_time:.2f} ms/batch ({batch_size / cnn_time * 1000:.0f} samples/sec)")
+    print()
+
+    # === Transformer Benchmark ===
+    print("=== Transformer (PhutballTransformer) ===")
+    transformer = create_transformer_network(
+        rows=rows, cols=cols,
+        d_model=128, n_layers=4, n_heads=4, ffn_dim=256
+    )
+    transformer_vars = init_transformer_network(rng, transformer, num_input_channels)
+    transformer_params = transformer_vars['params']
+
+    transformer_param_count = sum(x.size for x in jax.tree_util.tree_leaves(transformer_params))
+    print(f"Parameters: {transformer_param_count:,}")
+
+    # JIT compile
+    @jax.jit
+    def transformer_forward(params, x):
+        return transformer.apply({'params': params}, x, train=False)
+
+    # Warmup
+    for _ in range(num_warmup):
+        _ = transformer_forward(transformer_params, dummy_input)
+    jax.block_until_ready(transformer_forward(transformer_params, dummy_input))
+
+    # Benchmark
+    start = time.perf_counter()
+    for _ in range(num_iterations):
+        policy, value = transformer_forward(transformer_params, dummy_input)
+    jax.block_until_ready(policy)
+    transformer_time = (time.perf_counter() - start) / num_iterations * 1000
+    print(f"Inference: {transformer_time:.2f} ms/batch ({batch_size / transformer_time * 1000:.0f} samples/sec)")
+    print()
+
+    # === Summary ===
+    print("=== Summary ===")
+    print(f"CNN:         {cnn_param_count:>10,} params, {cnn_time:>6.2f} ms/batch")
+    print(f"Transformer: {transformer_param_count:>10,} params, {transformer_time:>6.2f} ms/batch")
+    print(f"Speedup: {cnn_time / transformer_time:.2f}x" if transformer_time < cnn_time else f"Slowdown: {transformer_time / cnn_time:.2f}x")
+
+
 if __name__ == "__main__":
-    print("Testing Phutball Network...\n")
-    
-    test_network_shapes()
-    print()
-    
-    test_training_step()
-    print()
-    
-    test_different_board_sizes()
-    
-    print("\n✓ All network tests passed!")
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "benchmark":
+        print("Benchmarking Networks...\n")
+        benchmark_networks()
+    else:
+        print("Testing Phutball Network...\n")
+
+        print("=== CNN Tests ===")
+        test_network_shapes()
+        print()
+
+        test_training_step()
+        print()
+
+        test_different_board_sizes()
+        print()
+
+        print("=== Transformer Tests ===")
+        test_transformer_shapes()
+        print()
+
+        test_transformer_training()
+
+        print("\n✓ All network tests passed!")
+        print("\nRun 'python network.py benchmark' for performance comparison.")
