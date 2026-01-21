@@ -2510,6 +2510,9 @@ class TransformerTrainer:
         print("=" * 60)
         print()
 
+        # Send initial heartbeat at training start
+        self._maybe_send_heartbeat()
+
         for iteration in range(self.iteration, self.config.num_iterations):
             self.iteration = iteration
             iter_start = time.time()
