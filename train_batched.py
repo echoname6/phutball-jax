@@ -2041,8 +2041,8 @@ class TransformerTrainer:
                     mode=self.config.wandb_mode,
                 )
 
-        # Heartbeat tracking
-        self._last_heartbeat = time.time()
+        # Heartbeat tracking (0 = send immediately on first iteration)
+        self._last_heartbeat = 0
 
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
