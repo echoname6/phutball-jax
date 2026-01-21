@@ -26,6 +26,9 @@ from network import (
     # Chimera imports
     ChimeraNetwork, create_chimera_network, init_chimera_network,
     expand_chimera_network, make_chimera_train_step_fn, predict_chimera,
+    # Transformer imports
+    PhutballTransformer, create_transformer_network, init_transformer_network,
+    make_transformer_train_step_fn, predict_transformer,
 )
 from self_play_batched import (
     play_games_batched,
@@ -36,6 +39,9 @@ from self_play_batched import (
     play_vs_random_batched,
     batched_mcts_policy,
     batched_reset,
+    # Transformer MCTS
+    transformer_mcts_policy,
+    make_transformer_recurrent_fn,
 )
 
 
@@ -1950,6 +1956,600 @@ class AlphaZeroTrainer:
                 ratings[i] += K * (s_01 - e_01)
 
         return names, scores, games_mat, ratings, (W_mat, D_mat, L_mat)
+
+
+# ============================================================================
+# Transformer Trainer (no batch_stats - uses LayerNorm)
+# ============================================================================
+
+class TransformerTrainer:
+    """Training class for PhutballTransformer with batched self-play."""
+
+    def __init__(self, config: TrainConfig):
+        self.config = config
+
+        # Environment config
+        self.env_config = EnvConfig(rows=config.rows, cols=config.cols, max_turns=config.max_turns_per_game)
+
+        # Create transformer network
+        self.network = create_transformer_network(
+            rows=config.rows,
+            cols=config.cols,
+            d_model=config.num_channels,  # Reuse num_channels as d_model
+            n_layers=config.num_res_blocks,  # Reuse num_res_blocks as n_layers
+            n_heads=4,
+            ffn_dim=config.num_channels * 2,
+        )
+
+        # Optimizer
+        self.optimizer = create_optimizer(
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+
+        # Replay buffer
+        self.replay_buffer = ReplayBuffer(
+            max_size=config.buffer_size,
+            cols=config.cols,
+            augment_flip=True,
+        )
+
+        # Initialize random key
+        self.rng = jax.random.PRNGKey(42)
+
+        # Initialize network
+        self._init_network()
+
+        # Create JIT-compiled train step (no batch_stats)
+        self.train_step_fn = make_transformer_train_step_fn(self.network, self.optimizer)
+
+        # Metrics
+        self.iteration = 0
+        self.total_games = 0
+        self.total_examples = 0
+        self.metrics_history = []
+        self.last_self_play_stats = None
+
+        # LR decay tracking
+        self.current_lr = config.learning_rate
+        self.best_loss = float('inf')
+        self.iters_without_improvement = 0
+
+        self.wandb_run = None
+        if self.config.use_wandb:
+            if wandb is None:
+                print("WARNING: use_wandb=True but wandb is not installed; disabling wandb.")
+                self.config.use_wandb = False
+            else:
+                run_name = (
+                    self.config.wandb_run_name
+                    or f"phutball_transformer_{int(time.time())}"
+                )
+                cfg = asdict(self.config)
+                self.wandb_run = wandb.init(
+                    project=self.config.wandb_project,
+                    name=run_name,
+                    config=cfg,
+                    mode=self.config.wandb_mode,
+                )
+
+    def _init_network(self):
+        """Initialize network parameters (no batch_stats)."""
+        self.rng, init_rng = jax.random.split(self.rng)
+        variables = init_transformer_network(init_rng, self.network, num_input_channels=6)
+        self.params = variables['params']
+        self.opt_state = self.optimizer.init(self.params)
+
+    def get_network_params(self) -> dict:
+        """Get params dict for self-play (no batch_stats)."""
+        return {'network_params': self.params}
+
+    def _maybe_decay_lr(self, total_loss: float):
+        """Decay learning rate if loss has stalled."""
+        if not self.config.lr_decay_enabled:
+            return
+
+        if total_loss < self.best_loss:
+            self.best_loss = total_loss
+            self.iters_without_improvement = 0
+        else:
+            self.iters_without_improvement += 1
+
+        if self.iters_without_improvement >= self.config.lr_decay_patience:
+            new_lr = max(self.current_lr * self.config.lr_decay_factor, self.config.lr_min)
+            if new_lr < self.current_lr:
+                print(f"  [LR decay] Loss stalled for {self.config.lr_decay_patience} iters, "
+                      f"reducing LR: {self.current_lr:.2e} -> {new_lr:.2e}")
+                self.current_lr = new_lr
+                self.optimizer = create_optimizer(
+                    learning_rate=self.current_lr,
+                    weight_decay=self.config.weight_decay,
+                )
+                self.opt_state = self.optimizer.init(self.params)
+                self.train_step_fn = make_transformer_train_step_fn(self.network, self.optimizer)
+                self.iters_without_improvement = 0
+                self.best_loss = total_loss
+
+    def run_self_play(self) -> int:
+        """Run batched self-play games. Returns number of new examples."""
+        start_time = time.time()
+
+        total_states = []
+        total_policies = []
+        total_values = []
+
+        stats_totals = {
+            "num_games": 0,
+            "total_moves": 0,
+            "total_placements": 0,
+            "total_jumps": 0,
+            "num_jump_sequences": 0,
+            "sum_jump_sequence_lengths": 0,
+            "sum_jump_removed_tiles": 0,
+            "adjacency_opportunities": 0,
+            "adjacency_conversions": 0
+        }
+
+        p1_wins = 0
+        p2_wins = 0
+        draws = 0
+        vs_random_games = 0
+        self_play_games = 0
+
+        # Random opponent ratio
+        if self.config.random_opponent_enabled:
+            decay_progress = min(1.0, self.iteration / max(1, self.config.random_opponent_decay_iterations))
+            random_opp_ratio = (
+                self.config.random_opponent_initial_ratio
+                + (self.config.random_opponent_final_ratio - self.config.random_opponent_initial_ratio)
+                * decay_progress
+            )
+        else:
+            random_opp_ratio = 0.0
+
+        num_batches = self.config.games_per_iteration // self.config.batch_size_games
+
+        # Pre-create recurrent_fn for transformer
+        recurrent_fn = make_transformer_recurrent_fn(self.network, self.env_config)
+
+        for batch_idx in range(num_batches):
+            self.rng, game_rng = jax.random.split(self.rng)
+
+            # Play games using transformer MCTS
+            trajectory = play_games_batched(
+                params=self.get_network_params(),
+                rng=game_rng,
+                network=self.network,
+                env_config=self.env_config,
+                batch_size=self.config.batch_size_games,
+                max_turns=self.config.max_turns_per_game,
+                max_moves=self.config.max_moves_per_game,
+                temperature=self.config.temperature,
+                temp_threshold=self.config.temp_threshold,
+                temp_final=self.config.temp_final,
+                num_simulations=self.config.num_simulations,
+                random_opponent_ratio=random_opp_ratio,
+                mcts_policy_fn=transformer_mcts_policy,
+                recurrent_fn=recurrent_fn,
+            )
+
+            num_vs_random_this_batch = int(self.config.batch_size_games * random_opp_ratio)
+            if random_opp_ratio > 0 and num_vs_random_this_batch == 0:
+                num_vs_random_this_batch = 1
+            vs_random_games += num_vs_random_this_batch
+            self_play_games += self.config.batch_size_games - num_vs_random_this_batch
+
+            batch_stats = compute_phutball_stats(trajectory, self.env_config)
+            for k in stats_totals:
+                stats_totals[k] += batch_stats[k]
+
+            winners_np = np.array(trajectory.winners)
+            p1_wins += int(np.sum(winners_np == 1))
+            p2_wins += int(np.sum(winners_np == 2))
+            draws += int(np.sum(winners_np == 0))
+
+            states, policies, values = trajectory_to_training_examples(trajectory)
+
+            total_states.append(states)
+            total_policies.append(policies)
+            total_values.append(values)
+
+        # Concatenate all examples
+        if total_states:
+            all_states = np.concatenate(total_states, axis=0)
+            all_policies = np.concatenate(total_policies, axis=0)
+            all_values = np.concatenate(total_values, axis=0)
+
+            # Add to replay buffer
+            self.replay_buffer.add_batch(all_states, all_policies, all_values)
+
+            num_examples = len(all_states)
+            self.total_examples += num_examples
+        else:
+            num_examples = 0
+
+        num_games = num_batches * self.config.batch_size_games
+        self.total_games += num_games
+
+        elapsed = time.time() - start_time
+        games_per_sec = num_games / elapsed if elapsed > 0 else 0
+
+        # Compute and store stats
+        total_games_stats = stats_totals["num_games"]
+        if total_games_stats > 0:
+            avg_moves = stats_totals["total_moves"] / total_games_stats
+            avg_placements = stats_totals["total_placements"] / total_games_stats
+            avg_jumps = stats_totals["total_jumps"] / total_games_stats
+        else:
+            avg_moves = avg_placements = avg_jumps = 0
+
+        num_jump_seq = stats_totals["num_jump_sequences"]
+        if num_jump_seq > 0:
+            avg_jump_len = stats_totals["sum_jump_sequence_lengths"] / num_jump_seq
+            avg_jumped_tiles = stats_totals["sum_jump_removed_tiles"] / num_jump_seq
+        else:
+            avg_jump_len = avg_jumped_tiles = 0
+
+        adj_opp = stats_totals["adjacency_opportunities"]
+        adj_conv = stats_totals["adjacency_conversions"]
+        adjacency_conv_rate = adj_conv / adj_opp if adj_opp > 0 else 0
+
+        self.last_self_play_stats = {
+            "games_per_sec": games_per_sec,
+            "avg_moves": avg_moves,
+            "avg_placements": avg_placements,
+            "avg_jumps": avg_jumps,
+            "avg_jump_len": avg_jump_len,
+            "avg_jumped_tiles": avg_jumped_tiles,
+            "adjacency_conv_rate": adjacency_conv_rate,
+            "p1_wins": p1_wins,
+            "p2_wins": p2_wins,
+            "draws": draws,
+            "vs_random_games": vs_random_games,
+            "self_play_games": self_play_games,
+            "random_opponent_ratio": random_opp_ratio,
+        }
+
+        total_decided = p1_wins + p2_wins
+        win_spread = f"P1:{p1_wins} P2:{p2_wins} D:{draws}"
+        if total_decided > 0:
+            p1_pct = 100.0 * p1_wins / total_decided
+            p2_pct = 100.0 * p2_wins / total_decided
+            win_spread += f" ({p1_pct:.0f}%/{p2_pct:.0f}%)"
+
+        print(f"  Self-play: {num_games} games ({games_per_sec:.1f} g/s), "
+              f"{num_examples} examples | {win_spread}")
+        print(f"    avg moves: {avg_moves:.1f}, placements: {avg_placements:.1f}, "
+              f"jumps: {avg_jumps:.1f}, jump_len: {avg_jump_len:.2f}, "
+              f"removed: {avg_jumped_tiles:.2f}, adj_conv: {adjacency_conv_rate:.1%}")
+
+        return num_examples
+
+    def get_curriculum_ratio(self) -> float:
+        """Get current curriculum mix ratio based on iteration."""
+        if not self.config.curriculum_enabled:
+            return 0.0
+        if self.iteration >= self.config.curriculum_decay_iterations:
+            return self.config.curriculum_final_ratio
+        progress = self.iteration / self.config.curriculum_decay_iterations
+        ratio = self.config.curriculum_initial_ratio + progress * (
+            self.config.curriculum_final_ratio - self.config.curriculum_initial_ratio
+        )
+        return ratio
+
+    def run_training(self) -> dict:
+        """Run training steps. Returns average metrics."""
+        if len(self.replay_buffer) < self.config.min_buffer_size:
+            print(f"  Skipping training: buffer has {len(self.replay_buffer)}/{self.config.min_buffer_size} examples")
+            return {}
+
+        start_time = time.time()
+        metrics_sum = {
+            'policy_loss': 0.0,
+            'value_loss': 0.0,
+            'total_loss': 0.0,
+            'policy_entropy': 0.0,
+            'mcts_entropy': 0.0,
+            'kl_divergence': 0.0,
+            'value_pred_mean': 0.0,
+            'value_pred_std': 0.0,
+        }
+
+        # Probe batch for policy change measurement (no batch_stats)
+        probe_batch = self.replay_buffer.sample(min(256, len(self.replay_buffer)))
+        probe_states = probe_batch['states']
+        variables = {'params': self.params}
+        old_logits, _ = self.network.apply(variables, probe_states, train=False)
+        old_probs = jax.nn.softmax(old_logits)
+
+        # Curriculum stats
+        curriculum_stats_sum = {
+            'curriculum_1jump': 0,
+            'curriculum_2jump': 0,
+            'curriculum_3jump': 0,
+            'curriculum_4jump': 0,
+            'curriculum_total': 0,
+        }
+
+        curriculum_ratio = self.get_curriculum_ratio()
+        curriculum_size = int(self.config.batch_size_train * curriculum_ratio)
+        replay_size = self.config.batch_size_train - curriculum_size
+
+        for step_idx in range(self.config.train_steps_per_iteration):
+            self.rng, step_rng, curriculum_rng = jax.random.split(self.rng, 3)
+
+            # Sample from replay buffer
+            if replay_size > 0:
+                replay_batch = self.replay_buffer.sample(replay_size)
+                states = replay_batch['states']
+                policies = replay_batch['policy_targets']
+                values = replay_batch['value_targets']
+            else:
+                states = np.empty((0, 6, self.config.rows, self.config.cols), dtype=np.float32)
+                policies = np.empty((0, 2 * self.config.rows * self.config.cols + 1), dtype=np.float32)
+                values = np.empty((0,), dtype=np.float32)
+
+            # Generate curriculum examples
+            if curriculum_size > 0:
+                curr_states, curr_policies, curr_values, curr_stats = generate_curriculum_batch(
+                    curriculum_rng, self.env_config, curriculum_size,
+                    jump_distribution=list(self.config.curriculum_jump_distribution),
+                    return_stats=True
+                )
+                for k, v in curr_stats.items():
+                    curriculum_stats_sum[k] += v
+                states = np.concatenate([states, curr_states], axis=0)
+                policies = np.concatenate([policies, curr_policies], axis=0)
+                values = np.concatenate([values, curr_values], axis=0)
+
+            batch = {
+                'states': states,
+                'policy_targets': policies,
+                'value_targets': values,
+            }
+
+            # Train step (no batch_stats)
+            self.params, self.opt_state, metrics = self.train_step_fn(
+                self.params, self.opt_state, batch, step_rng
+            )
+
+            for k, v in metrics.items():
+                metrics_sum[k] += float(v)
+
+        elapsed = time.time() - start_time
+        steps_per_sec = self.config.train_steps_per_iteration / elapsed
+
+        avg_metrics = {k: v / self.config.train_steps_per_iteration for k, v in metrics_sum.items()}
+
+        # Policy change measurement (no batch_stats)
+        variables = {'params': self.params}
+        new_logits, _ = self.network.apply(variables, probe_states, train=False)
+        new_probs = jax.nn.softmax(new_logits)
+        policy_kl = float(jnp.mean(jnp.sum(old_probs * (jnp.log(old_probs + 1e-8) - jnp.log(new_probs + 1e-8)), axis=-1)))
+        avg_metrics['policy_kl'] = policy_kl
+
+        curriculum_pct = curriculum_ratio * 100
+        print(f"  Training: {self.config.train_steps_per_iteration} steps "
+              f"({steps_per_sec:.1f} steps/sec) | lr: {self.current_lr:.0e} | "
+              f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
+              f"policy_kl: {policy_kl:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
+              f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
+
+        avg_metrics['curriculum_ratio'] = curriculum_ratio
+        avg_metrics.update(curriculum_stats_sum)
+
+        return avg_metrics
+
+    def save_checkpoint(self, path: Optional[str] = None):
+        """Save model checkpoint (no batch_stats)."""
+        if path is None:
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            path = os.path.join(self.config.checkpoint_dir, f"checkpoint_{self.iteration:06d}.pkl")
+
+        checkpoint = {
+            'params': self.params,
+            'opt_state': self.opt_state,
+            'iteration': self.iteration,
+            'total_games': self.total_games,
+            'total_examples': self.total_examples,
+            'config': self.config,
+            'metrics_history': self.metrics_history,
+            'network_type': 'transformer',
+        }
+
+        with open(path, 'wb') as f:
+            pickle.dump(checkpoint, f)
+
+        print(f"  Saved checkpoint: {path}")
+
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint (no batch_stats)."""
+        with open(path, 'rb') as f:
+            checkpoint = pickle.load(f)
+
+        self.params = checkpoint['params']
+        self.opt_state = checkpoint['opt_state']
+        self.iteration = checkpoint['iteration']
+        self.total_games = checkpoint['total_games']
+        self.total_examples = checkpoint['total_examples']
+        self.metrics_history = checkpoint.get('metrics_history', [])
+
+        print(f"Loaded checkpoint from iteration {self.iteration}")
+
+    def evaluate_vs_random_batched(self):
+        """Evaluate current checkpoint vs random."""
+        self.rng, eval_rng = jax.random.split(self.rng)
+
+        # Create transformer recurrent_fn for evaluation
+        recurrent_fn = make_transformer_recurrent_fn(self.network, self.env_config)
+
+        (
+            p1_wins, p1_draws, p1_losses,
+            p2_wins, p2_draws, p2_losses,
+            turns,
+        ) = play_vs_random_batched(
+            checkpoint_params=self.get_network_params(),
+            rng=eval_rng,
+            network=self.network,
+            env_config=self.env_config,
+            num_games=self.config.eval_vs_random_games,
+            max_moves=self.config.eval_max_moves,
+            num_simulations=self.config.eval_num_simulations,
+            temperature=self.config.eval_temperature,
+            mcts_policy_fn=transformer_mcts_policy,
+            recurrent_fn=recurrent_fn,
+        )
+
+        p1_wins = int(p1_wins)
+        p1_draws = int(p1_draws)
+        p1_losses = int(p1_losses)
+        p2_wins = int(p2_wins)
+        p2_draws = int(p2_draws)
+        p2_losses = int(p2_losses)
+
+        total_p1 = p1_wins + p1_draws + p1_losses
+        total_p2 = p2_wins + p2_draws + p2_losses
+        total = total_p1 + total_p2
+
+        total_wins = p1_wins + p2_wins
+        total_draws = p1_draws + p2_draws
+        total_losses = p1_losses + p2_losses
+
+        win_rate_overall = total_wins / total if total > 0 else 0.0
+        draw_rate_overall = total_draws / total if total > 0 else 0.0
+        loss_rate_overall = total_losses / total if total > 0 else 0.0
+
+        win_rate_p1 = p1_wins / total_p1 if total_p1 > 0 else 0.0
+        win_rate_p2 = p2_wins / total_p2 if total_p2 > 0 else 0.0
+
+        score_overall = (total_wins - total_losses) / total if total > 0 else 0.0
+        score_p1 = (p1_wins - p1_losses) / total_p1 if total_p1 > 0 else 0.0
+        score_p2 = (p2_wins - p2_losses) / total_p2 if total_p2 > 0 else 0.0
+        side_bias = score_p1 - score_p2
+
+        avg_turns = float(jnp.mean(turns))
+
+        print(
+            "  [eval] vs random (side-aware):\n"
+            f"    as P1: {p1_wins}-{p1_draws}-{p1_losses} "
+            f"(win: {win_rate_p1:.1%}, score: {score_p1:.3f})\n"
+            f"    as P2: {p2_wins}-{p2_draws}-{p2_losses} "
+            f"(win: {win_rate_p2:.1%}, score: {score_p2:.3f})\n"
+            f"    combined: win {win_rate_overall:.1%}, draw {draw_rate_overall:.1%}, "
+            f"loss {loss_rate_overall:.1%}, score {score_overall:.3f}, "
+            f"side_bias {side_bias:.3f}, avg turns {avg_turns:.1f}"
+        )
+
+        stats = {
+            "total_games": total,
+            "overall": {
+                "wins": total_wins,
+                "draws": total_draws,
+                "losses": total_losses,
+                "win_rate": win_rate_overall,
+                "draw_rate": draw_rate_overall,
+                "loss_rate": loss_rate_overall,
+                "score": score_overall,
+            },
+            "p1": {"wins": p1_wins, "draws": p1_draws, "losses": p1_losses, "win_rate": win_rate_p1, "score": score_p1},
+            "p2": {"wins": p2_wins, "draws": p2_draws, "losses": p2_losses, "win_rate": win_rate_p2, "score": score_p2},
+            "side_bias": side_bias,
+            "avg_turns": avg_turns,
+        }
+
+        return win_rate_overall, stats
+
+    def train(self):
+        """Main training loop."""
+        existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
+        if existing:
+            latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+            self.load_checkpoint(latest)
+            self.iteration += 1
+
+        print(f"Resuming from iteration {self.iteration}")
+        print("=" * 60)
+        print("Transformer Training for Phutball (Batched)")
+        print("=" * 60)
+        print(f"Board: {self.config.rows}x{self.config.cols}")
+        print(f"Network: d_model={self.config.num_channels}, n_layers={self.config.num_res_blocks}")
+        print(f"Self-play: {self.config.games_per_iteration} games/iter (batch={self.config.batch_size_games})")
+        print(f"Training: {self.config.train_steps_per_iteration} steps/iter (batch={self.config.batch_size_train})")
+        print(f"Temperature: {self.config.temperature} -> {self.config.temp_final} after {self.config.temp_threshold} moves")
+        print(f"Devices: {jax.devices()}")
+        print("=" * 60)
+        print()
+
+        for iteration in range(self.iteration, self.config.num_iterations):
+            self.iteration = iteration
+            iter_start = time.time()
+
+            print(f"Iteration {iteration + 1}/{self.config.num_iterations}")
+            print("-" * 40)
+
+            num_examples = self.run_self_play()
+            metrics = self.run_training()
+
+            if metrics:
+                self.metrics_history.append({
+                    'iteration': iteration,
+                    'total_games': self.total_games,
+                    'total_examples': self.total_examples,
+                    'buffer_size': len(self.replay_buffer),
+                    **metrics,
+                })
+                total_loss = metrics.get('total_loss', metrics.get('policy_loss', 0) + metrics.get('value_loss', 0))
+                self._maybe_decay_lr(total_loss)
+
+            if (iteration + 1) % self.config.checkpoint_every == 0:
+                self.save_checkpoint()
+
+                if self.config.eval_enable:
+                    win_rate, stats = self.evaluate_vs_random_batched()
+                    threshold = self.config.eval_vs_random_threshold
+                    if threshold is not None:
+                        if win_rate >= threshold:
+                            print(f"  [eval] Win rate {win_rate:.1%} >= {threshold:.0%}")
+                        else:
+                            print(f"  [eval] Win rate {win_rate:.1%} < {threshold:.0%}")
+                        if self.config.stop_when_beating_random and win_rate >= threshold:
+                            print(f"  [train] Reached threshold, stopping training early.")
+                            break
+
+            iter_time = time.time() - iter_start
+            print(f"  Iteration time: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)} examples")
+            print()
+
+            if metrics and self.config.use_wandb and self.wandb_run is not None:
+                global_step = (iteration + 1) * self.config.train_steps_per_iteration
+                log_data = {
+                    "iteration": iteration,
+                    "total_games": self.total_games,
+                    "total_examples": self.total_examples,
+                    "buffer_size": len(self.replay_buffer),
+                    "selfplay/examples_per_iter": num_examples,
+                    "train/policy_loss": metrics["policy_loss"],
+                    "train/value_loss": metrics["value_loss"],
+                    "train/total_loss": metrics["total_loss"],
+                    "train/policy_entropy": metrics["policy_entropy"],
+                    "train/mcts_entropy": metrics["mcts_entropy"],
+                    "train/kl_divergence": metrics["kl_divergence"],
+                    "train/policy_kl": metrics.get("policy_kl", 0),
+                    "train/value_pred_mean": metrics["value_pred_mean"],
+                    "train/value_pred_std": metrics["value_pred_std"],
+                    "train/curriculum_ratio": metrics.get("curriculum_ratio", 0.0),
+                    "time/iteration_sec": iter_time,
+                }
+                if self.last_self_play_stats is not None:
+                    for k, v in self.last_self_play_stats.items():
+                        log_data[f"selfplay/{k}"] = v
+                wandb.log(log_data, step=global_step)
+
+        self.save_checkpoint()
+        print("Training complete!")
+        print(f"Total games: {self.total_games}")
+        print(f"Total examples: {self.total_examples}")
+
 
 def compute_elo_from_results(
     names: List[str],

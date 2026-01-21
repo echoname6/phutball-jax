@@ -18,7 +18,7 @@ from phutball_env_jax import (
     MAX_JUMP_SEQUENCE_LENGTH,
     MAN, BALL, EMPTY, END_HI, END_LO
 )
-from network import PhutballNetwork, predict
+from network import PhutballNetwork, PhutballTransformer, predict, predict_transformer
 
 import mctx
 
@@ -240,6 +240,174 @@ def batched_mcts_policy(
     return actions, mcts_policy, root_values
 
 
+# ============================================================================
+# Transformer variants (no batch_stats)
+# ============================================================================
+
+def make_transformer_recurrent_fn(network: PhutballTransformer, env_config: EnvConfig):
+    """Create recurrent function for mctx that uses Transformer (no batch_stats)."""
+
+    rows, cols = env_config.rows, env_config.cols
+    action_space_size = 2 * rows * cols + 1
+
+    def recurrent_fn(params, rng, action, embedding):
+        """
+        Args:
+            params: Network params dict (only 'network_params', no 'batch_stats')
+            rng: Random key (unused - env is deterministic)
+            action: Actions to take, shape (batch_size,)
+            embedding: Current PhutballState (batched)
+
+        Returns:
+            RecurrentFnOutput, new_embedding
+        """
+        # Step the environment
+        def single_step(state, act):
+            return step(state, act, env_config)
+
+        next_states = jax.vmap(single_step)(embedding, action)
+
+        # Convert to network input
+        network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(next_states)
+
+        # Get network predictions (no batch_stats)
+        variables = {'params': params['network_params']}
+        policy_logits, values = network.apply(variables, network_inputs, train=False)
+
+        # Get legal action mask
+        def single_legal(state):
+            return get_legal_actions(state, env_config)
+
+        legal_mask = jax.vmap(single_legal)(next_states)
+
+        # Mask illegal actions
+        masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+
+        # Check for terminal states
+        terminated = next_states.terminated
+
+        # Discount: 1 for ongoing, 0 for terminal
+        discount = jnp.where(terminated, 0.0, 1.0)
+
+        # For terminal states, compute value from current_player's perspective.
+        terminal_value = jnp.where(
+            next_states.winner == next_states.current_player,
+            1.0,
+            jnp.where(next_states.winner == 0, 0.0, -1.0)
+        )
+        values = jnp.where(terminated, terminal_value, values)
+
+        recurrent_output = mctx.RecurrentFnOutput(
+            reward=jnp.zeros_like(values),
+            discount=discount,
+            prior_logits=masked_logits,
+            value=values,
+        )
+
+        return recurrent_output, next_states
+
+    return recurrent_fn
+
+
+def transformer_mcts_policy(
+    params: dict,
+    states: PhutballState,
+    rng: jnp.ndarray,
+    network: PhutballTransformer,
+    env_config: EnvConfig,
+    num_simulations: int = 50,
+    temperature: float = 1.0,
+    dirichlet_alpha: float = 0.3,
+    dirichlet_fraction: float = 0.25,
+    max_num_considered_actions: int = 32,
+    recurrent_fn=None,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Get MCTS-improved policy for a batch of states using Transformer (no batch_stats).
+
+    Returns:
+        actions: (batch,) selected actions
+        policies: (batch, action_space) MCTS visit count policies
+        values: (batch,) root value estimates
+    """
+    rows, cols = env_config.rows, env_config.cols
+    action_space_size = 2 * rows * cols + 1
+    batch_size = states.board.shape[0]
+
+    # Convert states to network input for root evaluation
+    network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(states)
+
+    # Get root network predictions (no batch_stats)
+    variables = {'params': params['network_params']}
+    policy_logits, values = network.apply(variables, network_inputs, train=False)
+
+    # Get legal action mask
+    def single_legal(state):
+        return get_legal_actions(state, env_config)
+
+    legal_mask = jax.vmap(single_legal)(states)
+    masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
+
+    rng, noise_rng = jax.random.split(rng)
+
+    priors = jax.nn.softmax(masked_logits, axis=-1)
+
+    # Sample Dirichlet noise for each state in batch
+    noise_rngs = jax.random.split(noise_rng, batch_size)
+    noise = jax.vmap(
+        lambda r: jax.random.dirichlet(r, jnp.full(action_space_size, dirichlet_alpha))
+    )(noise_rngs)
+
+    # Mix: (1 - ε) * prior + ε * noise, but only on legal actions
+    noisy_priors = (1 - dirichlet_fraction) * priors + dirichlet_fraction * noise
+    noisy_priors = jnp.where(legal_mask == 1, noisy_priors, 0.0)
+    noisy_priors = noisy_priors / (noisy_priors.sum(axis=-1, keepdims=True) + 1e-8)
+
+    noisy_logits = jnp.log(noisy_priors + 1e-8)
+    noisy_logits = jnp.where(legal_mask == 1, noisy_logits, -1e9)
+
+    root = mctx.RootFnOutput(
+        prior_logits=noisy_logits,
+        value=values,
+        embedding=states,
+    )
+
+    # Use pre-created recurrent_fn if provided, otherwise create one
+    if recurrent_fn is None:
+        recurrent_fn = make_transformer_recurrent_fn(network, env_config)
+
+    rng, mcts_rng = jax.random.split(rng)
+    policy_output = mctx.gumbel_muzero_policy(
+        params=params,
+        rng_key=mcts_rng,
+        root=root,
+        recurrent_fn=recurrent_fn,
+        num_simulations=num_simulations,
+        max_num_considered_actions=max_num_considered_actions,
+        gumbel_scale=1.0,
+    )
+
+    mcts_policy = policy_output.action_weights
+
+    root_values = policy_output.search_tree.node_values[:, 0]
+
+    rng, sample_rng = jax.random.split(rng)
+
+    # Always compute both paths, select with jnp.where (JAX-traceable)
+    greedy_actions = jnp.argmax(mcts_policy, axis=-1)
+
+    # Safe temperature division (avoid div by zero)
+    safe_temp = jnp.maximum(temperature, 1e-8)
+    logits = jnp.log(mcts_policy + 1e-8) / safe_temp
+    sample_rngs = jax.random.split(sample_rng, batch_size)
+    sampled_actions = jax.vmap(lambda r, l: jax.random.categorical(r, l))(sample_rngs, logits)
+
+    # Select based on temperature
+    actions = jnp.where(temperature < 0.01, greedy_actions, sampled_actions)
+
+    return actions, mcts_policy, root_values
+
+
 @partial(jax.jit, static_argnums=(3, 4, 5))
 def batched_network_policy(
     params: dict,
@@ -333,6 +501,8 @@ def play_games_batched(
     random_opponent_ratio: float = 0.0,  # Fraction of games vs random opponent
     opponent_params: dict = None,  # If provided, use for P2 (league play)
     opponent_ratio: float = 0.0,  # Fraction of games vs opponent_params
+    mcts_policy_fn=None,  # Custom MCTS policy function (for transformer)
+    recurrent_fn=None,  # Pre-created recurrent_fn (for transformer)
 ) -> TrajectoryData:
     """
     Play multiple games in parallel with optional random/league opponents.
@@ -412,7 +582,15 @@ def play_games_batched(
         return get_legal_actions(state, env_config)
 
     # Pre-create recurrent_fn once to avoid recompilation inside the loop
-    mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config) if use_mcts else None
+    if recurrent_fn is not None:
+        mcts_recurrent_fn = recurrent_fn
+    elif use_mcts:
+        mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+    else:
+        mcts_recurrent_fn = None
+
+    # Use provided mcts_policy_fn or default to batched_mcts_policy
+    _mcts_policy_fn = mcts_policy_fn if mcts_policy_fn is not None else batched_mcts_policy
 
     # Play loop - now takes step_idx for temperature scheduling
     def game_step(carry, _):
@@ -455,14 +633,14 @@ def play_games_batched(
 
         if use_mcts:
             # Use MCTS to get improved policy (main network)
-            actions_net, policies_net, values = batched_mcts_policy(
+            actions_net, policies_net, values = _mcts_policy_fn(
                 params, env_states, step_rng, network, env_config,
                 num_simulations=num_simulations, temperature=effective_temp,
                 recurrent_fn=mcts_recurrent_fn,
             )
             # League opponent MCTS (if needed)
             if opponent_params is not None:
-                actions_league, policies_league, _ = batched_mcts_policy(
+                actions_league, policies_league, _ = _mcts_policy_fn(
                     opponent_params, env_states, step_rng, network, env_config,
                     num_simulations=num_simulations, temperature=effective_temp,
                     recurrent_fn=mcts_recurrent_fn,
@@ -796,7 +974,6 @@ def play_match_batched(
     )
 
 
-@partial(jax.jit, static_argnums=(2, 3, 4, 5, 6, 7))
 def play_vs_random_batched(
     checkpoint_params: dict,
     rng: jnp.ndarray,
@@ -806,6 +983,8 @@ def play_vs_random_batched(
     max_moves: int,
     num_simulations: int,
     temperature: float = 0.0,
+    mcts_policy_fn=None,  # Custom MCTS policy function (for transformer)
+    recurrent_fn=None,  # Pre-created recurrent_fn (for transformer)
 ):
     """
     Play checkpoint vs random policy.
@@ -842,7 +1021,13 @@ def play_vs_random_batched(
     step0 = jnp.int32(0)
 
     # Pre-create recurrent_fn once to avoid recompilation inside the loop
-    mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+    if recurrent_fn is not None:
+        mcts_recurrent_fn = recurrent_fn
+    else:
+        mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+
+    # Use provided mcts_policy_fn or default to batched_mcts_policy
+    _mcts_policy_fn = mcts_policy_fn if mcts_policy_fn is not None else batched_mcts_policy
 
     def cond_fn(carry):
         states, terminated, rng, step_idx = carry
@@ -864,7 +1049,7 @@ def play_vs_random_batched(
         rng, rng_ckpt, rng_rand = jax.random.split(rng, 3)
 
         # Get checkpoint actions via MCTS
-        actions_ckpt, _, _ = batched_mcts_policy(
+        actions_ckpt, _, _ = _mcts_policy_fn(
             checkpoint_params,
             states,
             rng_ckpt,

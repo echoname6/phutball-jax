@@ -641,10 +641,94 @@ def make_train_step_fn(network, optimizer):
     return _train_step
 
 
+def compute_loss_transformer(params, network, batch, rng):
+    """
+    Compute AlphaZero loss for Transformer (no batch_stats).
+
+    Args:
+        params: Network parameters
+        network: PhutballTransformer instance
+        batch: Dict with 'states', 'policy_targets', 'value_targets'
+        rng: Random key (for dropout if used)
+
+    Returns:
+        total_loss: Combined loss
+        metrics: Dict of loss components
+    """
+    states = batch['states']
+    policy_targets = batch['policy_targets']
+    value_targets = batch['value_targets']
+
+    # Forward pass (no mutable state for LayerNorm)
+    variables = {'params': params}
+    policy_logits, value_preds = network.apply(variables, states, train=True)
+
+    # Policy loss: cross-entropy with MCTS policy targets
+    log_probs = jax.nn.log_softmax(policy_logits)
+    policy_loss = -jnp.mean(jnp.sum(policy_targets * log_probs, axis=-1))
+
+    # Value loss: MSE between predicted value and game outcome
+    value_loss = jnp.mean(jnp.square(value_preds - value_targets))
+
+    # Total loss
+    total_loss = policy_loss + value_loss
+
+    # Policy entropy (network output)
+    probs = jax.nn.softmax(policy_logits)
+    entropy = -jnp.mean(jnp.sum(probs * log_probs, axis=-1))
+
+    # KL divergence
+    mcts_entropy = -jnp.sum(policy_targets * jnp.log(policy_targets + 1e-8), axis=-1)
+    kl_div = jnp.mean(-mcts_entropy - jnp.sum(policy_targets * log_probs, axis=-1))
+
+    # Value prediction stats
+    value_pred_mean = jnp.mean(value_preds)
+    value_pred_std = jnp.std(value_preds)
+
+    metrics = {
+        'policy_loss': policy_loss,
+        'value_loss': value_loss,
+        'total_loss': total_loss,
+        'policy_entropy': entropy,
+        'mcts_entropy': jnp.mean(mcts_entropy),
+        'kl_divergence': kl_div,
+        'value_pred_mean': value_pred_mean,
+        'value_pred_std': value_pred_std,
+    }
+
+    return total_loss, metrics
+
+
+def make_transformer_train_step_fn(network, optimizer):
+    """Create a JIT-compiled train step function for Transformer (no batch_stats)."""
+
+    @jax.jit
+    def _train_step(params, opt_state, batch, rng):
+        def loss_fn(p):
+            return compute_loss_transformer(p, network, batch, rng)
+
+        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        return new_params, new_opt_state, metrics
+
+    return _train_step
+
+
+def predict_transformer(params, network, states):
+    """Run inference for Transformer (no batch_stats)."""
+    variables = {'params': params}
+    policy_logits, values = network.apply(variables, states, train=False)
+    policy_probs = jax.nn.softmax(policy_logits)
+    return policy_probs, values
+
+
 def predict(params, batch_norm_state, network, states):
     """
     Run inference (no gradients, uses running BN stats).
-    
+
     Args:
         params: Network parameters
         batch_norm_state: BatchNorm running statistics
