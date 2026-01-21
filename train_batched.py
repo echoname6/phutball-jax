@@ -928,6 +928,10 @@ class TrainConfig:
     wandb_run_name: Optional[str] = None
     wandb_mode: str = "online"
 
+    # Heartbeat notifications via ntfy.sh
+    ntfy_topic: Optional[str] = None
+    heartbeat_minutes: int = 30
+
 
 class AlphaZeroTrainer:
     """Main training class with batched self-play."""
@@ -2037,6 +2041,28 @@ class TransformerTrainer:
                     mode=self.config.wandb_mode,
                 )
 
+        # Heartbeat tracking
+        self._last_heartbeat = time.time()
+
+    def _maybe_send_heartbeat(self):
+        """Send heartbeat notification via ntfy.sh if configured."""
+        if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
+            return
+        now = time.time()
+        if now - self._last_heartbeat >= self.config.heartbeat_minutes * 60:
+            try:
+                import requests
+                requests.post(
+                    f"https://ntfy.sh/{self.config.ntfy_topic}",
+                    data=f"Iter {self.iteration}, games {self.total_games}, examples {self.total_examples}",
+                    headers={"Title": "Transformer Training Heartbeat", "Priority": "low"},
+                    timeout=10
+                )
+                print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
+            except Exception as e:
+                print(f"[ntfy] Heartbeat failed: {e}")
+            self._last_heartbeat = now
+
     def _init_network(self):
         """Initialize network parameters (no batch_stats)."""
         self.rng, init_rng = jax.random.split(self.rng)
@@ -2523,6 +2549,9 @@ class TransformerTrainer:
             iter_time = time.time() - iter_start
             print(f"  Iteration time: {iter_time:.1f}s | Buffer: {len(self.replay_buffer)} examples")
             print()
+
+            # Heartbeat notification
+            self._maybe_send_heartbeat()
 
             if metrics and self.config.use_wandb and self.wandb_run is not None:
                 global_step = (iteration + 1) * self.config.train_steps_per_iteration
