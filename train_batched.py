@@ -1968,6 +1968,10 @@ class TransformerTrainer:
     def __init__(self, config: TrainConfig):
         self.config = config
 
+        # Use separate checkpoint dir for transformer (unless explicitly overridden)
+        if config.checkpoint_dir == "checkpoints":
+            self.config.checkpoint_dir = "checkpoints_transformer"
+
         # Environment config
         self.env_config = EnvConfig(rows=config.rows, cols=config.cols, max_turns=config.max_turns_per_game)
 
