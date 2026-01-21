@@ -2191,7 +2191,7 @@ class TransformerTrainer:
             all_values = np.concatenate(total_values, axis=0)
 
             # Add to replay buffer
-            self.replay_buffer.add_batch(all_states, all_policies, all_values)
+            self.replay_buffer.add(all_states, all_policies, all_values)
 
             num_examples = len(all_states)
             self.total_examples += num_examples
