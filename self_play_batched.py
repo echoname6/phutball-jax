@@ -40,6 +40,35 @@ class TrajectoryData(NamedTuple):
     actions: jnp.ndarray         # (batch, max_moves) chosen action ids
 
 
+def transform_policy_for_p2(policy_logits: jnp.ndarray, rows: int, cols: int) -> jnp.ndarray:
+    """
+    Transform policy logits from visual coords (P2's 180° rotated view) back to physical coords.
+
+    The network input is 180° rotated for P2, so the policy outputs are in rotated coords.
+    We need to unrotate them to match the physical board.
+
+    Action space:
+    - [0, rows*cols): placement actions - position (a // cols, a % cols)
+    - [rows*cols, 2*rows*cols): jump actions - jump to (a-N) // cols, (a-N) % cols)
+    - [2*rows*cols]: halt action (no transformation needed)
+
+    For 180° rotation, position (r, c) -> (rows-1-r, cols-1-c)
+    This is equivalent to reversing the flattened index within each action type.
+    """
+    N = rows * cols
+
+    # Split into placement, jump, halt
+    placement_logits = policy_logits[..., :N]
+    jump_logits = policy_logits[..., N:2*N]
+    halt_logits = policy_logits[..., 2*N:]
+
+    # Reverse placement and jump indices (180° rotation = reverse flattened order)
+    physical_placement = jnp.flip(placement_logits, axis=-1)
+    physical_jump = jnp.flip(jump_logits, axis=-1)
+
+    return jnp.concatenate([physical_placement, physical_jump, halt_logits], axis=-1)
+
+
 def batched_reset(env_config: EnvConfig, batch_size: int) -> PhutballState:
     """Reset multiple environments in parallel."""
     single_state = reset(env_config)
@@ -76,10 +105,10 @@ def make_batched_network_input(env_config: EnvConfig):
 
 def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
     """Create recurrent function for mctx that uses real env dynamics."""
-    
+
     rows, cols = env_config.rows, env_config.cols
     action_space_size = 2 * rows * cols + 1
-    
+
     def recurrent_fn(params, rng, action, embedding):
         """
         Args:
@@ -87,38 +116,44 @@ def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
             rng: Random key (unused - env is deterministic)
             action: Actions to take, shape (batch_size,)
             embedding: Current PhutballState (batched)
-        
+
         Returns:
             RecurrentFnOutput, new_embedding
         """
         # Step the environment
         def single_step(state, act):
             return step(state, act, env_config)
-        
+
         next_states = jax.vmap(single_step)(embedding, action)
-        
-        # Convert to network input
+
+        # Convert to network input (NOTE: this rotates 180° for P2)
         network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(next_states)
-        
+
         # Get network predictions
         variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
         policy_logits, values = network.apply(variables, network_inputs, train=False)
-        
-        # Get legal action mask
+
+        # Transform policy logits back to physical coords for P2
+        # The network input was rotated 180° for P2, so policy is in rotated coords
+        is_p2 = (next_states.current_player == 2)[:, None]  # (batch, 1) for broadcasting
+        policy_logits_p2 = transform_policy_for_p2(policy_logits, rows, cols)
+        policy_logits = jnp.where(is_p2, policy_logits_p2, policy_logits)
+
+        # Get legal action mask (in physical coords)
         def single_legal(state):
             return get_legal_actions(state, env_config)
-        
+
         legal_mask = jax.vmap(single_legal)(next_states)
-        
+
         # Mask illegal actions
         masked_logits = jnp.where(legal_mask == 1, policy_logits, -1e9)
-        
+
         # Check for terminal states
         terminated = next_states.terminated
-        
+
         # Discount: 1 for ongoing, 0 for terminal
         discount = jnp.where(terminated, 0.0, 1.0)
-        
+
         # For terminal states, compute value from current_player's perspective.
         # During jumps (the only way to win), current_player is the player who just moved.
         terminal_value = jnp.where(
@@ -127,16 +162,16 @@ def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
             jnp.where(next_states.winner == 0, 0.0, -1.0)  # Draw or opponent won
         )
         values = jnp.where(terminated, terminal_value, values)
-        
+
         recurrent_output = mctx.RecurrentFnOutput(
             reward=jnp.zeros_like(values),  # AlphaZero doesn't use intermediate rewards
             discount=discount,
             prior_logits=masked_logits,
             value=values,
         )
-        
+
         return recurrent_output, next_states
-    
+
     return recurrent_fn
 
 
@@ -166,14 +201,19 @@ def batched_mcts_policy(
     batch_size = states.board.shape[0]
     
     # Convert states to network input for root evaluation
-    # Uses state_to_network_input with jump sequence
+    # Uses state_to_network_input with jump sequence (NOTE: rotates 180° for P2)
     network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(states)
-    
+
     # Get root network predictions
     variables = {'params': params['network_params'], 'batch_stats': params['batch_stats']}
     policy_logits, values = network.apply(variables, network_inputs, train=False)
-    
-    # Get legal action mask
+
+    # Transform policy logits back to physical coords for P2
+    is_p2 = (states.current_player == 2)[:, None]  # (batch, 1) for broadcasting
+    policy_logits_p2 = transform_policy_for_p2(policy_logits, rows, cols)
+    policy_logits = jnp.where(is_p2, policy_logits_p2, policy_logits)
+
+    # Get legal action mask (in physical coords)
     def single_legal(state):
         return get_legal_actions(state, env_config)
     
@@ -267,14 +307,19 @@ def make_transformer_recurrent_fn(network: PhutballTransformer, env_config: EnvC
 
         next_states = jax.vmap(single_step)(embedding, action)
 
-        # Convert to network input
+        # Convert to network input (NOTE: rotates 180° for P2)
         network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(next_states)
 
         # Get network predictions (no batch_stats)
         variables = {'params': params['network_params']}
         policy_logits, values = network.apply(variables, network_inputs, train=False)
 
-        # Get legal action mask
+        # Transform policy logits back to physical coords for P2
+        is_p2 = (next_states.current_player == 2)[:, None]  # (batch, 1) for broadcasting
+        policy_logits_p2 = transform_policy_for_p2(policy_logits, rows, cols)
+        policy_logits = jnp.where(is_p2, policy_logits_p2, policy_logits)
+
+        # Get legal action mask (in physical coords)
         def single_legal(state):
             return get_legal_actions(state, env_config)
 
@@ -334,14 +379,19 @@ def transformer_mcts_policy(
     action_space_size = 2 * rows * cols + 1
     batch_size = states.board.shape[0]
 
-    # Convert states to network input for root evaluation
+    # Convert states to network input for root evaluation (NOTE: rotates 180° for P2)
     network_inputs = jax.vmap(lambda s: state_to_network_input(s, env_config))(states)
 
     # Get root network predictions (no batch_stats)
     variables = {'params': params['network_params']}
     policy_logits, values = network.apply(variables, network_inputs, train=False)
 
-    # Get legal action mask
+    # Transform policy logits back to physical coords for P2
+    is_p2 = (states.current_player == 2)[:, None]  # (batch, 1) for broadcasting
+    policy_logits_p2 = transform_policy_for_p2(policy_logits, rows, cols)
+    policy_logits = jnp.where(is_p2, policy_logits_p2, policy_logits)
+
+    # Get legal action mask (in physical coords)
     def single_legal(state):
         return get_legal_actions(state, env_config)
 
@@ -1309,36 +1359,57 @@ def trajectory_to_training_examples(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert trajectory data to training examples.
-    
+
+    NOTE: MCTS policies are stored in physical coords. For P2, we need to
+    transform them back to visual coords (180° rotation) to match the network
+    input which is also rotated for P2.
+
     Returns:
         states: (N, channels, rows, cols)
         policies: (N, action_space)
         values: (N,)
     """
     batch_size, max_moves = trajectory.valid_mask.shape
-    
+
     all_states = []
     all_policies = []
     all_values = []
-    
+
     # Convert to numpy for easier manipulation
     states_np = np.array(trajectory.states)
     policies_np = np.array(trajectory.policies)
     players_np = np.array(trajectory.players)
     valid_np = np.array(trajectory.valid_mask)
     winners_np = np.array(trajectory.winners)
-    
+
+    # Infer board dimensions from state shape: (batch, moves, channels, rows, cols)
+    _, _, _, rows, cols = states_np.shape
+    N = rows * cols
+
+    def transform_policy_to_visual(policy):
+        """Transform policy from physical coords back to visual coords for P2."""
+        # Same transformation as physical->visual (180° rotation is self-inverse)
+        placement = policy[:N][::-1]
+        jump = policy[N:2*N][::-1]
+        halt = policy[2*N:]
+        return np.concatenate([placement, jump, halt])
+
     for game_idx in range(batch_size):
         winner = winners_np[game_idx]
-        
+
         for move_idx in range(max_moves):
             if not valid_np[game_idx, move_idx]:
                 continue
-                
+
             state = states_np[game_idx, move_idx]
             policy = policies_np[game_idx, move_idx]
             player = players_np[game_idx, move_idx]
-            
+
+            # Transform P2 policies back to visual coords for training
+            # (network input is rotated 180° for P2, so target policy should match)
+            if player == 2:
+                policy = transform_policy_to_visual(policy)
+
             # Value from this player's perspective
             if winner == 0:
                 value = 0.0  # Draw
@@ -1346,7 +1417,7 @@ def trajectory_to_training_examples(
                 value = 1.0  # Win
             else:
                 value = -1.0  # Loss
-            
+
             all_states.append(state)
             all_policies.append(policy)
             all_values.append(value)
