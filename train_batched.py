@@ -2050,17 +2050,25 @@ class TransformerTrainer:
             return
         now = time.time()
         if now - self._last_heartbeat >= self.config.heartbeat_minutes * 60:
-            try:
-                import requests
-                requests.post(
-                    f"https://ntfy.sh/{self.config.ntfy_topic}",
-                    data=f"Iter {self.iteration}, games {self.total_games}, examples {self.total_examples}",
-                    headers={"Title": "Transformer Training Heartbeat", "Priority": "low"},
-                    timeout=10
-                )
-                print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
-            except Exception as e:
-                print(f"[ntfy] Heartbeat failed: {e}")
+            import requests
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    requests.post(
+                        f"https://ntfy.sh/{self.config.ntfy_topic}",
+                        data=f"Iter {self.iteration}, games {self.total_games}, examples {self.total_examples}",
+                        headers={"Title": "Transformer Training Heartbeat", "Priority": "low"},
+                        timeout=10
+                    )
+                    print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        delay = 2 ** attempt  # 1s, 2s, 4s
+                        print(f"[ntfy] Heartbeat attempt {attempt + 1} failed, retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        print(f"[ntfy] Heartbeat failed after {max_retries} attempts: {e}")
             self._last_heartbeat = now
 
     def _init_network(self):
@@ -3008,18 +3016,26 @@ class ChimeraTrainer:
 
         now = time.time()
         if now - self._last_heartbeat >= self.config.heartbeat_minutes * 60:
-            try:
-                import requests
-                wr = getattr(self, 'best_win_rate_vs_random', 0)
-                requests.post(
-                    f"https://ntfy.sh/{self.config.ntfy_topic}",
-                    data=f"Iter {self.iteration}, WR={wr:.1%} - still running",
-                    headers={"Title": "Heartbeat", "Priority": "default"},
-                    timeout=10
-                )
-                print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
-            except Exception as e:
-                print(f"[ntfy] Heartbeat failed: {e}")
+            import requests
+            wr = getattr(self, 'best_win_rate_vs_random', 0)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    requests.post(
+                        f"https://ntfy.sh/{self.config.ntfy_topic}",
+                        data=f"Iter {self.iteration}, WR={wr:.1%} - still running",
+                        headers={"Title": "Heartbeat", "Priority": "default"},
+                        timeout=10
+                    )
+                    print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        delay = 2 ** attempt  # 1s, 2s, 4s
+                        print(f"[ntfy] Heartbeat attempt {attempt + 1} failed, retrying in {delay}s...")
+                        time.sleep(delay)
+                    else:
+                        print(f"[ntfy] Heartbeat failed after {max_retries} attempts: {e}")
             self._last_heartbeat = now
 
     def _init_network(self):
