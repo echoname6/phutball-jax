@@ -1029,17 +1029,34 @@ def play_vs_random_batched(
     # Use provided mcts_policy_fn or default to batched_mcts_policy
     _mcts_policy_fn = mcts_policy_fn if mcts_policy_fn is not None else batched_mcts_policy
 
-    def cond_fn(carry):
-        states, terminated, rng, step_idx = carry
-        any_active = jnp.any(~terminated)
-        return jnp.logical_and(step_idx < max_moves, any_active)
+    # Use Python loop instead of lax.while_loop to avoid TPU stack overflow
+    # with deep transformer computation graphs
+    @jax.jit
+    def get_random_actions(states, rng_rand):
+        """Get random actions for all games."""
+        def get_random_action(state, rng_key):
+            legal = get_legal_actions(state, env_config)
+            probs = legal.astype(jnp.float32)
+            probs = probs / jnp.sum(probs)
+            return jax.random.choice(rng_key, action_space_size, p=probs)
+        rand_rngs = jax.random.split(rng_rand, batch_size)
+        return jax.vmap(get_random_action)(states, rand_rngs)
 
-    def body_fn(carry):
-        states, terminated, rng, step_idx = carry
+    @jax.jit
+    def step_games(states, actions, terminated):
+        """Step all games and freeze terminated ones."""
+        new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
+        done_mask = terminated | new_states_raw.terminated
+        new_states = _make_frozen_state(states, new_states_raw, done_mask, env_config)
+        return new_states, done_mask
+
+    # Python loop - avoids stack overflow from deep JIT compilation
+    for step_idx in range(max_moves):
+        # Check if any games still active
+        if not bool(jnp.any(~terminated)):
+            break
 
         current_player = states.current_player
-
-        # Determine if checkpoint is to move
         use_checkpoint = jnp.where(
             current_player == 1,
             checkpoint_is_P1,
@@ -1059,33 +1076,17 @@ def play_vs_random_batched(
             temperature=temperature,
             recurrent_fn=mcts_recurrent_fn,
         )
-        
-        # Get random actions (uniform over legal)
-        def get_random_action(state, rng_key):
-            legal = get_legal_actions(state, env_config)
-            # Uniform over legal actions
-            probs = legal.astype(jnp.float32)
-            probs = probs / jnp.sum(probs)
-            return jax.random.choice(rng_key, action_space_size, p=probs)
-        
-        rand_rngs = jax.random.split(rng_rand, batch_size)
-        actions_rand = jax.vmap(get_random_action)(states, rand_rngs)
-        
+
+        # Get random actions
+        actions_rand = get_random_actions(states, rng_rand)
+
         # Select action based on who's moving
         actions = jnp.where(use_checkpoint, actions_ckpt, actions_rand)
-        
+
         # Step environments
-        new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
-        
-        # Freeze terminated games
-        done_mask = terminated | new_states_raw.terminated
-        
-        new_states = _make_frozen_state(states, new_states_raw, done_mask, env_config)
-        
-        return (new_states, done_mask, rng, step_idx + jnp.int32(1))
-    
-    init_carry = (states, terminated, rng, step0)
-    final_states, _, _, _ = lax.while_loop(cond_fn, body_fn, init_carry)
+        states, terminated = step_games(states, actions, terminated)
+
+    final_states = states
     
     winners = final_states.winner
     per_game_turns = final_states.num_turns
