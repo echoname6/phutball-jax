@@ -1339,18 +1339,19 @@ class AlphaZeroTrainer:
             'total_examples': self.total_examples,
             'config': self.config,
             'metrics_history': self.metrics_history,
+            'buffer': self.replay_buffer.get_data(),
         }
-        
+
         with open(path, 'wb') as f:
             pickle.dump(checkpoint, f)
-        
-        print(f"  Saved checkpoint: {path}")
-    
+
+        print(f"  Saved checkpoint: {path} (buffer: {len(self.replay_buffer)} examples)")
+
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
         with open(path, 'rb') as f:
             checkpoint = pickle.load(f)
-        
+
         self.params = checkpoint['params']
         self.batch_stats = checkpoint['batch_stats']
         self.opt_state = checkpoint['opt_state']
@@ -1358,8 +1359,12 @@ class AlphaZeroTrainer:
         self.total_games = checkpoint['total_games']
         self.total_examples = checkpoint['total_examples']
         self.metrics_history = checkpoint.get('metrics_history', [])
-        
-        print(f"Loaded checkpoint from iteration {self.iteration}")
+
+        # Restore replay buffer if present (backwards compatible)
+        if 'buffer' in checkpoint:
+            self.replay_buffer.set_data(checkpoint['buffer'])
+
+        print(f"Loaded checkpoint from iteration {self.iteration} (buffer: {len(self.replay_buffer)} examples)")
     
     def train(self):
         """Main training loop."""
@@ -2393,12 +2398,13 @@ class TransformerTrainer:
             'config': self.config,
             'metrics_history': self.metrics_history,
             'network_type': 'transformer',
+            'buffer': self.replay_buffer.get_data(),
         }
 
         with open(path, 'wb') as f:
             pickle.dump(checkpoint, f)
 
-        print(f"  Saved checkpoint: {path}")
+        print(f"  Saved checkpoint: {path} (buffer: {len(self.replay_buffer)} examples)")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint (no batch_stats)."""
@@ -2412,7 +2418,11 @@ class TransformerTrainer:
         self.total_examples = checkpoint['total_examples']
         self.metrics_history = checkpoint.get('metrics_history', [])
 
-        print(f"Loaded checkpoint from iteration {self.iteration}")
+        # Restore replay buffer if present (backwards compatible)
+        if 'buffer' in checkpoint:
+            self.replay_buffer.set_data(checkpoint['buffer'])
+
+        print(f"Loaded checkpoint from iteration {self.iteration} (buffer: {len(self.replay_buffer)} examples)")
 
     def evaluate_vs_random_batched(self):
         """Evaluate current checkpoint vs random."""
@@ -3594,11 +3604,12 @@ class ChimeraTrainer:
             'current_lr': self.current_lr,
             'best_loss': self.best_loss,
             'best_win_rate_vs_random': self.best_win_rate_vs_random,
+            'buffer': self.replay_buffer.get_data(),
         }
 
         with open(path, 'wb') as f:
             pickle.dump(checkpoint, f)
-        print(f"  Saved checkpoint: {path}")
+        print(f"  Saved checkpoint: {path} (buffer: {len(self.replay_buffer)} examples)")
 
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
@@ -3620,7 +3631,11 @@ class ChimeraTrainer:
         self.best_loss = checkpoint.get('best_loss', float('inf'))
         self.best_win_rate_vs_random = checkpoint.get('best_win_rate_vs_random', 0.5)
 
-        print(f"Loaded checkpoint from iteration {self.iteration} (sims={self.current_sims}, lr={self.current_lr:.2e})")
+        # Restore replay buffer if present (backwards compatible)
+        if 'buffer' in checkpoint:
+            self.replay_buffer.set_data(checkpoint['buffer'])
+
+        print(f"Loaded checkpoint from iteration {self.iteration} (sims={self.current_sims}, lr={self.current_lr:.2e}, buffer: {len(self.replay_buffer)} examples)")
 
     def add_board_size(self, new_rows: int, new_cols: int):
         """Add a new board size to the chimera (post-hoc expansion)."""

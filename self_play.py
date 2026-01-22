@@ -201,6 +201,35 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+    def get_data(self) -> dict:
+        """Get buffer contents for checkpointing."""
+        if not self.buffer:
+            return {'states': None, 'policies': None, 'values': None}
+
+        states = np.stack([ex.state for ex in self.buffer])
+        policies = np.stack([ex.policy for ex in self.buffer])
+        values = np.array([ex.value for ex in self.buffer])
+
+        return {
+            'states': states,
+            'policies': policies,
+            'values': values,
+        }
+
+    def set_data(self, data: dict):
+        """Restore buffer contents from checkpoint."""
+        if data is None or data.get('states') is None:
+            return
+
+        states = data['states']
+        policies = data['policies']
+        values = data['values']
+
+        self.buffer = [
+            TrainingExample(state=states[i], policy=policies[i], value=values[i])
+            for i in range(len(states))
+        ]
+
 
 # ============================================================================
 # Tests

@@ -214,12 +214,13 @@ class AlphaZeroTrainer:
             'total_examples': self.total_examples,
             'config': self.config,
             'metrics_history': self.metrics_history,
+            'buffer': self.replay_buffer.get_data(),
         }
-        
+
         with open(path, 'wb') as f:
             pickle.dump(checkpoint, f)
-        
-        print(f"  Saved checkpoint: {path}")
+
+        print(f"  Saved checkpoint: {path} (buffer: {len(self.replay_buffer)} examples)")
     
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""
@@ -233,8 +234,12 @@ class AlphaZeroTrainer:
         self.total_games = checkpoint['total_games']
         self.total_examples = checkpoint['total_examples']
         self.metrics_history = checkpoint.get('metrics_history', [])
-        
-        print(f"Loaded checkpoint from iteration {self.iteration}")
+
+        # Restore replay buffer if present (backwards compatible)
+        if 'buffer' in checkpoint:
+            self.replay_buffer.set_data(checkpoint['buffer'])
+
+        print(f"Loaded checkpoint from iteration {self.iteration} (buffer: {len(self.replay_buffer)} examples)")
     
     def train(self):
         """Main training loop."""

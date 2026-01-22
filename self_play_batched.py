@@ -1740,6 +1740,42 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
 
+    def get_data(self) -> dict:
+        """Get buffer contents for checkpointing."""
+        if self.states is None or self.size == 0:
+            return {'states': None, 'policies': None, 'values': None, 'size': 0, 'idx': 0}
+
+        return {
+            'states': self.states[:self.size].copy(),
+            'policies': self.policies[:self.size].copy(),
+            'values': self.values[:self.size].copy(),
+            'size': self.size,
+            'idx': self.idx,
+        }
+
+    def set_data(self, data: dict):
+        """Restore buffer contents from checkpoint."""
+        if data is None or data.get('states') is None:
+            return
+
+        states = data['states']
+        policies = data['policies']
+        values = data['values']
+        n = len(states)
+
+        # Initialize arrays if needed
+        if self.states is None:
+            self.states = np.zeros((self.max_size,) + states.shape[1:], dtype=np.float32)
+            self.policies = np.zeros((self.max_size,) + policies.shape[1:], dtype=np.float32)
+            self.values = np.zeros(self.max_size, dtype=np.float32)
+
+        # Copy data into buffer
+        self.states[:n] = states
+        self.policies[:n] = policies
+        self.values[:n] = values
+        self.size = n
+        self.idx = data.get('idx', n % self.max_size)
+
 
 # --------============
 # Tests
