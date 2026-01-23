@@ -1024,6 +1024,30 @@ def play_match_batched(
     )
 
 
+# Module-level JIT functions for play_vs_random_batched
+# Moved outside to avoid recompilation on each call (causes XLA stack overflow on TPU v6e)
+
+@partial(jax.jit, static_argnums=(2, 3))
+def _get_random_actions_batched(states, rng_rand, action_space_size, batch_size, env_config):
+    """Get random legal actions for all games."""
+    def get_random_action(state, rng_key):
+        legal = get_legal_actions(state, env_config)
+        probs = legal.astype(jnp.float32)
+        probs = probs / jnp.sum(probs)
+        return jax.random.choice(rng_key, action_space_size, p=probs)
+    rand_rngs = jax.random.split(rng_rand, batch_size)
+    return jax.vmap(get_random_action)(states, rand_rngs)
+
+
+@jax.jit
+def _step_games_batched(states, actions, terminated, env_config):
+    """Step all games and freeze terminated ones."""
+    new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
+    done_mask = terminated | new_states_raw.terminated
+    new_states = _make_frozen_state(states, new_states_raw, done_mask, env_config)
+    return new_states, done_mask
+
+
 def play_vs_random_batched(
     checkpoint_params: dict,
     rng: jnp.ndarray,
@@ -1079,28 +1103,9 @@ def play_vs_random_batched(
     # Use provided mcts_policy_fn or default to batched_mcts_policy
     _mcts_policy_fn = mcts_policy_fn if mcts_policy_fn is not None else batched_mcts_policy
 
-    # Use Python loop instead of lax.while_loop to avoid TPU stack overflow
-    # with deep transformer computation graphs
-    @jax.jit
-    def get_random_actions(states, rng_rand):
-        """Get random actions for all games."""
-        def get_random_action(state, rng_key):
-            legal = get_legal_actions(state, env_config)
-            probs = legal.astype(jnp.float32)
-            probs = probs / jnp.sum(probs)
-            return jax.random.choice(rng_key, action_space_size, p=probs)
-        rand_rngs = jax.random.split(rng_rand, batch_size)
-        return jax.vmap(get_random_action)(states, rand_rngs)
-
-    @jax.jit
-    def step_games(states, actions, terminated):
-        """Step all games and freeze terminated ones."""
-        new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
-        done_mask = terminated | new_states_raw.terminated
-        new_states = _make_frozen_state(states, new_states_raw, done_mask, env_config)
-        return new_states, done_mask
-
     # Python loop - avoids stack overflow from deep JIT compilation
+    # Note: get_random_actions and step_games moved to module level to prevent
+    # recompilation on each call (which caused XLA stack overflow on TPU v6e)
     for step_idx in range(max_moves):
         # Check if any games still active
         if not bool(jnp.any(~terminated)):
@@ -1128,13 +1133,13 @@ def play_vs_random_batched(
         )
 
         # Get random actions
-        actions_rand = get_random_actions(states, rng_rand)
+        actions_rand = _get_random_actions_batched(states, rng_rand, action_space_size, batch_size, env_config)
 
         # Select action based on who's moving
         actions = jnp.where(use_checkpoint, actions_ckpt, actions_rand)
 
         # Step environments
-        states, terminated = step_games(states, actions, terminated)
+        states, terminated = _step_games_batched(states, actions, terminated, env_config)
 
     final_states = states
     
@@ -1746,9 +1751,9 @@ class ReplayBuffer:
             return {'states': None, 'policies': None, 'values': None, 'size': 0, 'idx': 0}
 
         return {
-            'states': self.states[:self.size].copy(),
-            'policies': self.policies[:self.size].copy(),
-            'values': self.values[:self.size].copy(),
+            'states': self.states[:self.size],
+            'policies': self.policies[:self.size],
+            'values': self.values[:self.size],
             'size': self.size,
             'idx': self.idx,
         }
