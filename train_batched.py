@@ -858,7 +858,8 @@ class TrainConfig:
     # Network architecture
     num_channels: int = 128
     num_res_blocks: int = 8
-    
+    pos_encoding: str = "goal_distance"  # "normalized" or "goal_distance"
+
     # Self-play (batched)
     batch_size_games: int = 64       # Games played in parallel
     max_turns_per_game: int = 2048   # Max turns before game ends
@@ -1992,6 +1993,7 @@ class TransformerTrainer:
             n_layers=config.num_res_blocks,  # Reuse num_res_blocks as n_layers
             n_heads=4,
             ffn_dim=config.num_channels * 2,
+            pos_encoding=config.pos_encoding,
         )
 
         # Optimizer

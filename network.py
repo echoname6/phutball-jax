@@ -70,6 +70,7 @@ class PhutballTransformer(nn.Module):
     n_heads: int = 4
     ffn_dim: int = 256
     dropout_rate: float = 0.0
+    pos_encoding: str = "goal_distance"  # "normalized" or "goal_distance"
 
     @nn.compact
     def __call__(self, x, train: bool = True):
@@ -93,9 +94,15 @@ class PhutballTransformer(nn.Module):
         occupancy = x[:, :, :, 0:1]  # (batch, rows, cols, 1)
         jump_seq = x[:, :, :, 1:6]    # (batch, rows, cols, 5)
 
-        # Create positional encodings (normalized to [0, 1])
-        row_pos = jnp.arange(self.rows) / (self.rows - 1)  # (rows,)
-        col_pos = jnp.arange(self.cols) / (self.cols - 1)  # (cols,)
+        # Create positional encodings
+        if self.pos_encoding == "goal_distance":
+            # goal_dist: -1 = deepest endzone row, 0 = goal line, 1+ = rows away from scoring
+            row_pos = jnp.arange(self.rows) - 1  # [-1, 0, 1, 2, ..., rows-2]
+            # lateral_dist: negative = left, 0 = center, positive = right
+            col_pos = jnp.arange(self.cols) - (self.cols - 1) / 2  # e.g. [-4..4] for 9 cols
+        else:  # "normalized"
+            row_pos = jnp.arange(self.rows) / (self.rows - 1)  # [0, 1]
+            col_pos = jnp.arange(self.cols) / (self.cols - 1)  # [0, 1]
 
         # Broadcast to (rows, cols)
         row_enc = jnp.broadcast_to(row_pos[:, None], (self.rows, self.cols))
@@ -159,6 +166,7 @@ def create_transformer_network(
     n_heads: int = 4,
     ffn_dim: int = 256,
     dropout_rate: float = 0.0,
+    pos_encoding: str = "goal_distance",
 ) -> PhutballTransformer:
     """Factory function to create transformer network."""
     return PhutballTransformer(
@@ -169,6 +177,7 @@ def create_transformer_network(
         n_heads=n_heads,
         ffn_dim=ffn_dim,
         dropout_rate=dropout_rate,
+        pos_encoding=pos_encoding,
     )
 
 
