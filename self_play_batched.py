@@ -1027,7 +1027,7 @@ def play_match_batched(
 # Module-level JIT functions for play_vs_random_batched
 # Moved outside to avoid recompilation on each call (causes XLA stack overflow on TPU v6e)
 
-@partial(jax.jit, static_argnums=(2, 3))
+@partial(jax.jit, static_argnums=(2, 3, 4))
 def _get_random_actions_batched(states, rng_rand, action_space_size, batch_size, env_config):
     """Get random legal actions for all games."""
     def get_random_action(state, rng_key):
@@ -1039,7 +1039,7 @@ def _get_random_actions_batched(states, rng_rand, action_space_size, batch_size,
     return jax.vmap(get_random_action)(states, rand_rngs)
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(3,))
 def _step_games_batched(states, actions, terminated, env_config):
     """Step all games and freeze terminated ones."""
     new_states_raw = jax.vmap(lambda s, a: step(s, a, env_config))(states, actions)
