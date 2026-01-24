@@ -23,8 +23,8 @@ Array = Any
 EMPTY = 0
 BALL = -1
 MAN = 1
-END_HI = 2    # Row 0 - beyond goal for P2
-END_LO = 2    # Row -1 - beyond goal for P1 (same as END_HI so network can't distinguish P1/P2)
+END_HI = 2    # Rows 0-1 (top end zone, P1's goal)
+END_LO = -2   # Rows (rows-2) to (rows-1) (bottom end zone, P2's goal)
 OUT_OF_BOUNDS = jnp.array(3, dtype=jnp.int32)
 
 # Fixed array size for jump sequence tracking (for JIT compilation and NN input)
