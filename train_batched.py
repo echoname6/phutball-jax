@@ -931,6 +931,24 @@ class TrainConfig:
     league_save_every: int = 5             # Save to pool every N iterations
     league_random_ratio: float = 0.1       # Fraction of games vs pure random (within league games)
 
+    # Phase-based curriculum: transitions based on win rate vs random
+    # Overrides random_opponent and league settings when enabled
+    curriculum_phase_enabled: bool = False
+    curriculum_win_threshold: float = 0.92     # Win rate required for phase transition
+    curriculum_consecutive_required: int = 3   # Consecutive evals at threshold to transition
+    # Phase 1: 40% self, 40% random, 20% league
+    curriculum_phase1_self: float = 0.40
+    curriculum_phase1_random: float = 0.40
+    curriculum_phase1_league: float = 0.20
+    # Phase 2: 60% self, 20% random, 20% league
+    curriculum_phase2_self: float = 0.60
+    curriculum_phase2_random: float = 0.20
+    curriculum_phase2_league: float = 0.20
+    # Phase 3: 80% self, 0% random, 20% league
+    curriculum_phase3_self: float = 0.80
+    curriculum_phase3_random: float = 0.00
+    curriculum_phase3_league: float = 0.20
+
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
     wandb_run_name: Optional[str] = None
@@ -2061,6 +2079,11 @@ class TransformerTrainer:
         # League play: pool of past checkpoints
         self.league_pool = []  # List of (iteration, params) tuples
 
+        # Curriculum phase tracking
+        self.curriculum_phase = 1  # Start at phase 1
+        self.curriculum_consecutive_p1_passes = 0
+        self.curriculum_consecutive_p2_passes = 0
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
@@ -2126,6 +2149,68 @@ class TransformerTrainer:
         iter_num, params = self.league_pool[idx]
         return params
 
+    def _get_curriculum_ratios(self) -> dict:
+        """Get opponent ratios based on current curriculum phase."""
+        if not self.config.curriculum_phase_enabled:
+            return None
+
+        phase = self.curriculum_phase
+        if phase == 1:
+            return {
+                "self": self.config.curriculum_phase1_self,
+                "random": self.config.curriculum_phase1_random,
+                "league": self.config.curriculum_phase1_league,
+            }
+        elif phase == 2:
+            return {
+                "self": self.config.curriculum_phase2_self,
+                "random": self.config.curriculum_phase2_random,
+                "league": self.config.curriculum_phase2_league,
+            }
+        else:  # phase 3
+            return {
+                "self": self.config.curriculum_phase3_self,
+                "random": self.config.curriculum_phase3_random,
+                "league": self.config.curriculum_phase3_league,
+            }
+
+    def _update_curriculum_phase(self, p1_win_rate: float, p2_win_rate: float):
+        """Update curriculum phase based on win rates vs random."""
+        if not self.config.curriculum_phase_enabled:
+            return
+
+        threshold = self.config.curriculum_win_threshold
+        required = self.config.curriculum_consecutive_required
+
+        # Check P1
+        if p1_win_rate >= threshold:
+            self.curriculum_consecutive_p1_passes += 1
+        else:
+            self.curriculum_consecutive_p1_passes = 0
+
+        # Check P2
+        if p2_win_rate >= threshold:
+            self.curriculum_consecutive_p2_passes += 1
+        else:
+            self.curriculum_consecutive_p2_passes = 0
+
+        # Log progress
+        print(f"  [Curriculum] Phase {self.curriculum_phase} | "
+              f"P1: {p1_win_rate:.1%} ({self.curriculum_consecutive_p1_passes}/{required}) | "
+              f"P2: {p2_win_rate:.1%} ({self.curriculum_consecutive_p2_passes}/{required})")
+
+        # Transition if both pass
+        if (self.curriculum_consecutive_p1_passes >= required and
+            self.curriculum_consecutive_p2_passes >= required):
+            if self.curriculum_phase < 3:
+                self.curriculum_phase += 1
+                self.curriculum_consecutive_p1_passes = 0
+                self.curriculum_consecutive_p2_passes = 0
+                ratios = self._get_curriculum_ratios()
+                print(f"  [Curriculum] PHASE TRANSITION -> Phase {self.curriculum_phase}")
+                print(f"  [Curriculum] New ratios: self={ratios['self']:.0%}, "
+                      f"random={ratios['random']:.0%}, league={ratios['league']:.0%}")
+
     def _maybe_decay_lr(self, total_loss: float):
         """Decay learning rate if loss has stalled."""
         if not self.config.lr_decay_enabled:
@@ -2178,25 +2263,38 @@ class TransformerTrainer:
         vs_random_games = 0
         self_play_games = 0
 
-        # Random opponent ratio
-        if self.config.random_opponent_enabled:
-            decay_progress = min(1.0, self.iteration / max(1, self.config.random_opponent_decay_iterations))
-            random_opp_ratio = (
-                self.config.random_opponent_initial_ratio
-                + (self.config.random_opponent_final_ratio - self.config.random_opponent_initial_ratio)
-                * decay_progress
-            )
-        else:
-            random_opp_ratio = 0.0
+        # Determine opponent ratios based on curriculum or legacy settings
+        curriculum_ratios = self._get_curriculum_ratios()
 
-        # League opponent
-        league_opponent = None
-        league_ratio = 0.0
-        if self.config.league_enabled and len(self.league_pool) > 0:
-            league_opponent = self._get_league_opponent_params()
-            league_ratio = self.config.league_opponent_ratio
-            # Also mix in some pure random games within the league ratio
-            random_opp_ratio = max(random_opp_ratio, self.config.league_random_ratio)
+        if curriculum_ratios is not None:
+            # Use curriculum phase-based ratios
+            random_opp_ratio = curriculum_ratios["random"]
+            league_ratio = curriculum_ratios["league"]
+            # Get league opponent if we have any and league ratio > 0
+            league_opponent = None
+            if league_ratio > 0 and len(self.league_pool) > 0:
+                league_opponent = self._get_league_opponent_params()
+        else:
+            # Legacy settings
+            # Random opponent ratio
+            if self.config.random_opponent_enabled:
+                decay_progress = min(1.0, self.iteration / max(1, self.config.random_opponent_decay_iterations))
+                random_opp_ratio = (
+                    self.config.random_opponent_initial_ratio
+                    + (self.config.random_opponent_final_ratio - self.config.random_opponent_initial_ratio)
+                    * decay_progress
+                )
+            else:
+                random_opp_ratio = 0.0
+
+            # League opponent
+            league_opponent = None
+            league_ratio = 0.0
+            if self.config.league_enabled and len(self.league_pool) > 0:
+                league_opponent = self._get_league_opponent_params()
+                league_ratio = self.config.league_opponent_ratio
+                # Also mix in some pure random games within the league ratio
+                random_opp_ratio = max(random_opp_ratio, self.config.league_random_ratio)
 
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
 
@@ -2554,6 +2652,9 @@ class TransformerTrainer:
             "side_bias": side_bias,
             "avg_turns": avg_turns,
         }
+
+        # Update curriculum phase based on P1/P2 win rates
+        self._update_curriculum_phase(win_rate_p1, win_rate_p2)
 
         return win_rate_overall, stats
 
