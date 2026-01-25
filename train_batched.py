@@ -924,6 +924,13 @@ class TrainConfig:
     random_opponent_final_ratio: float = 0.003    # Final fraction (decays to this)
     random_opponent_decay_iterations: int = 100   # Iterations to decay from initial to final
 
+    # League play: play against mixture of past checkpoints
+    league_enabled: bool = False
+    league_pool_size: int = 10             # Max past checkpoints to keep in pool
+    league_opponent_ratio: float = 0.3     # Fraction of games vs league opponent (rest vs self)
+    league_save_every: int = 5             # Save to pool every N iterations
+    league_random_ratio: float = 0.1       # Fraction of games vs pure random (within league games)
+
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
     wandb_run_name: Optional[str] = None
@@ -2051,6 +2058,9 @@ class TransformerTrainer:
         # Heartbeat tracking (0 = send immediately on first iteration)
         self._last_heartbeat = 0
 
+        # League play: pool of past checkpoints
+        self.league_pool = []  # List of (iteration, params) tuples
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
@@ -2088,6 +2098,33 @@ class TransformerTrainer:
     def get_network_params(self) -> dict:
         """Get params dict for self-play (no batch_stats)."""
         return {'network_params': self.params}
+
+    def _maybe_save_to_league(self):
+        """Save current params to league pool if enabled."""
+        if not self.config.league_enabled:
+            return
+        if (self.iteration + 1) % self.config.league_save_every != 0:
+            return
+
+        # Deep copy params
+        params_copy = jax.tree_util.tree_map(lambda x: np.array(x), self.params)
+        params_dict = {'network_params': params_copy}
+
+        self.league_pool.append((self.iteration, params_dict))
+
+        # Trim to max size
+        if len(self.league_pool) > self.config.league_pool_size:
+            self.league_pool = self.league_pool[-self.config.league_pool_size:]
+
+        print(f"  [League] Saved checkpoint to pool (size={len(self.league_pool)})")
+
+    def _get_league_opponent_params(self) -> dict:
+        """Get random params from league pool, or None if pool is empty."""
+        if not self.league_pool:
+            return None
+        idx = np.random.randint(len(self.league_pool))
+        iter_num, params = self.league_pool[idx]
+        return params
 
     def _maybe_decay_lr(self, total_loss: float):
         """Decay learning rate if loss has stalled."""
@@ -2152,6 +2189,15 @@ class TransformerTrainer:
         else:
             random_opp_ratio = 0.0
 
+        # League opponent
+        league_opponent = None
+        league_ratio = 0.0
+        if self.config.league_enabled and len(self.league_pool) > 0:
+            league_opponent = self._get_league_opponent_params()
+            league_ratio = self.config.league_opponent_ratio
+            # Also mix in some pure random games within the league ratio
+            random_opp_ratio = max(random_opp_ratio, self.config.league_random_ratio)
+
         num_batches = self.config.games_per_iteration // self.config.batch_size_games
 
         # Pre-create recurrent_fn for transformer
@@ -2174,6 +2220,8 @@ class TransformerTrainer:
                 temp_final=self.config.temp_final,
                 num_simulations=self.config.num_simulations,
                 random_opponent_ratio=random_opp_ratio,
+                opponent_params=league_opponent,
+                opponent_ratio=league_ratio,
                 mcts_policy_fn=transformer_mcts_policy,
                 recurrent_fn=recurrent_fn,
             )
@@ -2553,6 +2601,9 @@ class TransformerTrainer:
                 })
                 total_loss = metrics.get('total_loss', metrics.get('policy_loss', 0) + metrics.get('value_loss', 0))
                 self._maybe_decay_lr(total_loss)
+
+            # Save to league pool if enabled
+            self._maybe_save_to_league()
 
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
