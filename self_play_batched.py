@@ -1057,6 +1057,7 @@ def play_vs_random_batched(
     max_moves: int,
     num_simulations: int,
     temperature: float = 0.0,
+    dirichlet_fraction: float = 0.0,  # 0.0 for eval (no exploration noise)
     mcts_policy_fn=None,  # Custom MCTS policy function (for transformer)
     recurrent_fn=None,  # Pre-created recurrent_fn (for transformer)
 ):
@@ -1129,6 +1130,7 @@ def play_vs_random_batched(
             env_config,
             num_simulations=num_simulations,
             temperature=temperature,
+            dirichlet_fraction=dirichlet_fraction,
             recurrent_fn=mcts_recurrent_fn,
         )
 
