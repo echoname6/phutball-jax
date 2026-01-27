@@ -2141,6 +2141,50 @@ class TransformerTrainer:
 
         print(f"  [League] Saved checkpoint to pool (size={len(self.league_pool)})")
 
+    def _populate_league_pool_from_checkpoints(self):
+        """Populate league pool from existing checkpoints on resume."""
+        if not self.config.league_enabled:
+            return
+
+        # Find all existing checkpoints
+        checkpoint_pattern = os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl")
+        existing = glob.glob(checkpoint_pattern)
+        if not existing:
+            print("  [League] No existing checkpoints found for pool")
+            return
+
+        # Sort by iteration number and take the last N
+        def get_iter(path):
+            try:
+                return int(path.split('_')[-1].split('.')[0])
+            except:
+                return -1
+
+        existing_sorted = sorted(existing, key=get_iter)
+        # Take the last league_pool_size checkpoints (or all if fewer exist)
+        to_load = existing_sorted[-self.config.league_pool_size:]
+
+        print(f"  [League] Loading {len(to_load)} checkpoints into pool...")
+
+        for ckpt_path in to_load:
+            try:
+                with open(ckpt_path, 'rb') as f:
+                    checkpoint = pickle.load(f)
+
+                iter_num = checkpoint['iteration']
+                params = checkpoint['params']
+
+                # Deep copy params to numpy
+                params_copy = jax.tree_util.tree_map(lambda x: np.array(x), params)
+                params_dict = {'network_params': params_copy}
+
+                self.league_pool.append((iter_num, params_dict))
+            except Exception as e:
+                print(f"  [League] Warning: Failed to load {ckpt_path}: {e}")
+
+        print(f"  [League] Pool initialized with {len(self.league_pool)} checkpoints: "
+              f"{[it for it, _ in self.league_pool]}")
+
     def _get_league_opponent_params(self) -> dict:
         """Get random params from league pool, or None if pool is empty."""
         if not self.league_pool:
@@ -2665,6 +2709,8 @@ class TransformerTrainer:
             latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
             self.load_checkpoint(latest)
             self.iteration += 1
+            # Populate league pool from existing checkpoints on resume (fix: pool was empty before)
+            self._populate_league_pool_from_checkpoints()
 
         print(f"Resuming from iteration {self.iteration}")
         print("=" * 60)
