@@ -1467,6 +1467,7 @@ def compute_phutball_stats(
     states_np = np.asarray(trajectory.states)      # (B, M, C, R, C)
     actions_np = np.asarray(trajectory.actions)    # (B, M)
     valid_np = np.asarray(trajectory.valid_mask)   # (B, M)
+    players_np = np.asarray(trajectory.players)    # (B, M) which player moved
 
     batch_size, max_moves = valid_np.shape
     rows, cols = env_config.rows, env_config.cols
@@ -1492,6 +1493,11 @@ def compute_phutball_stats(
             total_moves += 1
             a = int(actions_np[g, t])
             board_before = states_np[g, t, 0]  # channel 0 is board
+
+            # For P2's moves, the observation was 180° rotated for perspective normalization
+            # Unflip to get physical coordinates that match the action encoding
+            if players_np[g, t] == 2:
+                board_before = np.flip(np.flip(board_before, axis=0), axis=1)
 
             is_placement = a < total_positions
             is_jump = (total_positions <= a < 2 * total_positions)
