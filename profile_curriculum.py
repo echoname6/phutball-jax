@@ -17,8 +17,13 @@ from train_batched import (
     generate_one_move_win_state,
     generate_n_move_win_state,
 )
-from network import PhutballNetwork
-from self_play_batched import play_games_batched, trajectory_to_training_examples
+from network import PhutballNetwork, create_transformer_network, init_transformer_network
+from self_play_batched import (
+    play_games_batched,
+    trajectory_to_training_examples,
+    transformer_mcts_policy,
+    make_transformer_recurrent_fn,
+)
 
 
 @dataclass
@@ -147,13 +152,14 @@ def profile_individual_generators(
 
 def profile_mcts_selfplay(
     env_config: EnvConfig,
-    network: PhutballNetwork,
+    network,
     params: dict,
     batch_size: int = 16,
     num_iterations: int = 3,
     num_simulations: int = 50,
     max_turns: int = 100,
     warmup: int = 1,
+    use_transformer: bool = False,
 ) -> ProfilingResult:
     """
     Profile MCTS self-play game generation.
@@ -167,10 +173,18 @@ def profile_mcts_selfplay(
         num_simulations: MCTS simulations per move
         max_turns: Max turns per game (for quicker profiling)
         warmup: Number of warmup iterations
+        use_transformer: Use transformer MCTS functions
 
     Returns:
         ProfilingResult with timing statistics
     """
+    if use_transformer:
+        mcts_policy_fn = transformer_mcts_policy
+        recurrent_fn = make_transformer_recurrent_fn(network, env_config)
+    else:
+        mcts_policy_fn = None
+        recurrent_fn = None
+
     rng = jax.random.PRNGKey(999)
 
     # Warmup
@@ -184,6 +198,8 @@ def profile_mcts_selfplay(
             batch_size=batch_size,
             max_turns=max_turns,
             num_simulations=num_simulations,
+            mcts_policy_fn=mcts_policy_fn,
+            recurrent_fn=recurrent_fn,
         )
         states, policies, values = trajectory_to_training_examples(trajectory)
 
@@ -203,6 +219,8 @@ def profile_mcts_selfplay(
             batch_size=batch_size,
             max_turns=max_turns,
             num_simulations=num_simulations,
+            mcts_policy_fn=mcts_policy_fn,
+            recurrent_fn=recurrent_fn,
         )
         states, policies, values = trajectory_to_training_examples(trajectory)
         total_examples += len(states)
@@ -212,8 +230,9 @@ def profile_mcts_selfplay(
     end_time = time.perf_counter()
     total_time = end_time - start_time
 
+    label = "Transformer" if use_transformer else "CNN"
     return ProfilingResult(
-        name=f"MCTS Self-Play ({num_simulations} sims)",
+        name=f"MCTS Self-Play ({label}, {num_simulations} sims)",
         total_time=total_time,
         num_examples=total_examples,
         examples_per_second=total_examples / total_time,
@@ -224,12 +243,13 @@ def profile_mcts_selfplay(
 
 def profile_raw_network_selfplay(
     env_config: EnvConfig,
-    network: PhutballNetwork,
+    network,
     params: dict,
     batch_size: int = 64,
     num_iterations: int = 5,
     max_turns: int = 200,
     warmup: int = 1,
+    use_transformer: bool = False,
 ) -> ProfilingResult:
     """
     Profile self-play with raw network (no MCTS).
@@ -275,8 +295,9 @@ def profile_raw_network_selfplay(
     end_time = time.perf_counter()
     total_time = end_time - start_time
 
+    label = "Transformer" if use_transformer else "CNN"
     return ProfilingResult(
-        name="Raw Network Self-Play (no MCTS)",
+        name=f"Raw Network Self-Play ({label}, no MCTS)",
         total_time=total_time,
         num_examples=total_examples,
         examples_per_second=total_examples / total_time,
@@ -305,6 +326,8 @@ def run_profiler(
     selfplay_iterations: int = 3,
     num_simulations: int = 50,
     include_mcts: bool = True,
+    use_transformer: bool = False,
+    transformer_kwargs: dict = None,
 ):
     """
     Run the full profiler and compare curriculum vs self-play.
@@ -350,22 +373,35 @@ def run_profiler(
     print("Initializing network for self-play...")
     print("-" * 40)
 
-    network = PhutballNetwork(
-        num_channels=64,  # Smaller for faster profiling
-        num_res_blocks=4,
-        rows=rows,
-        cols=cols,
-    )
-
-    rng = jax.random.PRNGKey(0)
-    dummy_input = jnp.zeros((1, 6, rows, cols))
-    variables = network.init(rng, dummy_input)
-    # Convert to expected format for self-play
-    params = {
-        'network_params': variables['params'],
-        'batch_stats': variables.get('batch_stats', {}),
-    }
-    print(f"Network initialized: {64} channels, {4} res blocks")
+    if use_transformer:
+        tkw = transformer_kwargs or {}
+        network = create_transformer_network(
+            rows=rows, cols=cols,
+            d_model=tkw.get('d_model', 128),
+            n_layers=tkw.get('n_layers', 4),
+            n_heads=tkw.get('n_heads', 4),
+            ffn_dim=tkw.get('ffn_dim', 256),
+        )
+        rng = jax.random.PRNGKey(0)
+        variables = init_transformer_network(rng, network, num_input_channels=6)
+        params = {'network_params': variables['params']}
+        print(f"Transformer initialized: d_model={tkw.get('d_model', 128)}, "
+              f"layers={tkw.get('n_layers', 4)}")
+    else:
+        network = PhutballNetwork(
+            num_channels=64,  # Smaller for faster profiling
+            num_res_blocks=4,
+            rows=rows,
+            cols=cols,
+        )
+        rng = jax.random.PRNGKey(0)
+        dummy_input = jnp.zeros((1, 6, rows, cols))
+        variables = network.init(rng, dummy_input)
+        params = {
+            'network_params': variables['params'],
+            'batch_stats': variables.get('batch_stats', {}),
+        }
+        print(f"CNN initialized: {64} channels, {4} res blocks")
 
     # Profile raw network self-play
     print("\n" + "-" * 40)
@@ -379,6 +415,7 @@ def run_profiler(
         batch_size=selfplay_batch_size,
         num_iterations=selfplay_iterations,
         max_turns=200,
+        use_transformer=use_transformer,
     )
     print(f"\n{raw_result.name}:")
     print(format_result(raw_result))
@@ -398,6 +435,7 @@ def run_profiler(
             num_iterations=selfplay_iterations,
             num_simulations=num_simulations,
             max_turns=50,  # Shorter games for MCTS profiling
+            use_transformer=use_transformer,
         )
         print(f"\n{mcts_result.name}:")
         print(format_result(mcts_result))
@@ -454,8 +492,20 @@ if __name__ == "__main__":
     parser.add_argument("--selfplay-iters", type=int, default=3, help="Self-play iterations")
     parser.add_argument("--mcts-sims", type=int, default=50, help="MCTS simulations")
     parser.add_argument("--no-mcts", action="store_true", help="Skip MCTS profiling")
+    parser.add_argument("--transformer", action="store_true", help="Use transformer instead of CNN")
+    parser.add_argument("--d-model", type=int, default=128, help="Transformer d_model")
+    parser.add_argument("--n-layers", type=int, default=4, help="Transformer layers")
+    parser.add_argument("--n-heads", type=int, default=4, help="Transformer attention heads")
+    parser.add_argument("--ffn-dim", type=int, default=256, help="Transformer FFN dimension")
 
     args = parser.parse_args()
+
+    tkw = {
+        'd_model': args.d_model,
+        'n_layers': args.n_layers,
+        'n_heads': args.n_heads,
+        'ffn_dim': args.ffn_dim,
+    } if args.transformer else None
 
     run_profiler(
         rows=args.rows,
@@ -466,4 +516,6 @@ if __name__ == "__main__":
         selfplay_iterations=args.selfplay_iters,
         num_simulations=args.mcts_sims,
         include_mcts=not args.no_mcts,
+        use_transformer=args.transformer,
+        transformer_kwargs=tkw,
     )
