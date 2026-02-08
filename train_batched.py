@@ -952,6 +952,7 @@ class TrainConfig:
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
     wandb_run_name: Optional[str] = None
+    wandb_run_id: Optional[str] = None  # Set to resume a previous wandb run
     wandb_mode: str = "online"
 
     # Heartbeat notifications via ntfy.sh
@@ -1022,12 +1023,22 @@ class AlphaZeroTrainer:
                 )
                 cfg = asdict(self.config)
                 # asdict(config) is all simple types, so fine for wandb
-                self.wandb_run = wandb.init(
+                init_kwargs = dict(
                     project=self.config.wandb_project,
                     name=run_name,
                     config=cfg,
                     mode=self.config.wandb_mode,
                 )
+                if self.config.wandb_run_id:
+                    init_kwargs["id"] = self.config.wandb_run_id
+                    init_kwargs["resume"] = "allow"
+                    print(f"[wandb] Resuming run: {self.config.wandb_run_id}")
+                self.wandb_run = wandb.init(**init_kwargs)
+                # Save run ID for future resumes
+                id_path = os.path.join(self.config.checkpoint_dir, "wandb_run_id.txt")
+                with open(id_path, "w") as f:
+                    f.write(self.wandb_run.id)
+                print(f"[wandb] Run ID: {self.wandb_run.id} (saved to {id_path})")
         
     def _init_network(self):
         """Initialize network parameters."""
@@ -2066,12 +2077,22 @@ class TransformerTrainer:
                     or f"phutball_transformer_{int(time.time())}"
                 )
                 cfg = asdict(self.config)
-                self.wandb_run = wandb.init(
+                init_kwargs = dict(
                     project=self.config.wandb_project,
                     name=run_name,
                     config=cfg,
                     mode=self.config.wandb_mode,
                 )
+                if self.config.wandb_run_id:
+                    init_kwargs["id"] = self.config.wandb_run_id
+                    init_kwargs["resume"] = "allow"
+                    print(f"[wandb] Resuming run: {self.config.wandb_run_id}")
+                self.wandb_run = wandb.init(**init_kwargs)
+                # Save run ID for future resumes
+                id_path = os.path.join(self.config.checkpoint_dir, "wandb_run_id.txt")
+                with open(id_path, "w") as f:
+                    f.write(self.wandb_run.id)
+                print(f"[wandb] Run ID: {self.wandb_run.id} (saved to {id_path})")
 
         # Heartbeat tracking (0 = send immediately on first iteration)
         self._last_heartbeat = 0
@@ -3210,11 +3231,20 @@ class ChimeraTrainer:
                 self.config.use_wandb = False
             else:
                 run_name = config.wandb_run_name or f"chimera_{int(time.time())}"
-                self.wandb_run = wandb.init(
+                init_kwargs = dict(
                     project=config.wandb_project,
                     name=run_name,
                     config=asdict(config),
                 )
+                if getattr(config, 'wandb_run_id', None):
+                    init_kwargs["id"] = config.wandb_run_id
+                    init_kwargs["resume"] = "allow"
+                    print(f"[wandb] Resuming run: {config.wandb_run_id}")
+                self.wandb_run = wandb.init(**init_kwargs)
+                id_path = os.path.join(config.checkpoint_dir, "wandb_run_id.txt")
+                with open(id_path, "w") as f:
+                    f.write(self.wandb_run.id)
+                print(f"[wandb] Run ID: {self.wandb_run.id} (saved to {id_path})")
 
         # Heartbeat tracking for ntfy notifications
         self._last_heartbeat = time.time()
