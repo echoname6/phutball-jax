@@ -881,6 +881,15 @@ class TrainConfig:
     lr_decay_patience: int = 10        # Iterations without improvement before decay
     lr_min: float = 1e-5               # Don't decay below this
 
+    # Cosine LR schedule (overrides plateau decay when enabled)
+    cosine_lr_enabled: bool = False
+    lr_end: float = 1e-5               # Final LR for cosine decay
+    lr_warmup_iters: int = 10          # Linear warmup iterations
+
+    # Draw penalty: value assigned to draws in training targets
+    # 0.0 = standard (draw is neutral), negative = penalize draws
+    draw_value: float = 0.0
+
     # Replay buffer
     buffer_size: int = 500000
     min_buffer_size: int = 1000  # Min examples before training starts
@@ -2032,11 +2041,28 @@ class TransformerTrainer:
             pos_encoding=config.pos_encoding,
         )
 
-        # Optimizer
-        self.optimizer = create_optimizer(
-            learning_rate=config.learning_rate,
-            weight_decay=config.weight_decay,
-        )
+        # Optimizer (cosine schedule or fixed LR)
+        if config.cosine_lr_enabled:
+            total_train_steps = config.num_iterations * config.train_steps_per_iteration
+            warmup_steps = config.lr_warmup_iters * config.train_steps_per_iteration
+
+            schedule = optax.warmup_cosine_decay_schedule(
+                init_value=config.lr_end,           # Start from lr_end during warmup
+                peak_value=config.learning_rate,     # Ramp up to peak
+                warmup_steps=warmup_steps,
+                decay_steps=total_train_steps,
+                end_value=config.lr_end,
+            )
+            self.optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adamw(learning_rate=schedule, weight_decay=config.weight_decay),
+            )
+            self._cosine_schedule = schedule  # Keep ref for logging
+        else:
+            self.optimizer = create_optimizer(
+                learning_rate=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
 
         # Replay buffer
         self.replay_buffer = ReplayBuffer(
@@ -2277,7 +2303,9 @@ class TransformerTrainer:
                       f"random={ratios['random']:.0%}, league={ratios['league']:.0%}")
 
     def _maybe_decay_lr(self, total_loss: float):
-        """Decay learning rate if loss has stalled."""
+        """Decay learning rate if loss has stalled. Skipped when cosine schedule is active."""
+        if self.config.cosine_lr_enabled:
+            return  # Cosine schedule handles LR; no plateau decay needed
         if not self.config.lr_decay_enabled:
             return
 
@@ -2404,7 +2432,9 @@ class TransformerTrainer:
             p2_wins += int(np.sum(winners_np == 2))
             draws += int(np.sum(winners_np == 0))
 
-            states, policies, values = trajectory_to_training_examples(trajectory)
+            states, policies, values = trajectory_to_training_examples(
+                trajectory, draw_value=self.config.draw_value
+            )
 
             total_states.append(states)
             total_policies.append(policies)
@@ -2585,8 +2615,17 @@ class TransformerTrainer:
         avg_metrics['policy_kl'] = policy_kl
 
         curriculum_pct = curriculum_ratio * 100
+
+        # Compute current LR for logging
+        if self.config.cosine_lr_enabled:
+            global_step = self.iteration * self.config.train_steps_per_iteration
+            display_lr = float(self._cosine_schedule(global_step))
+            self.current_lr = display_lr  # Update for wandb logging
+        else:
+            display_lr = self.current_lr
+
         print(f"  Training: {self.config.train_steps_per_iteration} steps "
-              f"({steps_per_sec:.1f} steps/sec) | lr: {self.current_lr:.0e} | "
+              f"({steps_per_sec:.1f} steps/sec) | lr: {display_lr:.2e} | "
               f"p_loss: {avg_metrics['policy_loss']:.4f}, v_loss: {avg_metrics['value_loss']:.4f}, "
               f"policy_kl: {policy_kl:.4f}, entropy: {avg_metrics['policy_entropy']:.3f}, "
               f"v_pred: {avg_metrics['value_pred_mean']:.3f}±{avg_metrics['value_pred_std']:.3f}")
@@ -2625,11 +2664,43 @@ class TransformerTrainer:
             checkpoint = pickle.load(f)
 
         self.params = checkpoint['params']
-        self.opt_state = checkpoint['opt_state']
         self.iteration = checkpoint['iteration']
         self.total_games = checkpoint['total_games']
         self.total_examples = checkpoint['total_examples']
         self.metrics_history = checkpoint.get('metrics_history', [])
+
+        # When using cosine schedule, reinitialize opt_state fresh.
+        # The schedule was already sized for num_iterations total steps,
+        # so restarting the optimizer means the cosine curve runs from
+        # the resume point over the remaining iterations - which is fine
+        # since we're switching from a flat LR anyway.
+        if self.config.cosine_lr_enabled:
+            # Rebuild schedule for remaining iterations
+            remaining_iters = self.config.num_iterations - self.iteration
+            remaining_steps = remaining_iters * self.config.train_steps_per_iteration
+            warmup_steps = min(
+                self.config.lr_warmup_iters * self.config.train_steps_per_iteration,
+                remaining_steps // 4,  # Don't waste too much of remaining time on warmup
+            )
+            schedule = optax.warmup_cosine_decay_schedule(
+                init_value=self.config.lr_end,
+                peak_value=self.config.learning_rate,
+                warmup_steps=warmup_steps,
+                decay_steps=remaining_steps,
+                end_value=self.config.lr_end,
+            )
+            self.optimizer = optax.chain(
+                optax.clip_by_global_norm(1.0),
+                optax.adamw(learning_rate=schedule, weight_decay=self.config.weight_decay),
+            )
+            self._cosine_schedule = schedule
+            self.opt_state = self.optimizer.init(self.params)
+            # Rebuild train step fn with new optimizer
+            self.train_step_fn = make_transformer_train_step_fn(self.network, self.optimizer)
+            print(f"  [cosine LR] Rebuilt schedule for {remaining_iters} remaining iters "
+                  f"({self.config.learning_rate:.1e} -> {self.config.lr_end:.1e})")
+        else:
+            self.opt_state = checkpoint['opt_state']
 
         # Restore replay buffer if present (backwards compatible)
         if 'buffer' in checkpoint:

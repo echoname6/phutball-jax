@@ -1363,6 +1363,7 @@ def play_games_vs_random_training(
 
 def trajectory_to_training_examples(
     trajectory: TrajectoryData,
+    draw_value: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert trajectory data to training examples.
@@ -1370,6 +1371,12 @@ def trajectory_to_training_examples(
     NOTE: MCTS policies are stored in physical coords. For P2, we need to
     transform them back to visual coords (180° rotation) to match the network
     input which is also rotated for P2.
+
+    Args:
+        trajectory: Game trajectory data from self-play.
+        draw_value: Value assigned to drawn games from each player's perspective.
+            Default 0.0 (standard). Use negative values (e.g. -0.3) to penalize
+            draws and discourage passive play / draw equilibria.
 
     Returns:
         states: (N, channels, rows, cols)
@@ -1419,7 +1426,7 @@ def trajectory_to_training_examples(
 
             # Value from this player's perspective
             if winner == 0:
-                value = 0.0  # Draw
+                value = draw_value  # Draw (penalized when draw_value < 0)
             elif winner == player:
                 value = 1.0  # Win
             else:
