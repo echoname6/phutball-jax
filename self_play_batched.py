@@ -577,7 +577,7 @@ def play_games_batched(
         TrajectoryData with all game trajectories
     """
     action_space_size = 2 * env_config.rows * env_config.cols + 1
-    num_channels = 6
+    num_channels = 9
     rows, cols = env_config.rows, env_config.cols
     use_mcts = num_simulations > 0
 
@@ -1213,7 +1213,7 @@ def play_games_vs_random_training(
         TrajectoryData with all game trajectories
     """
     action_space_size = 2 * env_config.rows * env_config.cols + 1
-    num_channels = 6
+    num_channels = 9
     rows, cols = env_config.rows, env_config.cols
     use_mcts = num_simulations > 0
 
@@ -1499,19 +1499,22 @@ def compute_phutball_stats(
 
             total_moves += 1
             a = int(actions_np[g, t])
-            board_before = states_np[g, t, 0]  # channel 0 is board
+            # Channel 0 = ball (binary), Channel 1 = men (binary)
+            ball_ch = states_np[g, t, 0]
+            men_ch = states_np[g, t, 1]
 
             # For P2's moves, the observation was 180° rotated for perspective normalization
             # Unflip to get physical coordinates that match the action encoding
             if players_np[g, t] == 2:
-                board_before = np.flip(np.flip(board_before, axis=0), axis=1)
+                ball_ch = np.flip(np.flip(ball_ch, axis=0), axis=1)
+                men_ch = np.flip(np.flip(men_ch, axis=0), axis=1)
 
             is_placement = a < total_positions
             is_jump = (total_positions <= a < 2 * total_positions)
 
             if is_placement:
                 # --- % occupying-adjacent-tile conversion ---
-                ball_pos = np.argwhere(board_before == BALL)
+                ball_pos = np.argwhere(ball_ch > 0.5)
                 if ball_pos.size > 0:
                     br, bc = ball_pos[0]
 
@@ -1519,8 +1522,8 @@ def compute_phutball_stats(
                     r1 = min(br + 1, rows - 1)
                     c0 = max(bc - 1, 0)
                     c1 = min(bc + 1, cols - 1)
-                    neighborhood = board_before[r0:r1 + 1, c0:c1 + 1]
-                    has_adjacent_man = np.any(neighborhood == MAN)
+                    neighborhood = men_ch[r0:r1 + 1, c0:c1 + 1]
+                    has_adjacent_man = np.any(neighborhood > 0.5)
 
                     pr = a // cols
                     pc = a % cols
@@ -1547,14 +1550,20 @@ def compute_phutball_stats(
                 land_c = jump_idx % cols
                 landing_pos = np.array([land_r, land_c], dtype=np.int32)
 
-                ball_pos_arr = np.argwhere(board_before == BALL)
+                ball_pos_arr = np.argwhere(ball_ch > 0.5)
                 if ball_pos_arr.size > 0:
                     ball_pos = ball_pos_arr[0]
+
+                    # Reconstruct board for calculate_jumped_men
+                    # (it needs integer tile values to identify men)
+                    board_reconstructed = np.zeros_like(ball_ch, dtype=np.int32)
+                    board_reconstructed[ball_ch > 0.5] = BALL
+                    board_reconstructed[men_ch > 0.5] = MAN
 
                     jumped = calculate_jumped_men(
                         jnp.array(ball_pos, dtype=jnp.int32),
                         jnp.array(landing_pos, dtype=jnp.int32),
-                        jnp.array(board_before),
+                        jnp.array(board_reconstructed),
                     )
                     jumped_np = np.asarray(jumped)
                     valid_jumped = jumped_np[jumped_np[:, 0] >= 0]
@@ -1744,6 +1753,11 @@ class ReplayBuffer:
             if rot180_mask.any():
                 # Flip state along both axes (rows and cols)
                 states[rot180_mask] = np.flip(states[rot180_mask], axis=(-2, -1))
+                # Swap my-goal and opp-goal channels (channels 2 and 3)
+                # since opponent's perspective reverses which endzone is "mine"
+                temp_ch = states[rot180_mask, 2].copy()
+                states[rot180_mask, 2] = states[rot180_mask, 3]
+                states[rot180_mask, 3] = temp_ch
                 # Negate value (opponent's perspective has opposite outcome)
                 values[rot180_mask] = -values[rot180_mask]
                 # Flip policy
@@ -1829,7 +1843,7 @@ def test_batched_games():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=6)
+    variables = init_network(init_rng, network, num_input_channels=9)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],
@@ -1871,7 +1885,7 @@ def test_replay_buffer():
     buffer = ReplayBuffer(max_size=100)
     
     # Add some data
-    states = np.random.randn(50, 6, 9, 9).astype(np.float32)
+    states = np.random.randn(50, 9, 9, 9).astype(np.float32)
     policies = np.random.rand(50, 163).astype(np.float32)
     policies = policies / policies.sum(axis=1, keepdims=True)
     values = np.random.uniform(-1, 1, 50).astype(np.float32)
@@ -1881,7 +1895,7 @@ def test_replay_buffer():
     
     # Sample
     batch = buffer.sample(16)
-    assert batch['states'].shape == (16, 6, 9, 9)
+    assert batch['states'].shape == (16, 9, 9, 9)
     
     # Add more (should wrap)
     buffer.add(states, policies, values)
@@ -1900,7 +1914,7 @@ def benchmark_batched_games():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=6)
+    variables = init_network(init_rng, network, num_input_channels=9)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],

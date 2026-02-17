@@ -1052,7 +1052,7 @@ class AlphaZeroTrainer:
     def _init_network(self):
         """Initialize network parameters."""
         self.rng, init_rng = jax.random.split(self.rng)
-        variables = init_network(init_rng, self.network, num_input_channels=6)
+        variables = init_network(init_rng, self.network, num_input_channels=9)
         
         self.params = variables['params']
         self.batch_stats = variables['batch_stats']
@@ -2161,7 +2161,7 @@ class TransformerTrainer:
     def _init_network(self):
         """Initialize network parameters (no batch_stats)."""
         self.rng, init_rng = jax.random.split(self.rng)
-        variables = init_transformer_network(init_rng, self.network, num_input_channels=6)
+        variables = init_transformer_network(init_rng, self.network, num_input_channels=9)
         self.params = variables['params']
         self.opt_state = self.optimizer.init(self.params)
 
@@ -3352,7 +3352,7 @@ class ChimeraTrainer:
     def _init_network(self):
         """Initialize network parameters."""
         self.rng, init_rng = jax.random.split(self.rng)
-        variables = init_chimera_network(init_rng, self.network, num_input_channels=6)
+        variables = init_chimera_network(init_rng, self.network, num_input_channels=9)
 
         self.params = variables['params']
         self.batch_stats = variables['batch_stats']

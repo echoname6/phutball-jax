@@ -252,7 +252,7 @@ def test_play_single_game():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=6)
+    variables = init_network(init_rng, network, num_input_channels=9)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],
@@ -326,7 +326,7 @@ def test_play_multiple_games():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=6)
+    variables = init_network(init_rng, network, num_input_channels=9)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],

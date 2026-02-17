@@ -535,33 +535,45 @@ def step(state: PhutballState, action: Array, config: EnvConfig) -> PhutballStat
 def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
     """
     Convert PhutballState to neural network input.
-    
+
     Returns:
-        Array of shape (6, rows, cols):
-        - Channel 0: board state (float32 cast of board values)
-        - Channels 1-5: jump sequence encoding
-        
+        Array of shape (9, rows, cols):
+        - Channel 0: ball position (binary)
+        - Channel 1: men positions (binary)
+        - Channel 2: my-goal endzone (endzone the current player attacks toward)
+        - Channel 3: opponent-goal endzone
+        - Channels 4-8: jump sequence encoding
+
+    The board is encoded as 4 binary channels instead of raw tile values.
+    My-goal is the endzone the current player is trying to push the ball into:
+        P1 attacks rows 0-1 (END_HI), P2 attacks rows R-2:R-1 (END_LO).
+    After the 180° spatial flip for P2, my-goal always appears at the top
+    with the same positive value for both players.
+
     Jump sequence encoding:
         - For each position in the jump sequence, we mark it in one of 5 layers
         - If a position is visited multiple times, each visit uses the next layer
         - The VALUE at that position is the step index (0, 1, 2, ...) when visited
-        
-    Example: if jump_sequence = [(5,5), (6,5), (5,5), (7,5)] with length 4:
-        - Layer 1 at (5,5) = 0.0 (first visit, step 0)
-        - Layer 1 at (6,5) = 1.0 (first visit, step 1)
-        - Layer 2 at (5,5) = 2.0 (second visit, step 2)
-        - Layer 1 at (7,5) = 3.0 (first visit, step 3)
-        
-    This allows the network to understand:
-        1. Which positions have been visited (non-zero)
-        2. In what ORDER they were visited (the value)
-        3. If positions were revisited (multiple layers marked)
     """
     rows, cols = config.rows, config.cols
     is_p2 = state.current_player == 2
 
-    # Channel 0: board state
-    board_channel = state.board.astype(jnp.float32)
+    # Channel 0: ball position (binary)
+    ball_channel = (state.board == BALL).astype(jnp.float32)
+
+    # Channel 1: men positions (binary)
+    men_channel = (state.board == MAN).astype(jnp.float32)
+
+    # Channel 2: my-goal endzone (where current player attacks toward)
+    # Channel 3: opponent-goal endzone
+    # P1 attacks toward rows 0-1 (END_HI), P2 attacks toward rows R-2:R-1 (END_LO)
+    # Use row indices (not board values) so endzones show even when occupied by pieces
+    row_indices = jnp.arange(rows)[:, None]
+    end_hi_mask = jnp.broadcast_to((row_indices <= 1), (rows, cols)).astype(jnp.float32)
+    end_lo_mask = jnp.broadcast_to((row_indices >= rows - 2), (rows, cols)).astype(jnp.float32)
+
+    my_goal = jnp.where(is_p2, end_lo_mask, end_hi_mask)
+    opp_goal = jnp.where(is_p2, end_hi_mask, end_lo_mask)
 
     # Channels 1-5: jump sequence encoding
     num_jump_layers = 5
@@ -627,10 +639,13 @@ def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
         no_sequence
     )
 
-    # Stack all channels: (6, rows, cols)
+    # Stack all channels: (9, rows, cols)
     observation = jnp.concatenate([
-        board_channel[None, :, :],  # (1, rows, cols)
-        jump_layers                  # (5, rows, cols)
+        ball_channel[None, :, :],    # (1, rows, cols)
+        men_channel[None, :, :],     # (1, rows, cols)
+        my_goal[None, :, :],         # (1, rows, cols)
+        opp_goal[None, :, :],        # (1, rows, cols)
+        jump_layers                   # (5, rows, cols)
     ], axis=0)
 
     # Perspective normalization: P1 attacks towards row 0, P2 attacks towards row max
@@ -751,18 +766,18 @@ def test_network_input_encoding():
     )
     
     obs = state_to_network_input(state, config)
-    
-    # Check shape
-    assert obs.shape == (6, 9, 9), f"Observation shape: {obs.shape}"
-    
-    # Check channel 0 is the board
-    assert float(obs[0, 4, 4]) == float(BALL), f"Ball position in channel 0: {obs[0, 4, 4]}"
-    
-    # Check jump sequence channels
-    # Position (4,4) was visited at step 0, so layer 1 should have value 1.0 (step 0 + 1)
-    assert float(obs[1, 4, 4]) == 1.0, f"Layer 1 at (4,4): {obs[1, 4, 4]}"
-    # Position (2,4) was visited at step 1, so layer 1 should have value 2.0 (step 1 + 1)
-    assert float(obs[1, 2, 4]) == 2.0, f"Layer 1 at (2,4): {obs[1, 2, 4]}"
+
+    # Check shape (9 channels: 4 board + 5 jump)
+    assert obs.shape == (9, 9, 9), f"Observation shape: {obs.shape}"
+
+    # Check channel 0 is ball position (binary)
+    assert float(obs[0, 4, 4]) == 1.0, f"Ball position in channel 0: {obs[0, 4, 4]}"
+
+    # Check jump sequence channels (now channels 4-8)
+    # Position (4,4) was visited at step 0, so layer 4 should have value 1.0 (step 0 + 1)
+    assert float(obs[4, 4, 4]) == 1.0, f"Jump layer 0 at (4,4): {obs[4, 4, 4]}"
+    # Position (2,4) was visited at step 1, so layer 4 should have value 2.0 (step 1 + 1)
+    assert float(obs[4, 2, 4]) == 2.0, f"Jump layer 0 at (2,4): {obs[4, 2, 4]}"
     
     print("✓ test_network_input_encoding passed")
 
@@ -784,14 +799,14 @@ def test_repeated_position_visit():
     
     obs = state_to_network_input(state, config)
     
-    # Position (4,4) visited twice:
-    # - First visit at step 0 -> layer 1, value 1.0
-    # - Second visit at step 2 -> layer 2, value 3.0
-    assert float(obs[1, 4, 4]) == 1.0, f"Layer 1 at (4,4): {obs[1, 4, 4]} (expected 1.0)"
-    assert float(obs[2, 4, 4]) == 3.0, f"Layer 2 at (4,4): {obs[2, 4, 4]} (expected 3.0)"
-    
-    # Position (2,4) visited once at step 1 -> layer 1, value 2.0
-    assert float(obs[1, 2, 4]) == 2.0, f"Layer 1 at (2,4): {obs[1, 2, 4]} (expected 2.0)"
+    # Position (4,4) visited twice (jump channels start at index 4):
+    # - First visit at step 0 -> jump layer 0 (ch 4), value 1.0
+    # - Second visit at step 2 -> jump layer 1 (ch 5), value 3.0
+    assert float(obs[4, 4, 4]) == 1.0, f"Jump layer 0 at (4,4): {obs[4, 4, 4]} (expected 1.0)"
+    assert float(obs[5, 4, 4]) == 3.0, f"Jump layer 1 at (4,4): {obs[5, 4, 4]} (expected 3.0)"
+
+    # Position (2,4) visited once at step 1 -> jump layer 0 (ch 4), value 2.0
+    assert float(obs[4, 2, 4]) == 2.0, f"Jump layer 0 at (2,4): {obs[4, 2, 4]} (expected 2.0)"
     
     print("✓ test_repeated_position_visit passed")
 

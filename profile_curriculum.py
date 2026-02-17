@@ -383,7 +383,7 @@ def run_profiler(
             ffn_dim=tkw.get('ffn_dim', 256),
         )
         rng = jax.random.PRNGKey(0)
-        variables = init_transformer_network(rng, network, num_input_channels=6)
+        variables = init_transformer_network(rng, network, num_input_channels=9)
         params = {'network_params': variables['params']}
         print(f"Transformer initialized: d_model={tkw.get('d_model', 128)}, "
               f"layers={tkw.get('n_layers', 4)}")
