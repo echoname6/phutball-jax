@@ -151,20 +151,27 @@ def make_mcts_recurrent_fn(network: PhutballNetwork, env_config: EnvConfig):
         # Check for terminal states
         terminated = next_states.terminated
 
-        # Discount: 1 for ongoing, 0 for terminal
-        discount = jnp.where(terminated, 0.0, 1.0)
+        # Two-player game: discount=-1 when player changes (negates opponent's value),
+        # +1 when same player (mid-jump), 0 for terminal.
+        player_changed = (embedding.current_player != next_states.current_player)
+        discount = jnp.where(
+            terminated, 0.0,
+            jnp.where(player_changed, -1.0, 1.0)
+        )
 
-        # For terminal states, compute value from current_player's perspective.
-        # During jumps (the only way to win), current_player is the player who just moved.
+        # Terminal value from the acting player's perspective.
         terminal_value = jnp.where(
             next_states.winner == next_states.current_player,
-            1.0,   # Current player won
-            jnp.where(next_states.winner == 0, 0.0, -1.0)  # Draw or opponent won
+            1.0,   # Acting player won
+            jnp.where(next_states.winner == 0, 0.0, -1.0)  # Draw or own-goal
         )
-        values = jnp.where(terminated, terminal_value, values)
+
+        # Terminal value goes into reward (not value), because with discount=0:
+        # Q = reward + 0*value = reward. Putting it in value would lose it.
+        reward = jnp.where(terminated, terminal_value, 0.0)
 
         recurrent_output = mctx.RecurrentFnOutput(
-            reward=jnp.zeros_like(values),  # AlphaZero doesn't use intermediate rewards
+            reward=reward,
             discount=discount,
             prior_logits=masked_logits,
             value=values,
@@ -331,19 +338,27 @@ def make_transformer_recurrent_fn(network: PhutballTransformer, env_config: EnvC
         # Check for terminal states
         terminated = next_states.terminated
 
-        # Discount: 1 for ongoing, 0 for terminal
-        discount = jnp.where(terminated, 0.0, 1.0)
+        # Two-player game: discount=-1 when player changes (negates opponent's value),
+        # +1 when same player (mid-jump), 0 for terminal.
+        player_changed = (embedding.current_player != next_states.current_player)
+        discount = jnp.where(
+            terminated, 0.0,
+            jnp.where(player_changed, -1.0, 1.0)
+        )
 
-        # For terminal states, compute value from current_player's perspective.
+        # Terminal value from the acting player's perspective.
         terminal_value = jnp.where(
             next_states.winner == next_states.current_player,
             1.0,
             jnp.where(next_states.winner == 0, 0.0, -1.0)
         )
-        values = jnp.where(terminated, terminal_value, values)
+
+        # Terminal value goes into reward (not value), because with discount=0:
+        # Q = reward + 0*value = reward. Putting it in value would lose it.
+        reward = jnp.where(terminated, terminal_value, 0.0)
 
         recurrent_output = mctx.RecurrentFnOutput(
-            reward=jnp.zeros_like(values),
+            reward=reward,
             discount=discount,
             prior_logits=masked_logits,
             value=values,
