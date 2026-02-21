@@ -957,6 +957,10 @@ class TrainConfig:
     curriculum_phase3_self: float = 0.80
     curriculum_phase3_random: float = 0.00
     curriculum_phase3_league: float = 0.20
+    # Per-phase MCTS simulations (None = use num_simulations for that phase)
+    curriculum_phase1_sims: Optional[int] = None
+    curriculum_phase2_sims: Optional[int] = None
+    curriculum_phase3_sims: Optional[int] = None
 
     use_wandb: bool = False
     wandb_project: str = "phutball-az"
@@ -2130,6 +2134,9 @@ class TransformerTrainer:
         self.curriculum_phase = 1  # Start at phase 1
         self.curriculum_consecutive_p1_passes = 0
         self.curriculum_consecutive_p2_passes = 0
+        self.current_num_simulations = (
+            self.config.curriculum_phase1_sims or self.config.num_simulations
+        ) if self.config.curriculum_phase_enabled else self.config.num_simulations
 
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
@@ -2298,9 +2305,18 @@ class TransformerTrainer:
                 self.curriculum_consecutive_p1_passes = 0
                 self.curriculum_consecutive_p2_passes = 0
                 ratios = self._get_curriculum_ratios()
+                # Update MCTS sim count for new phase
+                phase_sims = {
+                    1: self.config.curriculum_phase1_sims,
+                    2: self.config.curriculum_phase2_sims,
+                    3: self.config.curriculum_phase3_sims,
+                }.get(self.curriculum_phase)
+                if phase_sims is not None:
+                    self.current_num_simulations = phase_sims
                 print(f"  [Curriculum] PHASE TRANSITION -> Phase {self.curriculum_phase}")
                 print(f"  [Curriculum] New ratios: self={ratios['self']:.0%}, "
                       f"random={ratios['random']:.0%}, league={ratios['league']:.0%}")
+                print(f"  [Curriculum] MCTS simulations: {self.current_num_simulations}")
 
     def _maybe_decay_lr(self, total_loss: float):
         """Decay learning rate if loss has stalled. Skipped when cosine schedule is active."""
@@ -2409,7 +2425,7 @@ class TransformerTrainer:
                 temperature=self.config.temperature,
                 temp_threshold=self.config.temp_threshold,
                 temp_final=self.config.temp_final,
-                num_simulations=self.config.num_simulations,
+                num_simulations=self.current_num_simulations,
                 random_opponent_ratio=random_opp_ratio,
                 opponent_params=league_opponent,
                 opponent_ratio=league_ratio,
@@ -2651,6 +2667,10 @@ class TransformerTrainer:
             'metrics_history': self.metrics_history,
             'network_type': 'transformer',
             'buffer': self.replay_buffer.get_data(),
+            'curriculum_phase': self.curriculum_phase,
+            'current_num_simulations': self.current_num_simulations,
+            'curriculum_consecutive_p1_passes': self.curriculum_consecutive_p1_passes,
+            'curriculum_consecutive_p2_passes': self.curriculum_consecutive_p2_passes,
         }
 
         with open(path, 'wb') as f:
@@ -2706,7 +2726,17 @@ class TransformerTrainer:
         if 'buffer' in checkpoint:
             self.replay_buffer.set_data(checkpoint['buffer'])
 
-        print(f"Loaded checkpoint from iteration {self.iteration} (buffer: {len(self.replay_buffer)} examples)")
+        # Restore curriculum state (backwards compatible)
+        if 'curriculum_phase' in checkpoint:
+            self.curriculum_phase = checkpoint['curriculum_phase']
+            self.curriculum_consecutive_p1_passes = checkpoint.get('curriculum_consecutive_p1_passes', 0)
+            self.curriculum_consecutive_p2_passes = checkpoint.get('curriculum_consecutive_p2_passes', 0)
+        if 'current_num_simulations' in checkpoint:
+            self.current_num_simulations = checkpoint['current_num_simulations']
+
+        print(f"Loaded checkpoint from iteration {self.iteration} "
+              f"(buffer: {len(self.replay_buffer)} examples, "
+              f"phase: {self.curriculum_phase}, sims: {self.current_num_simulations})")
 
     def evaluate_vs_random_batched(self):
         """Evaluate current checkpoint vs random."""
