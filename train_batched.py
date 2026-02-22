@@ -1025,7 +1025,6 @@ class AlphaZeroTrainer:
         self.iters_without_improvement = 0
 
         self.wandb_run = None
-        self._wandb_step_offset = 0
         if self.config.use_wandb:
             if wandb is None:
                 print("WARNING: use_wandb=True but wandb is not installed; disabling wandb.")
@@ -1048,9 +1047,11 @@ class AlphaZeroTrainer:
                     init_kwargs["resume"] = "allow"
                     print(f"[wandb] Resuming run: {self.config.wandb_run_id}")
                 self.wandb_run = wandb.init(**init_kwargs)
-                self._wandb_step_offset = self.wandb_run.summary.get("_step", 0)
-                if self._wandb_step_offset > 0:
-                    print(f"[wandb] Resuming from step {self._wandb_step_offset}")
+                # Use iteration as x-axis for all metrics (avoids monotonic step issues on resume)
+                wandb.define_metric("iteration")
+                wandb.define_metric("total_games")
+                wandb.define_metric("total_train_steps")
+                wandb.define_metric("*", step_metric="iteration")
                 # Save run ID for future resumes
                 id_path = os.path.join(self.config.checkpoint_dir, "wandb_run_id.txt")
                 with open(id_path, "w") as f:
@@ -1513,11 +1514,10 @@ class AlphaZeroTrainer:
             print()
 
             if metrics and self.config.use_wandb and self.wandb_run is not None:
-                global_step = (iteration + 1) * self.config.train_steps_per_iteration + self._wandb_step_offset
-
                 log_data = {
                     "iteration": iteration,
                     "total_games": self.total_games,
+                    "total_train_steps": (iteration + 1) * self.config.train_steps_per_iteration,
                     "total_examples": self.total_examples,
                     "buffer_size": len(self.replay_buffer),
                     "selfplay/examples_per_iter": num_examples,
@@ -1539,12 +1539,11 @@ class AlphaZeroTrainer:
                     "time/iteration_sec": iter_time,
                 }
 
-                # Phutball-specific stats if available
                 if self.last_self_play_stats is not None:
                     for k, v in self.last_self_play_stats.items():
                         log_data[f"selfplay/{k}"] = v
 
-                wandb.log(log_data, step=global_step)
+                wandb.log(log_data)
 
         # Final checkpoint
         self.save_checkpoint()
@@ -2101,7 +2100,6 @@ class TransformerTrainer:
         self.iters_without_improvement = 0
 
         self.wandb_run = None
-        self._wandb_step_offset = 0
         if self.config.use_wandb:
             if wandb is None:
                 print("WARNING: use_wandb=True but wandb is not installed; disabling wandb.")
@@ -2123,10 +2121,11 @@ class TransformerTrainer:
                     init_kwargs["resume"] = "allow"
                     print(f"[wandb] Resuming run: {self.config.wandb_run_id}")
                 self.wandb_run = wandb.init(**init_kwargs)
-                # Query the last logged step so we can continue monotonically
-                self._wandb_step_offset = self.wandb_run.summary.get("_step", 0)
-                if self._wandb_step_offset > 0:
-                    print(f"[wandb] Resuming from step {self._wandb_step_offset}")
+                # Use iteration as x-axis (avoids monotonic step issues on resume)
+                wandb.define_metric("iteration")
+                wandb.define_metric("total_games")
+                wandb.define_metric("total_train_steps")
+                wandb.define_metric("*", step_metric="iteration")
                 # Save run ID for future resumes
                 id_path = os.path.join(self.config.checkpoint_dir, "wandb_run_id.txt")
                 with open(id_path, "w") as f:
@@ -2906,10 +2905,10 @@ class TransformerTrainer:
             self._maybe_send_heartbeat()
 
             if metrics and self.config.use_wandb and self.wandb_run is not None:
-                global_step = (iteration + 1) * self.config.train_steps_per_iteration + self._wandb_step_offset
                 log_data = {
                     "iteration": iteration,
                     "total_games": self.total_games,
+                    "total_train_steps": (iteration + 1) * self.config.train_steps_per_iteration,
                     "total_examples": self.total_examples,
                     "buffer_size": len(self.replay_buffer),
                     "selfplay/examples_per_iter": num_examples,
@@ -2928,7 +2927,7 @@ class TransformerTrainer:
                 if self.last_self_play_stats is not None:
                     for k, v in self.last_self_play_stats.items():
                         log_data[f"selfplay/{k}"] = v
-                wandb.log(log_data, step=global_step)
+                wandb.log(log_data)
 
         self.save_checkpoint()
         print("Training complete!")
@@ -3335,7 +3334,6 @@ class ChimeraTrainer:
 
         # Wandb
         self.wandb_run = None
-        self._wandb_step_offset = 0
         if self.config.use_wandb:
             if wandb is None:
                 print("WARNING: wandb not installed, disabling")
@@ -3352,9 +3350,10 @@ class ChimeraTrainer:
                     init_kwargs["resume"] = "allow"
                     print(f"[wandb] Resuming run: {config.wandb_run_id}")
                 self.wandb_run = wandb.init(**init_kwargs)
-                self._wandb_step_offset = self.wandb_run.summary.get("_step", 0)
-                if self._wandb_step_offset > 0:
-                    print(f"[wandb] Resuming from step {self._wandb_step_offset}")
+                wandb.define_metric("iteration")
+                wandb.define_metric("total_games")
+                wandb.define_metric("total_train_steps")
+                wandb.define_metric("*", step_metric="iteration")
                 id_path = os.path.join(config.checkpoint_dir, "wandb_run_id.txt")
                 with open(id_path, "w") as f:
                     f.write(self.wandb_run.id)
@@ -4103,6 +4102,8 @@ class ChimeraTrainer:
 
                 log_data = {
                     "iteration": iteration,
+                    "total_games": sum(self.total_games.values()),
+                    "total_train_steps": (iteration + 1) * self.config.train_steps_per_iteration,
                     "train/policy_loss": metrics["policy_loss"],
                     "train/value_loss": metrics["value_loss"],
                     "train/policy_entropy": metrics["policy_entropy"],
