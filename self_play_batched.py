@@ -1191,6 +1191,131 @@ def play_vs_random_batched(
     )
 
 
+def play_vs_checkpoint_batched(
+    current_params: dict,
+    opponent_params: dict,
+    rng: jnp.ndarray,
+    network,
+    env_config: EnvConfig,
+    num_games: int,
+    max_moves: int,
+    num_simulations: int,
+    temperature: float = 0.0,
+    dirichlet_fraction: float = 0.0,
+    mcts_policy_fn=None,
+    recurrent_fn=None,
+):
+    """
+    Play current checkpoint vs opponent checkpoint with MCTS on both sides.
+
+    Runs num_games total:
+      - games [0 .. num_games//2 - 1]: current as P1, opponent as P2
+      - games [num_games//2 .. num_games - 1]: opponent as P1, current as P2
+
+    Returns:
+        p1_wins, p1_draws, p1_losses: current's record when playing as P1
+        p2_wins, p2_draws, p2_losses: current's record when playing as P2
+        per_game_turns: turns per game
+    """
+    rows, cols = env_config.rows, env_config.cols
+    action_space_size = 2 * rows * cols + 1
+
+    games_per_color = num_games // 2
+    batch_size = 2 * games_per_color
+
+    # Which games have current as P1?
+    current_is_P1 = jnp.concatenate([
+        jnp.ones((games_per_color,), dtype=jnp.bool_),
+        jnp.zeros((games_per_color,), dtype=jnp.bool_),
+    ])
+    current_is_P2 = ~current_is_P1
+
+    # Initial states
+    states = batched_reset(env_config, batch_size)
+    terminated = jnp.zeros((batch_size,), dtype=jnp.bool_)
+
+    # Pre-create recurrent_fn once
+    if recurrent_fn is not None:
+        mcts_recurrent_fn = recurrent_fn
+    else:
+        mcts_recurrent_fn = make_mcts_recurrent_fn(network, env_config)
+
+    _mcts_policy_fn = mcts_policy_fn if mcts_policy_fn is not None else batched_mcts_policy
+
+    for step_idx in range(max_moves):
+        if not bool(jnp.any(~terminated)):
+            break
+
+        current_player = states.current_player
+        use_current = jnp.where(
+            current_player == 1,
+            current_is_P1,
+            current_is_P2,
+        )
+
+        rng, rng_cur, rng_opp = jax.random.split(rng, 3)
+
+        # MCTS for current params
+        actions_cur, _, _ = _mcts_policy_fn(
+            current_params,
+            states,
+            rng_cur,
+            network,
+            env_config,
+            num_simulations=num_simulations,
+            temperature=temperature,
+            dirichlet_fraction=dirichlet_fraction,
+            recurrent_fn=mcts_recurrent_fn,
+        )
+
+        # MCTS for opponent params
+        actions_opp, _, _ = _mcts_policy_fn(
+            opponent_params,
+            states,
+            rng_opp,
+            network,
+            env_config,
+            num_simulations=num_simulations,
+            temperature=temperature,
+            dirichlet_fraction=dirichlet_fraction,
+            recurrent_fn=mcts_recurrent_fn,
+        )
+
+        # Select action per game
+        actions = jnp.where(use_current, actions_cur, actions_opp)
+
+        # Step environments
+        states, terminated = _step_games_batched(states, actions, terminated, env_config)
+
+    winners = states.winner
+    per_game_turns = states.num_turns
+
+    # Compute side-aware stats (from current's POV)
+    draw_mask = (winners == 0)
+
+    p1_win_mask = current_is_P1 & (winners == 1)
+    p1_draw_mask = current_is_P1 & draw_mask
+    p1_loss_mask = current_is_P1 & (winners == 2)
+
+    p2_win_mask = current_is_P2 & (winners == 2)
+    p2_draw_mask = current_is_P2 & draw_mask
+    p2_loss_mask = current_is_P2 & (winners == 1)
+
+    p1_wins = jnp.sum(p1_win_mask.astype(jnp.int32))
+    p1_draws = jnp.sum(p1_draw_mask.astype(jnp.int32))
+    p1_losses = jnp.sum(p1_loss_mask.astype(jnp.int32))
+
+    p2_wins = jnp.sum(p2_win_mask.astype(jnp.int32))
+    p2_draws = jnp.sum(p2_draw_mask.astype(jnp.int32))
+    p2_losses = jnp.sum(p2_loss_mask.astype(jnp.int32))
+
+    return (
+        p1_wins, p1_draws, p1_losses,
+        p2_wins, p2_draws, p2_losses,
+        per_game_turns,
+    )
+
+
 def play_games_vs_random_training(
     params: dict,
     rng: jnp.ndarray,

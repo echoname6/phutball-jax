@@ -37,6 +37,7 @@ from self_play_batched import (
     compute_phutball_stats,
     play_match_batched,
     play_vs_random_batched,
+    play_vs_checkpoint_batched,
     batched_mcts_policy,
     batched_reset,
     # Transformer MCTS
@@ -916,6 +917,19 @@ class TrainConfig:
     eval_vs_random_threshold: Optional[float] = None
     stop_when_beating_random: bool = False
 
+    # League ELO evaluation
+    elo_eval_enabled: bool = False
+    elo_eval_games_per_perspective: int = 10  # games per perspective per opponent
+    elo_eval_max_opponents: int = 5
+    elo_eval_num_simulations: int = 32
+    elo_eval_max_moves: int = 2048
+
+    # ELO-based sim escalation
+    elo_escalation_enabled: bool = False
+    elo_min_improvement: float = 20.0
+    elo_stagnation_patience: int = 5
+    elo_sim_tiers: Tuple[int, ...] = (32, 48, 64)
+
     # Curriculum learning (N-jump winning states)
     curriculum_enabled: bool = True
     curriculum_initial_ratio: float = 0.5    # Initial fraction of batch from curriculum
@@ -937,7 +951,7 @@ class TrainConfig:
     league_enabled: bool = False
     league_pool_size: int = 10             # Max past checkpoints to keep in pool
     league_opponent_ratio: float = 0.3     # Fraction of games vs league opponent (rest vs self)
-    league_save_every: int = 5             # Save to pool every N iterations
+    league_save_every: int = 10            # Save to pool every N iterations
     league_random_ratio: float = 0.1       # Fraction of games vs pure random (within league games)
 
     # Phase-based curriculum: transitions based on win rate vs random
@@ -2146,6 +2160,16 @@ class TransformerTrainer:
             self.config.curriculum_phase1_sims or self.config.num_simulations
         ) if self.config.curriculum_phase_enabled else self.config.num_simulations
 
+        # ELO evaluation state
+        self.best_elo = -float('inf')
+        self.elo_stagnation_count = 0
+        self.elo_sim_tier_index = 0
+        self.elo_history = []
+        self._last_elo_stats = None
+
+        if self.config.elo_escalation_enabled:
+            self.current_num_simulations = self.config.elo_sim_tiers[0]
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
@@ -2186,7 +2210,7 @@ class TransformerTrainer:
 
     def _maybe_save_to_league(self):
         """Save current params to league pool if enabled."""
-        if not self.config.league_enabled:
+        if not (self.config.league_enabled or self.config.elo_eval_enabled):
             return
         if (self.iteration + 1) % self.config.league_save_every != 0:
             return
@@ -2205,7 +2229,7 @@ class TransformerTrainer:
 
     def _populate_league_pool_from_checkpoints(self):
         """Populate league pool from existing checkpoints on resume."""
-        if not self.config.league_enabled:
+        if not (self.config.league_enabled or self.config.elo_eval_enabled):
             return
 
         # Find all existing checkpoints
@@ -2326,6 +2350,33 @@ class TransformerTrainer:
                       f"random={ratios['random']:.0%}, league={ratios['league']:.0%}")
                 print(f"  [Curriculum] MCTS simulations: {self.current_num_simulations}")
 
+    def _update_elo_escalation(self, current_elo: float):
+        """Update ELO-based sim escalation state."""
+        if not self.config.elo_escalation_enabled:
+            return
+
+        min_improvement = self.config.elo_min_improvement
+        patience = self.config.elo_stagnation_patience
+        tiers = self.config.elo_sim_tiers
+
+        if current_elo > self.best_elo + min_improvement:
+            self.elo_stagnation_count = 0
+            self.best_elo = current_elo
+            print(f"  [ELO] New best ELO: {current_elo:.1f} (stagnation reset)")
+        else:
+            self.elo_stagnation_count += 1
+            print(f"  [ELO] Stagnation {self.elo_stagnation_count}/{patience} "
+                  f"(current: {current_elo:.1f}, best: {self.best_elo:.1f})")
+
+        if (self.elo_stagnation_count >= patience and
+                self.elo_sim_tier_index < len(tiers) - 1):
+            self.elo_sim_tier_index += 1
+            self.current_num_simulations = tiers[self.elo_sim_tier_index]
+            self.elo_stagnation_count = 0
+            self.best_elo = current_elo  # Reset baseline to current
+            print(f"  [ELO] SIM ESCALATION -> tier {self.elo_sim_tier_index} "
+                  f"({self.current_num_simulations} sims)")
+
     def _maybe_decay_lr(self, total_loss: float):
         """Decay learning rate if loss has stalled. Skipped when cosine schedule is active."""
         if self.config.cosine_lr_enabled:
@@ -2381,9 +2432,12 @@ class TransformerTrainer:
         self_play_games = 0
 
         # Determine opponent ratios based on curriculum or legacy settings
-        curriculum_ratios = self._get_curriculum_ratios()
-
-        if curriculum_ratios is not None:
+        if self.config.elo_eval_enabled:
+            # Pure self-play when using ELO evaluation
+            random_opp_ratio = 0.0
+            league_ratio = 0.0
+            league_opponent = None
+        elif (curriculum_ratios := self._get_curriculum_ratios()) is not None:
             # Use curriculum phase-based ratios
             random_opp_ratio = curriculum_ratios["random"]
             league_ratio = curriculum_ratios["league"]
@@ -2679,6 +2733,10 @@ class TransformerTrainer:
             'current_num_simulations': self.current_num_simulations,
             'curriculum_consecutive_p1_passes': self.curriculum_consecutive_p1_passes,
             'curriculum_consecutive_p2_passes': self.curriculum_consecutive_p2_passes,
+            'best_elo': self.best_elo,
+            'elo_stagnation_count': self.elo_stagnation_count,
+            'elo_sim_tier_index': self.elo_sim_tier_index,
+            'elo_history': self.elo_history,
         }
 
         with open(path, 'wb') as f:
@@ -2741,6 +2799,12 @@ class TransformerTrainer:
             self.curriculum_consecutive_p2_passes = checkpoint.get('curriculum_consecutive_p2_passes', 0)
         if 'current_num_simulations' in checkpoint:
             self.current_num_simulations = checkpoint['current_num_simulations']
+
+        # Restore ELO state (backwards compatible)
+        self.best_elo = checkpoint.get('best_elo', -float('inf'))
+        self.elo_stagnation_count = checkpoint.get('elo_stagnation_count', 0)
+        self.elo_sim_tier_index = checkpoint.get('elo_sim_tier_index', 0)
+        self.elo_history = checkpoint.get('elo_history', [])
 
         print(f"Loaded checkpoint from iteration {self.iteration} "
               f"(buffer: {len(self.replay_buffer)} examples, "
@@ -2832,6 +2896,111 @@ class TransformerTrainer:
 
         return win_rate_overall, stats
 
+    def evaluate_vs_league(self):
+        """Evaluate current checkpoint vs league pool using ELO."""
+        pool_size = len(self.league_pool)
+        if pool_size < 1:
+            print("  [ELO] No opponents in league pool, skipping evaluation")
+            return 1500.0, {}
+
+        num_opponents = min(pool_size, self.config.elo_eval_max_opponents)
+        opponents = self.league_pool[-num_opponents:]
+
+        # Build player list: opponents + current
+        names = [f"iter_{it}" for it, _ in opponents] + ["current"]
+        n = len(names)
+
+        W = np.zeros((n, n), dtype=np.float64)
+        D = np.zeros((n, n), dtype=np.float64)
+        L = np.zeros((n, n), dtype=np.float64)
+
+        current_idx = n - 1
+        current_params = self.get_network_params()
+
+        # Create recurrent_fn once
+        recurrent_fn = make_transformer_recurrent_fn(self.network, self.env_config)
+
+        num_games = 2 * self.config.elo_eval_games_per_perspective
+
+        print(f"  [ELO] Evaluating vs {num_opponents} opponents "
+              f"({num_games} games each)...")
+
+        for opp_idx, (opp_iter, opp_params) in enumerate(opponents):
+            self.rng, eval_rng = jax.random.split(self.rng)
+
+            (
+                p1_wins, p1_draws, p1_losses,
+                p2_wins, p2_draws, p2_losses,
+                turns,
+            ) = play_vs_checkpoint_batched(
+                current_params=current_params,
+                opponent_params=opp_params,
+                rng=eval_rng,
+                network=self.network,
+                env_config=self.env_config,
+                num_games=num_games,
+                max_moves=self.config.elo_eval_max_moves,
+                num_simulations=self.config.elo_eval_num_simulations,
+                temperature=0.0,
+                dirichlet_fraction=0.0,
+                mcts_policy_fn=transformer_mcts_policy,
+                recurrent_fn=recurrent_fn,
+            )
+
+            wins = int(p1_wins) + int(p2_wins)
+            draws = int(p1_draws) + int(p2_draws)
+            losses = int(p1_losses) + int(p2_losses)
+
+            W[current_idx, opp_idx] = wins
+            D[current_idx, opp_idx] = draws
+            L[current_idx, opp_idx] = losses
+
+            W[opp_idx, current_idx] = losses
+            D[opp_idx, current_idx] = draws
+            L[opp_idx, current_idx] = wins
+
+            total = wins + draws + losses
+            wr = wins / total if total > 0 else 0.0
+            print(f"    vs iter_{opp_iter}: {wins}W-{draws}D-{losses}L "
+                  f"(win rate: {wr:.1%})")
+
+        # Compute ELO ratings
+        ratings = compute_elo_from_results(names, W, D, L)
+        current_elo = float(ratings[current_idx])
+
+        # Compute ELO delta from last eval
+        elo_delta = 0.0
+        if self.elo_history:
+            elo_delta = current_elo - self.elo_history[-1]
+        self.elo_history.append(current_elo)
+
+        print(f"  [ELO] Ratings: ", end="")
+        for i, name in enumerate(names):
+            print(f"{name}={ratings[i]:.0f} ", end="")
+        print(f"| delta={elo_delta:+.1f}")
+
+        # Update escalation
+        self._update_elo_escalation(current_elo)
+
+        # Store stats for wandb
+        elo_stats = {
+            "elo": current_elo,
+            "elo_delta": elo_delta,
+            "num_opponents": num_opponents,
+            "sim_count": self.current_num_simulations,
+            "elo_sim_tier": self.elo_sim_tier_index,
+            "elo_stagnation_count": self.elo_stagnation_count,
+        }
+        # Per-opponent win rates
+        for opp_idx, (opp_iter, _) in enumerate(opponents):
+            total = W[current_idx, opp_idx] + D[current_idx, opp_idx] + L[current_idx, opp_idx]
+            if total > 0:
+                elo_stats[f"vs_iter_{opp_iter}_winrate"] = float(W[current_idx, opp_idx] / total)
+
+        self._last_elo_stats = elo_stats
+
+        return current_elo, elo_stats
+
     def train(self):
         """Main training loop."""
         existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
@@ -2885,7 +3054,9 @@ class TransformerTrainer:
             if (iteration + 1) % self.config.checkpoint_every == 0:
                 self.save_checkpoint()
 
-                if self.config.eval_enable:
+                if self.config.elo_eval_enabled:
+                    current_elo, elo_stats = self.evaluate_vs_league()
+                elif self.config.eval_enable:
                     win_rate, stats = self.evaluate_vs_random_batched()
                     threshold = self.config.eval_vs_random_threshold
                     if threshold is not None:
@@ -2927,6 +3098,10 @@ class TransformerTrainer:
                 if self.last_self_play_stats is not None:
                     for k, v in self.last_self_play_stats.items():
                         log_data[f"selfplay/{k}"] = v
+                if self._last_elo_stats is not None:
+                    for k, v in self._last_elo_stats.items():
+                        log_data[f"eval/{k}"] = v
+                    self._last_elo_stats = None
                 wandb.log(log_data)
 
         self.save_checkpoint()
@@ -3247,7 +3422,7 @@ class ChimeraConfig:
     league_enabled: bool = False
     league_pool_size: int = 10             # Max past checkpoints to keep
     league_opponent_ratio: float = 0.5     # Fraction of games vs past opponent
-    league_save_every: int = 5             # Save to pool every N iterations
+    league_save_every: int = 10            # Save to pool every N iterations
 
     # Random opponent mixing (decays as win rate vs random improves)
     random_opponent_enabled: bool = False
