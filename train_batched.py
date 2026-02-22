@@ -1025,6 +1025,7 @@ class AlphaZeroTrainer:
         self.iters_without_improvement = 0
 
         self.wandb_run = None
+        self._wandb_step_offset = 0
         if self.config.use_wandb:
             if wandb is None:
                 print("WARNING: use_wandb=True but wandb is not installed; disabling wandb.")
@@ -1047,12 +1048,15 @@ class AlphaZeroTrainer:
                     init_kwargs["resume"] = "allow"
                     print(f"[wandb] Resuming run: {self.config.wandb_run_id}")
                 self.wandb_run = wandb.init(**init_kwargs)
+                self._wandb_step_offset = self.wandb_run.summary.get("_step", 0)
+                if self._wandb_step_offset > 0:
+                    print(f"[wandb] Resuming from step {self._wandb_step_offset}")
                 # Save run ID for future resumes
                 id_path = os.path.join(self.config.checkpoint_dir, "wandb_run_id.txt")
                 with open(id_path, "w") as f:
                     f.write(self.wandb_run.id)
                 print(f"[wandb] Run ID: {self.wandb_run.id} (saved to {id_path})")
-        
+
     def _init_network(self):
         """Initialize network parameters."""
         self.rng, init_rng = jax.random.split(self.rng)
@@ -1509,7 +1513,7 @@ class AlphaZeroTrainer:
             print()
 
             if metrics and self.config.use_wandb and self.wandb_run is not None:
-                global_step = (iteration + 1) * self.config.train_steps_per_iteration
+                global_step = (iteration + 1) * self.config.train_steps_per_iteration + self._wandb_step_offset
 
                 log_data = {
                     "iteration": iteration,
@@ -2097,6 +2101,7 @@ class TransformerTrainer:
         self.iters_without_improvement = 0
 
         self.wandb_run = None
+        self._wandb_step_offset = 0
         if self.config.use_wandb:
             if wandb is None:
                 print("WARNING: use_wandb=True but wandb is not installed; disabling wandb.")
@@ -2118,6 +2123,10 @@ class TransformerTrainer:
                     init_kwargs["resume"] = "allow"
                     print(f"[wandb] Resuming run: {self.config.wandb_run_id}")
                 self.wandb_run = wandb.init(**init_kwargs)
+                # Query the last logged step so we can continue monotonically
+                self._wandb_step_offset = self.wandb_run.summary.get("_step", 0)
+                if self._wandb_step_offset > 0:
+                    print(f"[wandb] Resuming from step {self._wandb_step_offset}")
                 # Save run ID for future resumes
                 id_path = os.path.join(self.config.checkpoint_dir, "wandb_run_id.txt")
                 with open(id_path, "w") as f:
@@ -2897,7 +2906,7 @@ class TransformerTrainer:
             self._maybe_send_heartbeat()
 
             if metrics and self.config.use_wandb and self.wandb_run is not None:
-                global_step = (iteration + 1) * self.config.train_steps_per_iteration
+                global_step = (iteration + 1) * self.config.train_steps_per_iteration + self._wandb_step_offset
                 log_data = {
                     "iteration": iteration,
                     "total_games": self.total_games,
@@ -3326,6 +3335,7 @@ class ChimeraTrainer:
 
         # Wandb
         self.wandb_run = None
+        self._wandb_step_offset = 0
         if self.config.use_wandb:
             if wandb is None:
                 print("WARNING: wandb not installed, disabling")
@@ -3342,6 +3352,9 @@ class ChimeraTrainer:
                     init_kwargs["resume"] = "allow"
                     print(f"[wandb] Resuming run: {config.wandb_run_id}")
                 self.wandb_run = wandb.init(**init_kwargs)
+                self._wandb_step_offset = self.wandb_run.summary.get("_step", 0)
+                if self._wandb_step_offset > 0:
+                    print(f"[wandb] Resuming from step {self._wandb_step_offset}")
                 id_path = os.path.join(config.checkpoint_dir, "wandb_run_id.txt")
                 with open(id_path, "w") as f:
                     f.write(self.wandb_run.id)
