@@ -2170,6 +2170,9 @@ class TransformerTrainer:
         self.elo_sim_tier_index = 0
         self.elo_history = []
         self._last_elo_stats = None
+        # Cumulative game results within a rung: {(iter_a, iter_b): [wins, draws, losses]}
+        # wins/draws/losses are from iter_a's perspective
+        self.elo_game_results = {}
 
         if self.config.elo_escalation_enabled:
             self.current_num_simulations = self.config.elo_sim_tiers[0]
@@ -2183,31 +2186,55 @@ class TransformerTrainer:
                     self.board_ladder_index = i
                     break
 
+    def _send_ntfy(self, title: str, body: str, priority: str = "low"):
+        """Send a notification via ntfy.sh."""
+        if not self.config.ntfy_topic:
+            return
+        import requests
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                requests.post(
+                    f"https://ntfy.sh/{self.config.ntfy_topic}",
+                    data=body,
+                    headers={"Title": title, "Priority": priority},
+                    timeout=10
+                )
+                print(f"[ntfy] Sent: {title}")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = 2 ** attempt
+                    print(f"[ntfy] Attempt {attempt + 1} failed, retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    print(f"[ntfy] Failed after {max_retries} attempts: {e}")
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
             return
         now = time.time()
         if now - self._last_heartbeat >= self.config.heartbeat_minutes * 60:
-            import requests
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    requests.post(
-                        f"https://ntfy.sh/{self.config.ntfy_topic}",
-                        data=f"Iter {self.iteration}, games {self.total_games}, examples {self.total_examples}",
-                        headers={"Title": "Transformer Training Heartbeat", "Priority": "low"},
-                        timeout=10
-                    )
-                    print(f"[ntfy] Heartbeat sent: iter {self.iteration}")
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        delay = 2 ** attempt  # 1s, 2s, 4s
-                        print(f"[ntfy] Heartbeat attempt {attempt + 1} failed, retrying in {delay}s...")
-                        time.sleep(delay)
-                    else:
-                        print(f"[ntfy] Heartbeat failed after {max_retries} attempts: {e}")
+            lines = [
+                f"Iter {self.iteration} | {self.config.rows}x{self.config.cols} board",
+                f"Games: {self.total_games:,} | Buffer: {len(self.replay_buffer):,}",
+                f"Sims: {self.current_num_simulations} (tier {self.elo_sim_tier_index}/{len(self.config.elo_sim_tiers)-1})",
+            ]
+            if self.config.board_ladder_enabled:
+                lines.append(f"Ladder: rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}")
+            if self.elo_history:
+                lines.append(f"ELO: {self.elo_history[-1]:.0f} (best: {self.best_elo:.0f}, stag: {self.elo_stagnation_count})")
+            if hasattr(self, '_recent_elo_ratings') and self._recent_elo_ratings:
+                ratings_str = " | ".join(
+                    f"{'cur' if it == self.iteration else it}:{elo:.0f}"
+                    for it, elo in self._recent_elo_ratings.items()
+                )
+                lines.append(f"League: {ratings_str}")
+            if self.metrics_history:
+                m = self.metrics_history[-1]
+                lines.append(f"Loss: p={m.get('policy_loss', 0):.3f} v={m.get('value_loss', 0):.3f}")
+            self._send_ntfy("Training Heartbeat", "\n".join(lines))
             self._last_heartbeat = now
 
     def _init_network(self):
@@ -2389,6 +2416,13 @@ class TransformerTrainer:
             self.best_elo = current_elo  # Reset baseline to current
             print(f"  [ELO] SIM ESCALATION -> tier {self.elo_sim_tier_index} "
                   f"({self.current_num_simulations} sims)")
+            self._send_ntfy(
+                "Sim Escalation",
+                f"Iter {self.iteration} | {self.config.rows}x{self.config.cols}\n"
+                f"Tier {self.elo_sim_tier_index}/{len(tiers)-1} -> {self.current_num_simulations} sims\n"
+                f"ELO: {current_elo:.0f}",
+                priority="default",
+            )
 
         # Board size escalation: at max sim tier and still stagnant
         if (self.config.board_ladder_enabled and
@@ -2466,8 +2500,18 @@ class TransformerTrainer:
         self.best_elo = -float('inf')
         self.elo_stagnation_count = 0
         self.elo_history = []
+        self.elo_game_results = {}
 
         print(f"  [LADDER] Params preserved, buffer/league cleared, sims reset to {tiers[0]}")
+
+        self._send_ntfy(
+            "Board Size Escalation",
+            f"Iter {self.iteration} | {old_rows}x{old_cols} -> {new_rows}x{new_cols}\n"
+            f"Rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}\n"
+            f"Sims reset to {tiers[0]}, buffer/league cleared\n"
+            f"Weights preserved",
+            priority="high",
+        )
 
     def _maybe_decay_lr(self, total_loss: float):
         """Decay learning rate if loss has stalled. Skipped when cosine schedule is active."""
@@ -2829,6 +2873,7 @@ class TransformerTrainer:
             'elo_stagnation_count': self.elo_stagnation_count,
             'elo_sim_tier_index': self.elo_sim_tier_index,
             'elo_history': self.elo_history,
+            'elo_game_results': self.elo_game_results,
             'board_ladder_index': self.board_ladder_index,
         }
 
@@ -2898,6 +2943,7 @@ class TransformerTrainer:
         self.elo_stagnation_count = checkpoint.get('elo_stagnation_count', 0)
         self.elo_sim_tier_index = checkpoint.get('elo_sim_tier_index', 0)
         self.elo_history = checkpoint.get('elo_history', [])
+        self.elo_game_results = checkpoint.get('elo_game_results', {})
 
         # Restore board ladder state and rebuild if board size changed
         self.board_ladder_index = checkpoint.get('board_ladder_index', 0)
@@ -3027,7 +3073,12 @@ class TransformerTrainer:
         return win_rate_overall, stats
 
     def evaluate_vs_league(self):
-        """Evaluate current checkpoint vs league pool using ELO."""
+        """Evaluate current checkpoint vs league pool using ELO.
+
+        Game results accumulate in self.elo_game_results across evals within
+        a rung, so the ELO solver sees the full tournament history — not just
+        this eval's games.
+        """
         pool_size = len(self.league_pool)
         if pool_size < 1:
             print("  [ELO] No opponents in league pool, skipping evaluation")
@@ -3036,15 +3087,7 @@ class TransformerTrainer:
         num_opponents = min(pool_size, self.config.elo_eval_max_opponents)
         opponents = self.league_pool[-num_opponents:]
 
-        # Build player list: opponents + current
-        names = [f"iter_{it}" for it, _ in opponents] + ["current"]
-        n = len(names)
-
-        W = np.zeros((n, n), dtype=np.float64)
-        D = np.zeros((n, n), dtype=np.float64)
-        L = np.zeros((n, n), dtype=np.float64)
-
-        current_idx = n - 1
+        current_iter = self.iteration
         current_params = self.get_network_params()
 
         # Create recurrent_fn once
@@ -3055,7 +3098,7 @@ class TransformerTrainer:
         print(f"  [ELO] Evaluating vs {num_opponents} opponents "
               f"({num_games} games each)...")
 
-        for opp_idx, (opp_iter, opp_params) in enumerate(opponents):
+        for opp_iter, opp_params in opponents:
             self.rng, eval_rng = jax.random.split(self.rng)
 
             (
@@ -3081,22 +3124,45 @@ class TransformerTrainer:
             draws = int(p1_draws) + int(p2_draws)
             losses = int(p1_losses) + int(p2_losses)
 
-            W[current_idx, opp_idx] = wins
-            D[current_idx, opp_idx] = draws
-            L[current_idx, opp_idx] = losses
-
-            W[opp_idx, current_idx] = losses
-            D[opp_idx, current_idx] = draws
-            L[opp_idx, current_idx] = wins
+            # Accumulate into persistent game results (current's perspective)
+            key = (current_iter, opp_iter)
+            if key in self.elo_game_results:
+                prev = self.elo_game_results[key]
+                self.elo_game_results[key] = [prev[0] + wins, prev[1] + draws, prev[2] + losses]
+            else:
+                self.elo_game_results[key] = [wins, draws, losses]
 
             total = wins + draws + losses
             wr = wins / total if total > 0 else 0.0
             print(f"    vs iter_{opp_iter}: {wins}W-{draws}D-{losses}L "
                   f"(win rate: {wr:.1%})")
 
-        # Compute ELO ratings
+        # Build full W/D/L matrix from all accumulated results
+        all_iters = set()
+        for (a, b) in self.elo_game_results:
+            all_iters.add(a)
+            all_iters.add(b)
+        iter_list = sorted(all_iters)
+        iter_to_idx = {it: i for i, it in enumerate(iter_list)}
+        n = len(iter_list)
+
+        W = np.zeros((n, n), dtype=np.float64)
+        D = np.zeros((n, n), dtype=np.float64)
+        L = np.zeros((n, n), dtype=np.float64)
+
+        for (a, b), (w, d, l) in self.elo_game_results.items():
+            ia, ib = iter_to_idx[a], iter_to_idx[b]
+            W[ia, ib] += w
+            D[ia, ib] += d
+            L[ia, ib] += l
+            # Mirror: b's perspective
+            W[ib, ia] += l
+            D[ib, ia] += d
+            L[ib, ia] += w
+
+        names = [f"iter_{it}" for it in iter_list]
         ratings = compute_elo_from_results(names, W, D, L)
-        current_elo = float(ratings[current_idx])
+        current_elo = float(ratings[iter_to_idx[current_iter]])
 
         # Compute ELO delta from last eval
         elo_delta = 0.0
@@ -3104,30 +3170,51 @@ class TransformerTrainer:
             elo_delta = current_elo - self.elo_history[-1]
         self.elo_history.append(current_elo)
 
-        print(f"  [ELO] Ratings: ", end="")
-        for i, name in enumerate(names):
-            print(f"{name}={ratings[i]:.0f} ", end="")
+        # Print ratings for recent players (current + opponents played this eval)
+        print(f"  [ELO] Ratings ({len(iter_list)} players, {len(self.elo_game_results)} matchups): ", end="")
+        display_iters = [opp_iter for opp_iter, _ in opponents] + [current_iter]
+        for it in display_iters:
+            idx = iter_to_idx[it]
+            label = "current" if it == current_iter else f"iter_{it}"
+            print(f"{label}={ratings[idx]:.0f} ", end="")
         print(f"| delta={elo_delta:+.1f}")
 
         # Update escalation
         self._update_elo_escalation(current_elo)
 
         # Store stats for wandb
+        board_key = f"{self.config.rows}x{self.config.cols}"
         elo_stats = {
             "elo": current_elo,
             "elo_delta": elo_delta,
             "num_opponents": num_opponents,
+            "num_rated_players": len(iter_list),
+            "num_matchups": len(self.elo_game_results),
             "sim_count": self.current_num_simulations,
             "elo_sim_tier": self.elo_sim_tier_index,
             "elo_stagnation_count": self.elo_stagnation_count,
-            "board_size": f"{self.config.rows}x{self.config.cols}",
+            "board_size": board_key,
             "board_ladder_index": self.board_ladder_index,
+            # Board-size-prefixed ELO for cross-run comparison
+            f"{board_key}/elo": current_elo,
+            f"{board_key}/elo_delta": elo_delta,
+            f"{board_key}/sim_tier": self.elo_sim_tier_index,
         }
-        # Per-opponent win rates
-        for opp_idx, (opp_iter, _) in enumerate(opponents):
-            total = W[current_idx, opp_idx] + D[current_idx, opp_idx] + L[current_idx, opp_idx]
-            if total > 0:
-                elo_stats[f"vs_iter_{opp_iter}_winrate"] = float(W[current_idx, opp_idx] / total)
+        # Per-opponent win rates and ELOs
+        for opp_iter, _ in opponents:
+            key = (current_iter, opp_iter)
+            if key in self.elo_game_results:
+                w, d, l = self.elo_game_results[key]
+                total = w + d + l
+                if total > 0:
+                    elo_stats[f"vs_iter_{opp_iter}_winrate"] = float(w / total)
+                    elo_stats[f"vs_iter_{opp_iter}_elo"] = float(ratings[iter_to_idx[opp_iter]])
+
+        # Cache recent checkpoint ratings for ntfy heartbeat
+        recent = iter_list[-5:]
+        self._recent_elo_ratings = {
+            it: float(ratings[iter_to_idx[it]]) for it in recent
+        }
 
         self._last_elo_stats = elo_stats
 
