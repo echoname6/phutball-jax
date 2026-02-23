@@ -930,6 +930,10 @@ class TrainConfig:
     elo_stagnation_patience: int = 5
     elo_sim_tiers: Tuple[int, ...] = (32, 48, 64)
 
+    # Board size escalation (Jacob's Ladder)
+    board_ladder_enabled: bool = False
+    board_ladder_sizes: Tuple[Tuple[int, int], ...] = ((13, 7), (15, 9), (17, 11), (19, 13), (21, 15))
+
     # Curriculum learning (N-jump winning states)
     curriculum_enabled: bool = True
     curriculum_initial_ratio: float = 0.5    # Initial fraction of batch from curriculum
@@ -2170,6 +2174,15 @@ class TransformerTrainer:
         if self.config.elo_escalation_enabled:
             self.current_num_simulations = self.config.elo_sim_tiers[0]
 
+        # Board ladder state
+        self.board_ladder_index = 0
+        if self.config.board_ladder_enabled:
+            current_size = (self.config.rows, self.config.cols)
+            for i, size in enumerate(self.config.board_ladder_sizes):
+                if size == current_size:
+                    self.board_ladder_index = i
+                    break
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
@@ -2376,6 +2389,85 @@ class TransformerTrainer:
             self.best_elo = current_elo  # Reset baseline to current
             print(f"  [ELO] SIM ESCALATION -> tier {self.elo_sim_tier_index} "
                   f"({self.current_num_simulations} sims)")
+
+        # Board size escalation: at max sim tier and still stagnant
+        if (self.config.board_ladder_enabled and
+                self.elo_stagnation_count >= patience and
+                self.elo_sim_tier_index >= len(tiers) - 1 and
+                self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
+            self._escalate_board_size()
+
+    def _escalate_board_size(self):
+        """Escalate to next board size on the ladder (Jacob's Ladder).
+
+        Keeps existing params/opt_state (transformer weights are board-size agnostic).
+        Clears replay buffer (wrong spatial dims) and league pool (wrong env_config).
+        Resets ELO/sim state to start fresh on the new board.
+        """
+        old_rows, old_cols = self.config.rows, self.config.cols
+        self.board_ladder_index += 1
+        new_rows, new_cols = self.config.board_ladder_sizes[self.board_ladder_index]
+
+        print(f"  [LADDER] BOARD SIZE ESCALATION: {old_rows}x{old_cols} -> {new_rows}x{new_cols} "
+              f"(rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes) - 1})")
+
+        # Save checkpoint at transition point (old board size)
+        transition_path = os.path.join(
+            self.config.checkpoint_dir,
+            f"checkpoint_{self.iteration:06d}_ladder_{old_rows}x{old_cols}.pkl"
+        )
+        self.save_checkpoint(transition_path)
+
+        # Update config dimensions
+        self.config.rows = new_rows
+        self.config.cols = new_cols
+
+        # Update checkpoint dir to new board size (e.g. .../transformer_13x7_... -> .../transformer_15x9_...)
+        old_size_str = f"{old_rows}x{old_cols}"
+        new_size_str = f"{new_rows}x{new_cols}"
+        if old_size_str in self.config.checkpoint_dir:
+            self.config.checkpoint_dir = self.config.checkpoint_dir.replace(old_size_str, new_size_str)
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+            print(f"  [LADDER] Checkpoint dir -> {self.config.checkpoint_dir}")
+
+        # Recreate env_config with new dimensions
+        self.env_config = EnvConfig(rows=new_rows, cols=new_cols, max_turns=self.config.max_turns_per_game)
+
+        # Recreate network module (same d_model/n_layers, new rows/cols)
+        self.network = create_transformer_network(
+            rows=new_rows,
+            cols=new_cols,
+            d_model=self.config.num_channels,
+            n_layers=self.config.num_res_blocks,
+            n_heads=4,
+            ffn_dim=self.config.num_channels * 2,
+            pos_encoding=self.config.pos_encoding,
+        )
+
+        # Rebuild JIT-compiled train step (needs recompilation for new shapes)
+        self.train_step_fn = make_transformer_train_step_fn(self.network, self.optimizer)
+
+        # Keep self.params and self.opt_state — shapes are board-size agnostic
+
+        # Clear replay buffer (old spatial dims are incompatible)
+        self.replay_buffer = ReplayBuffer(
+            max_size=self.config.buffer_size,
+            cols=new_cols,
+            augment_flip=True,
+        )
+
+        # Clear league pool (old env_config)
+        self.league_pool = []
+
+        # Reset ELO/sim state to start fresh on new board
+        tiers = self.config.elo_sim_tiers
+        self.elo_sim_tier_index = 0
+        self.current_num_simulations = tiers[0]
+        self.best_elo = -float('inf')
+        self.elo_stagnation_count = 0
+        self.elo_history = []
+
+        print(f"  [LADDER] Params preserved, buffer/league cleared, sims reset to {tiers[0]}")
 
     def _maybe_decay_lr(self, total_loss: float):
         """Decay learning rate if loss has stalled. Skipped when cosine schedule is active."""
@@ -2737,6 +2829,7 @@ class TransformerTrainer:
             'elo_stagnation_count': self.elo_stagnation_count,
             'elo_sim_tier_index': self.elo_sim_tier_index,
             'elo_history': self.elo_history,
+            'board_ladder_index': self.board_ladder_index,
         }
 
         with open(path, 'wb') as f:
@@ -2806,9 +2899,46 @@ class TransformerTrainer:
         self.elo_sim_tier_index = checkpoint.get('elo_sim_tier_index', 0)
         self.elo_history = checkpoint.get('elo_history', [])
 
+        # Restore board ladder state and rebuild if board size changed
+        self.board_ladder_index = checkpoint.get('board_ladder_index', 0)
+        if self.config.board_ladder_enabled and self.board_ladder_index > 0:
+            saved_rows, saved_cols = self.config.board_ladder_sizes[self.board_ladder_index]
+            if (self.config.rows, self.config.cols) != (saved_rows, saved_cols):
+                old_size_str = f"{self.config.rows}x{self.config.cols}"
+                new_size_str = f"{saved_rows}x{saved_cols}"
+                print(f"  [LADDER] Resuming at rung {self.board_ladder_index}: "
+                      f"{old_size_str} -> {new_size_str}")
+                # Update checkpoint dir to match saved board size
+                if old_size_str in self.config.checkpoint_dir:
+                    self.config.checkpoint_dir = self.config.checkpoint_dir.replace(
+                        old_size_str, new_size_str)
+                    os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+                    print(f"  [LADDER] Checkpoint dir -> {self.config.checkpoint_dir}")
+                self.config.rows = saved_rows
+                self.config.cols = saved_cols
+                self.env_config = EnvConfig(rows=saved_rows, cols=saved_cols,
+                                            max_turns=self.config.max_turns_per_game)
+                self.network = create_transformer_network(
+                    rows=saved_rows, cols=saved_cols,
+                    d_model=self.config.num_channels,
+                    n_layers=self.config.num_res_blocks,
+                    n_heads=4,
+                    ffn_dim=self.config.num_channels * 2,
+                    pos_encoding=self.config.pos_encoding,
+                )
+                self.replay_buffer = ReplayBuffer(
+                    max_size=self.config.buffer_size,
+                    cols=saved_cols,
+                    augment_flip=True,
+                )
+                if 'buffer' in checkpoint:
+                    self.replay_buffer.set_data(checkpoint['buffer'])
+                self.train_step_fn = make_transformer_train_step_fn(self.network, self.optimizer)
+
         print(f"Loaded checkpoint from iteration {self.iteration} "
               f"(buffer: {len(self.replay_buffer)} examples, "
-              f"phase: {self.curriculum_phase}, sims: {self.current_num_simulations})")
+              f"phase: {self.curriculum_phase}, sims: {self.current_num_simulations}, "
+              f"board: {self.config.rows}x{self.config.cols})")
 
     def evaluate_vs_random_batched(self):
         """Evaluate current checkpoint vs random."""
@@ -2990,6 +3120,8 @@ class TransformerTrainer:
             "sim_count": self.current_num_simulations,
             "elo_sim_tier": self.elo_sim_tier_index,
             "elo_stagnation_count": self.elo_stagnation_count,
+            "board_size": f"{self.config.rows}x{self.config.cols}",
+            "board_ladder_index": self.board_ladder_index,
         }
         # Per-opponent win rates
         for opp_idx, (opp_iter, _) in enumerate(opponents):
