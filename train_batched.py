@@ -2478,10 +2478,11 @@ class TransformerTrainer:
             pos_encoding=self.config.pos_encoding,
         )
 
+        # Reset optimizer state (Adam momentum is stale from old board's gradients)
+        self.opt_state = self.optimizer.init(self.params)
+
         # Rebuild JIT-compiled train step (needs recompilation for new shapes)
         self.train_step_fn = make_transformer_train_step_fn(self.network, self.optimizer)
-
-        # Keep self.params and self.opt_state — shapes are board-size agnostic
 
         # Clear replay buffer (old spatial dims are incompatible)
         self.replay_buffer = ReplayBuffer(
