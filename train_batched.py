@@ -2224,13 +2224,13 @@ class TransformerTrainer:
             if self.config.board_ladder_enabled:
                 lines.append(f"Ladder: rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}")
             if self.elo_history:
-                lines.append(f"ELO: {self.elo_history[-1]:.0f} (best: {self.best_elo:.0f}, stag: {self.elo_stagnation_count})")
+                lines.append(f"ELO: {self.elo_history[-1]:.0f} (stag: {self.elo_stagnation_count})")
             if hasattr(self, '_recent_elo_ratings') and self._recent_elo_ratings:
                 ratings_str = " | ".join(
-                    f"{'cur' if it == self.iteration else it}:{elo:.0f}"
+                    f"{'*cur*' if it == self.iteration else f'i{it}'}:{elo:.0f}"
                     for it, elo in self._recent_elo_ratings.items()
                 )
-                lines.append(f"League: {ratings_str}")
+                lines.append(f"Top 5: {ratings_str}")
             if self.metrics_history:
                 m = self.metrics_history[-1]
                 lines.append(f"Loss: p={m.get('policy_loss', 0):.3f} v={m.get('value_loss', 0):.3f}")
@@ -2390,8 +2390,13 @@ class TransformerTrainer:
                       f"random={ratios['random']:.0%}, league={ratios['league']:.0%}")
                 print(f"  [Curriculum] MCTS simulations: {self.current_num_simulations}")
 
-    def _update_elo_escalation(self, current_elo: float):
-        """Update ELO-based sim escalation state."""
+    def _update_elo_escalation(self, current_elo: float, best_prior_elo: float = -float('inf'), color_dominant: bool = False):
+        """Update ELO-based sim escalation state.
+
+        Uses best_prior_elo (re-rated from the full tournament solver) instead of
+        a stale high-water mark, so earlier checkpoints whose ratings were inflated
+        by insufficient sampling get corrected before the stagnation comparison.
+        """
         if not self.config.elo_escalation_enabled:
             return
 
@@ -2399,21 +2404,35 @@ class TransformerTrainer:
         patience = self.config.elo_stagnation_patience
         tiers = self.config.elo_sim_tiers
 
-        if current_elo > self.best_elo + min_improvement:
+        # Color dominance: board size is effectively solved, skip sim tiers
+        if (color_dominant and
+                self.config.board_ladder_enabled and
+                self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
+            print(f"  [ELO] Color dominance -> skipping sim tiers, escalating board size")
+            self._send_ntfy(
+                "Color Dominance -> Board Escalation",
+                f"Iter {self.iteration} | {self.config.rows}x{self.config.cols}\n"
+                f"ELO eval determined by color assignment, not skill\n"
+                f"Skipping sim tiers -> board escalation",
+                priority="high",
+            )
+            self._escalate_board_size()
+            return
+
+        if current_elo > best_prior_elo + min_improvement:
             self.elo_stagnation_count = 0
-            self.best_elo = current_elo
-            print(f"  [ELO] New best ELO: {current_elo:.1f} (stagnation reset)")
+            self.best_elo = current_elo  # Track for display/checkpoint only
+            print(f"  [ELO] Improving: {current_elo:.1f} > best_prior {best_prior_elo:.1f} + {min_improvement} (stagnation reset)")
         else:
             self.elo_stagnation_count += 1
             print(f"  [ELO] Stagnation {self.elo_stagnation_count}/{patience} "
-                  f"(current: {current_elo:.1f}, best: {self.best_elo:.1f})")
+                  f"(current: {current_elo:.1f}, best_prior: {best_prior_elo:.1f})")
 
         if (self.elo_stagnation_count >= patience and
                 self.elo_sim_tier_index < len(tiers) - 1):
             self.elo_sim_tier_index += 1
             self.current_num_simulations = tiers[self.elo_sim_tier_index]
             self.elo_stagnation_count = 0
-            self.best_elo = current_elo  # Reset baseline to current
             print(f"  [ELO] SIM ESCALATION -> tier {self.elo_sim_tier_index} "
                   f"({self.current_num_simulations} sims)")
             self._send_ntfy(
@@ -3099,6 +3118,12 @@ class TransformerTrainer:
         print(f"  [ELO] Evaluating vs {num_opponents} opponents "
               f"({num_games} games each)...")
 
+        # Track per-color totals across all opponents for color dominance detection
+        total_p1_wins = 0
+        total_p1_games = 0
+        total_p2_wins = 0
+        total_p2_games = 0
+
         for opp_iter, opp_params in opponents:
             self.rng, eval_rng = jax.random.split(self.rng)
 
@@ -3125,6 +3150,14 @@ class TransformerTrainer:
             draws = int(p1_draws) + int(p2_draws)
             losses = int(p1_losses) + int(p2_losses)
 
+            # Track per-color results
+            _p1w, _p1d, _p1l = int(p1_wins), int(p1_draws), int(p1_losses)
+            _p2w, _p2d, _p2l = int(p2_wins), int(p2_draws), int(p2_losses)
+            total_p1_wins += _p1w
+            total_p1_games += _p1w + _p1d + _p1l
+            total_p2_wins += _p2w
+            total_p2_games += _p2w + _p2d + _p2l
+
             # Accumulate into persistent game results (current's perspective)
             key = (current_iter, opp_iter)
             if key in self.elo_game_results:
@@ -3135,8 +3168,28 @@ class TransformerTrainer:
 
             total = wins + draws + losses
             wr = wins / total if total > 0 else 0.0
-            print(f"    vs iter_{opp_iter}: {wins}W-{draws}D-{losses}L "
-                  f"(win rate: {wr:.1%})")
+            p1_total = _p1w + _p1d + _p1l
+            p2_total = _p2w + _p2d + _p2l
+            p1_wr_opp = _p1w / p1_total if p1_total > 0 else 0.0
+            p2_wr_opp = _p2w / p2_total if p2_total > 0 else 0.0
+            print(f"    vs iter_{opp_iter}: "
+                  f"as P1: {_p1w}W-{_p1d}D-{_p1l}L ({p1_wr_opp:.0%}) | "
+                  f"as P2: {_p2w}W-{_p2d}D-{_p2l}L ({p2_wr_opp:.0%}) | "
+                  f"total: {wins}W-{draws}D-{losses}L ({wr:.0%})")
+
+        # Detect color dominance: one color wins >90% while the other wins <10%
+        p1_wr = total_p1_wins / total_p1_games if total_p1_games > 0 else 0.5
+        p2_wr = total_p2_wins / total_p2_games if total_p2_games > 0 else 0.5
+        color_dominant = (
+            num_opponents >= 2 and  # need enough data
+            (p1_wr >= 0.9 or p1_wr <= 0.1) and
+            (p2_wr >= 0.9 or p2_wr <= 0.1) and
+            abs(p1_wr - p2_wr) >= 0.8  # opposite extremes
+        )
+        if color_dominant:
+            dominant_color = "P1" if p1_wr > p2_wr else "P2"
+            print(f"  [ELO] COLOR DOMINANCE detected: {dominant_color} wins "
+                  f"{max(p1_wr, p2_wr):.0%} of games (P1={p1_wr:.0%}, P2={p2_wr:.0%})")
 
         # Build full W/D/L matrix from all accumulated results
         all_iters = set()
@@ -3180,8 +3233,14 @@ class TransformerTrainer:
             print(f"{label}={ratings[idx]:.0f} ", end="")
         print(f"| delta={elo_delta:+.1f}")
 
+        # Best ELO among all non-current checkpoints (re-rated with full data)
+        best_prior_elo = max(
+            (float(ratings[iter_to_idx[it]]) for it in iter_list if it != current_iter),
+            default=-float('inf'),
+        )
+
         # Update escalation
-        self._update_elo_escalation(current_elo)
+        self._update_elo_escalation(current_elo, best_prior_elo=best_prior_elo, color_dominant=color_dominant)
 
         # Store stats for wandb
         board_key = f"{self.config.rows}x{self.config.cols}"
@@ -3200,6 +3259,9 @@ class TransformerTrainer:
             f"{board_key}/elo": current_elo,
             f"{board_key}/elo_delta": elo_delta,
             f"{board_key}/sim_tier": self.elo_sim_tier_index,
+            "color_dominant": color_dominant,
+            "p1_win_rate": p1_wr,
+            "p2_win_rate": p2_wr,
         }
         # Per-opponent win rates and ELOs
         for opp_iter, _ in opponents:
@@ -3211,10 +3273,11 @@ class TransformerTrainer:
                     elo_stats[f"vs_iter_{opp_iter}_winrate"] = float(w / total)
                     elo_stats[f"vs_iter_{opp_iter}_elo"] = float(ratings[iter_to_idx[opp_iter]])
 
-        # Cache recent checkpoint ratings for ntfy heartbeat
-        recent = iter_list[-5:]
+        # Cache top-5 checkpoint ratings (by ELO, descending) for ntfy heartbeat
+        all_rated = [(it, float(ratings[iter_to_idx[it]])) for it in iter_list]
+        all_rated.sort(key=lambda x: x[1], reverse=True)
         self._recent_elo_ratings = {
-            it: float(ratings[iter_to_idx[it]]) for it in recent
+            it: elo for it, elo in all_rated[:5]
         }
 
         self._last_elo_stats = elo_stats
