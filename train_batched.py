@@ -933,6 +933,7 @@ class TrainConfig:
     # Board size escalation (Jacob's Ladder)
     board_ladder_enabled: bool = False
     board_ladder_sizes: Tuple[Tuple[int, int], ...] = ((13, 7), (15, 9), (17, 11), (19, 13), (21, 15))
+    board_ladder_reset_params: bool = False  # True = reinit weights on escalation (tabula rasa)
 
     # Curriculum learning (N-jump winning states)
     curriculum_enabled: bool = True
@@ -2512,7 +2513,14 @@ class TransformerTrainer:
             pos_encoding=self.config.pos_encoding,
         )
 
-        # Reset optimizer state (Adam momentum is stale from old board's gradients)
+        # Reinit params from scratch (tabula rasa) or keep them (ladder)
+        if self.config.board_ladder_reset_params:
+            self.rng, init_rng = jax.random.split(self.rng)
+            variables = init_transformer_network(init_rng, self.network)
+            self.params = variables['params']
+            print(f"  [LADDER] Params reinitialized (tabula rasa)")
+
+        # Reset optimizer state (Adam momentum is stale)
         self.opt_state = self.optimizer.init(self.params)
 
         # Rebuild JIT-compiled train step (needs recompilation for new shapes)
@@ -2539,14 +2547,15 @@ class TransformerTrainer:
         self.selfplay_color_dominant_count = 0
         self.eval_color_dominant_count = 0
 
-        print(f"  [LADDER] Params preserved, buffer/league cleared, sims reset to {tiers[0]}")
+        weight_mode = "reinitialized (tabula rasa)" if self.config.board_ladder_reset_params else "preserved"
+        print(f"  [LADDER] Params {weight_mode}, buffer/league cleared, sims reset to {tiers[0]}")
 
         self._send_ntfy(
             "Board Size Escalation",
             f"Iter {self.iteration} | {old_rows}x{old_cols} -> {new_rows}x{new_cols}\n"
             f"Rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}\n"
             f"Sims reset to {tiers[0]}, buffer/league cleared\n"
-            f"Weights preserved",
+            f"Weights {weight_mode}",
             priority="high",
         )
 
