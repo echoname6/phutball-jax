@@ -2164,6 +2164,10 @@ class TransformerTrainer:
             self.config.curriculum_phase1_sims or self.config.num_simulations
         ) if self.config.curriculum_phase_enabled else self.config.num_simulations
 
+        # Color dominance tracking (self-play)
+        self.selfplay_color_dominant_count = 0  # consecutive iters with P1 wr >= 85%
+        self.eval_color_dominant_count = 0      # consecutive evals with color dominance
+
         # ELO evaluation state
         self.best_elo = -float('inf')
         self.elo_stagnation_count = 0
@@ -2404,15 +2408,26 @@ class TransformerTrainer:
         patience = self.config.elo_stagnation_patience
         tiers = self.config.elo_sim_tiers
 
-        # Color dominance: board size is effectively solved, skip sim tiers
-        if (color_dominant and
+        # Track consecutive eval-level color dominance
+        if color_dominant:
+            self.eval_color_dominant_count += 1
+        else:
+            self.eval_color_dominant_count = 0
+
+        # Color dominance: board is effectively solved when BOTH:
+        #   - eval shows color dominance for 4 consecutive evals
+        #   - self-play P1 wr >= 85% sustained (tracked per-iteration)
+        if (self.eval_color_dominant_count >= 4 and
+                self.selfplay_color_dominant_count >= 10 and
                 self.config.board_ladder_enabled and
                 self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
-            print(f"  [ELO] Color dominance -> skipping sim tiers, escalating board size")
+            print(f"  [ELO] Color dominance confirmed (eval: {self.eval_color_dominant_count} consecutive, "
+                  f"self-play: {self.selfplay_color_dominant_count} consecutive) -> board escalation")
             self._send_ntfy(
                 "Color Dominance -> Board Escalation",
                 f"Iter {self.iteration} | {self.config.rows}x{self.config.cols}\n"
-                f"ELO eval determined by color assignment, not skill\n"
+                f"Eval color dominant {self.eval_color_dominant_count}x, "
+                f"self-play {self.selfplay_color_dominant_count}x\n"
                 f"Skipping sim tiers -> board escalation",
                 priority="high",
             )
@@ -2521,6 +2536,8 @@ class TransformerTrainer:
         self.elo_stagnation_count = 0
         self.elo_history = []
         self.elo_game_results = {}
+        self.selfplay_color_dominant_count = 0
+        self.eval_color_dominant_count = 0
 
         print(f"  [LADDER] Params preserved, buffer/league cleared, sims reset to {tiers[0]}")
 
@@ -2895,6 +2912,8 @@ class TransformerTrainer:
             'elo_history': self.elo_history,
             'elo_game_results': self.elo_game_results,
             'board_ladder_index': self.board_ladder_index,
+            'selfplay_color_dominant_count': self.selfplay_color_dominant_count,
+            'eval_color_dominant_count': self.eval_color_dominant_count,
         }
 
         with open(path, 'wb') as f:
@@ -2964,6 +2983,8 @@ class TransformerTrainer:
         self.elo_sim_tier_index = checkpoint.get('elo_sim_tier_index', 0)
         self.elo_history = checkpoint.get('elo_history', [])
         self.elo_game_results = checkpoint.get('elo_game_results', {})
+        self.selfplay_color_dominant_count = checkpoint.get('selfplay_color_dominant_count', 0)
+        self.eval_color_dominant_count = checkpoint.get('eval_color_dominant_count', 0)
 
         # Restore board ladder state and rebuild if board size changed
         self.board_ladder_index = checkpoint.get('board_ladder_index', 0)
@@ -3181,7 +3202,7 @@ class TransformerTrainer:
         p1_wr = total_p1_wins / total_p1_games if total_p1_games > 0 else 0.5
         p2_wr = total_p2_wins / total_p2_games if total_p2_games > 0 else 0.5
         color_dominant = (
-            num_opponents >= 2 and  # need enough data
+            num_opponents >= 4 and  # need enough historical diversity
             (p1_wr >= 0.9 or p1_wr <= 0.1) and
             (p2_wr >= 0.9 or p2_wr <= 0.1) and
             abs(p1_wr - p2_wr) >= 0.8  # opposite extremes
@@ -3318,6 +3339,17 @@ class TransformerTrainer:
             print("-" * 40)
 
             num_examples = self.run_self_play()
+
+            # Track self-play color dominance
+            sp = self.last_self_play_stats
+            if sp is not None:
+                sp_decided = sp["p1_wins"] + sp["p2_wins"]
+                sp_p1_wr = sp["p1_wins"] / sp_decided if sp_decided > 0 else 0.5
+                if sp_p1_wr >= 0.85 or sp_p1_wr <= 0.15:
+                    self.selfplay_color_dominant_count += 1
+                else:
+                    self.selfplay_color_dominant_count = 0
+
             metrics = self.run_training()
 
             if metrics:
