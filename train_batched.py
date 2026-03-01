@@ -1077,6 +1077,34 @@ class AlphaZeroTrainer:
                     f.write(self.wandb_run.id)
                 print(f"[wandb] Run ID: {self.wandb_run.id} (saved to {id_path})")
 
+    def _wandb_log(self, data: dict):
+        """Log to wandb with error recovery. Reinitializes on fatal errors."""
+        if not self.config.use_wandb or self.wandb_run is None:
+            return
+        try:
+            wandb.log(data)
+        except Exception as e:
+            print(f"  [wandb] Log failed: {e}")
+            # Try to reinitialize the run
+            try:
+                run_id = self.wandb_run.id
+                print(f"  [wandb] Attempting to reinitialize run {run_id}...")
+                try:
+                    self.wandb_run.finish(quiet=True)
+                except Exception:
+                    pass
+                self.wandb_run = wandb.init(
+                    project=self.config.wandb_project,
+                    id=run_id,
+                    resume="must",
+                    mode=self.config.wandb_mode,
+                )
+                wandb.log(data)
+                print(f"  [wandb] Reinitialized and logged successfully")
+            except Exception as e2:
+                print(f"  [wandb] Reinit failed: {e2} — continuing without wandb")
+                self.wandb_run = None
+
     def _init_network(self):
         """Initialize network parameters."""
         self.rng, init_rng = jax.random.split(self.rng)
@@ -1562,7 +1590,7 @@ class AlphaZeroTrainer:
                     for k, v in self.last_self_play_stats.items():
                         log_data[f"selfplay/{k}"] = v
 
-                wandb.log(log_data)
+                self._wandb_log(log_data)
 
         # Final checkpoint
         self.save_checkpoint()
@@ -2157,6 +2185,33 @@ class TransformerTrainer:
         # League play: pool of past checkpoints
         self.league_pool = []  # List of (iteration, params) tuples
 
+    def _wandb_log(self, data: dict):
+        """Log to wandb with error recovery. Reinitializes on fatal errors."""
+        if not self.config.use_wandb or self.wandb_run is None:
+            return
+        try:
+            wandb.log(data)
+        except Exception as e:
+            print(f"  [wandb] Log failed: {e}")
+            try:
+                run_id = self.wandb_run.id
+                print(f"  [wandb] Attempting to reinitialize run {run_id}...")
+                try:
+                    self.wandb_run.finish(quiet=True)
+                except Exception:
+                    pass
+                self.wandb_run = wandb.init(
+                    project=self.config.wandb_project,
+                    id=run_id,
+                    resume="must",
+                    mode=self.config.wandb_mode,
+                )
+                wandb.log(data)
+                print(f"  [wandb] Reinitialized and logged successfully")
+            except Exception as e2:
+                print(f"  [wandb] Reinit failed: {e2} — continuing without wandb")
+                self.wandb_run = None
+
         # Curriculum phase tracking
         self.curriculum_phase = 1  # Start at phase 1
         self.curriculum_consecutive_p1_passes = 0
@@ -2549,6 +2604,23 @@ class TransformerTrainer:
 
         weight_mode = "reinitialized (tabula rasa)" if self.config.board_ladder_reset_params else "preserved"
         print(f"  [LADDER] Params {weight_mode}, buffer/league cleared, sims reset to {tiers[0]}")
+
+        # Update wandb config to reflect new board size
+        if self.config.use_wandb and self.wandb_run is not None:
+            try:
+                wandb.config.update({
+                    "rows": new_rows,
+                    "cols": new_cols,
+                    "board_ladder_index": self.board_ladder_index,
+                }, allow_val_change=True)
+                self._wandb_log({
+                    "ladder/board_escalation": 1,
+                    "ladder/rung": self.board_ladder_index,
+                    "ladder/rows": new_rows,
+                    "ladder/cols": new_cols,
+                })
+            except Exception as e:
+                print(f"  [wandb] Config update failed: {e}")
 
         self._send_ntfy(
             "Board Size Escalation",
@@ -3256,7 +3328,7 @@ class TransformerTrainer:
 
         # Print ratings for recent players (current + opponents played this eval)
         print(f"  [ELO] Ratings ({len(iter_list)} players, {len(self.elo_game_results)} matchups): ", end="")
-        display_iters = [opp_iter for opp_iter, _ in opponents] + [current_iter]
+        display_iters = [opp_iter for opp_iter, _ in opponents if opp_iter != current_iter] + [current_iter]
         for it in display_iters:
             idx = iter_to_idx[it]
             label = "current" if it == current_iter else f"iter_{it}"
@@ -3426,7 +3498,7 @@ class TransformerTrainer:
                     for k, v in self._last_elo_stats.items():
                         log_data[f"eval/{k}"] = v
                     self._last_elo_stats = None
-                wandb.log(log_data)
+                self._wandb_log(log_data)
 
         self.save_checkpoint()
         print("Training complete!")
@@ -3861,6 +3933,32 @@ class ChimeraTrainer:
         # Heartbeat tracking for ntfy notifications
         self._last_heartbeat = time.time()
 
+    def _wandb_log(self, data: dict):
+        """Log to wandb with error recovery. Reinitializes on fatal errors."""
+        if not self.config.use_wandb or self.wandb_run is None:
+            return
+        try:
+            wandb.log(data)
+        except Exception as e:
+            print(f"  [wandb] Log failed: {e}")
+            try:
+                run_id = self.wandb_run.id
+                print(f"  [wandb] Attempting to reinitialize run {run_id}...")
+                try:
+                    self.wandb_run.finish(quiet=True)
+                except Exception:
+                    pass
+                self.wandb_run = wandb.init(
+                    project=self.config.wandb_project,
+                    id=run_id,
+                    resume="must",
+                )
+                wandb.log(data)
+                print(f"  [wandb] Reinitialized and logged successfully")
+            except Exception as e2:
+                print(f"  [wandb] Reinit failed: {e2} — continuing without wandb")
+                self.wandb_run = None
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
@@ -4203,8 +4301,7 @@ class ChimeraTrainer:
             self.sims_doubled = True
             print(f"  [Sim curriculum] THRESHOLD REACHED! Doubling sims: {old_sims} -> {self.current_sims}")
 
-            if self.config.use_wandb and self.wandb_run:
-                wandb.log({
+            self._wandb_log({
                     "sim_curriculum/sims_doubled": 1,
                     "sim_curriculum/new_sims": self.current_sims,
                     "sim_curriculum/trigger_win_rate": avg_win_rate,
@@ -4634,7 +4731,7 @@ class ChimeraTrainer:
                     log_data[f"selfplay/{bk}/adj_conv"] = stats["adj_conv"]
                 for bk, wr in eval_win_rates.items():
                     log_data[f"eval/{bk}/win_rate"] = wr
-                wandb.log(log_data)
+                self._wandb_log(log_data)
 
         self.save_checkpoint()
         print("\nChimera training complete!")
