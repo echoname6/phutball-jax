@@ -3210,8 +3210,13 @@ class TransformerTrainer:
             print("  [ELO] No opponents in league pool, skipping evaluation")
             return 1500.0, {}
 
-        num_opponents = min(pool_size, self.config.elo_eval_max_opponents)
-        opponents = self.league_pool[-num_opponents:]
+        # Filter out current iteration (don't play yourself)
+        candidates = [(it, p) for it, p in self.league_pool if it != self.iteration]
+        if not candidates:
+            print("  [ELO] No opponents besides self in league pool, skipping evaluation")
+            return 1500.0, {}
+        num_opponents = min(len(candidates), self.config.elo_eval_max_opponents)
+        opponents = candidates[-num_opponents:]
 
         current_iter = self.iteration
         current_params = self.get_network_params()
