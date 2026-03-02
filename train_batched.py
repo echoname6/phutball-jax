@@ -902,6 +902,7 @@ class TrainConfig:
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
     checkpoint_every: int = 10  # iterations
+    fresh_start: bool = False  # Skip checkpoint resume, train from scratch
     
     # Logging
     log_every: int = 1
@@ -1472,12 +1473,15 @@ class AlphaZeroTrainer:
         """Main training loop."""
 
         # Auto-resume from latest checkpoint if exists
-        existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
-        if existing:
-            latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-            self.load_checkpoint(latest)
-            self.iteration += 1
-        print(f"Resuming from iteration {self.iteration}")
+        if not self.config.fresh_start:
+            existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
+            if existing:
+                latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                self.load_checkpoint(latest)
+                self.iteration += 1
+        else:
+            print("FRESH START: skipping checkpoint resume")
+        print(f"Starting from iteration {self.iteration}")
         print("=" * 60)
         print("AlphaZero Training for Phutball (Batched)")
         print("=" * 60)
@@ -3388,15 +3392,18 @@ class TransformerTrainer:
 
     def train(self):
         """Main training loop."""
-        existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
-        if existing:
-            latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-            self.load_checkpoint(latest)
-            self.iteration += 1
-            # Populate league pool from existing checkpoints on resume (fix: pool was empty before)
-            self._populate_league_pool_from_checkpoints()
+        if not self.config.fresh_start:
+            existing = glob.glob(os.path.join(self.config.checkpoint_dir, "checkpoint_*.pkl"))
+            if existing:
+                latest = max(existing, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                self.load_checkpoint(latest)
+                self.iteration += 1
+                # Populate league pool from existing checkpoints on resume
+                self._populate_league_pool_from_checkpoints()
+        else:
+            print("FRESH START: skipping checkpoint resume")
 
-        print(f"Resuming from iteration {self.iteration}")
+        print(f"Starting from iteration {self.iteration}")
         print("=" * 60)
         print("Transformer Training for Phutball (Batched)")
         print("=" * 60)
