@@ -2189,33 +2189,6 @@ class TransformerTrainer:
         # League play: pool of past checkpoints
         self.league_pool = []  # List of (iteration, params) tuples
 
-    def _wandb_log(self, data: dict):
-        """Log to wandb with error recovery. Reinitializes on fatal errors."""
-        if not self.config.use_wandb or self.wandb_run is None:
-            return
-        try:
-            wandb.log(data)
-        except Exception as e:
-            print(f"  [wandb] Log failed: {e}")
-            try:
-                run_id = self.wandb_run.id
-                print(f"  [wandb] Attempting to reinitialize run {run_id}...")
-                try:
-                    self.wandb_run.finish(quiet=True)
-                except Exception:
-                    pass
-                self.wandb_run = wandb.init(
-                    project=self.config.wandb_project,
-                    id=run_id,
-                    resume="must",
-                    mode=self.config.wandb_mode,
-                )
-                wandb.log(data)
-                print(f"  [wandb] Reinitialized and logged successfully")
-            except Exception as e2:
-                print(f"  [wandb] Reinit failed: {e2} — continuing without wandb")
-                self.wandb_run = None
-
         # Curriculum phase tracking
         self.curriculum_phase = 1  # Start at phase 1
         self.curriculum_consecutive_p1_passes = 0
@@ -2249,6 +2222,33 @@ class TransformerTrainer:
                 if size == current_size:
                     self.board_ladder_index = i
                     break
+
+    def _wandb_log(self, data: dict):
+        """Log to wandb with error recovery. Reinitializes on fatal errors."""
+        if not self.config.use_wandb or self.wandb_run is None:
+            return
+        try:
+            wandb.log(data)
+        except Exception as e:
+            print(f"  [wandb] Log failed: {e}")
+            try:
+                run_id = self.wandb_run.id
+                print(f"  [wandb] Attempting to reinitialize run {run_id}...")
+                try:
+                    self.wandb_run.finish(quiet=True)
+                except Exception:
+                    pass
+                self.wandb_run = wandb.init(
+                    project=self.config.wandb_project,
+                    id=run_id,
+                    resume="must",
+                    mode=self.config.wandb_mode,
+                )
+                wandb.log(data)
+                print(f"  [wandb] Reinitialized and logged successfully")
+            except Exception as e2:
+                print(f"  [wandb] Reinit failed: {e2} — continuing without wandb")
+                self.wandb_run = None
 
     def _send_ntfy(self, title: str, body: str, priority: str = "low"):
         """Send a notification via ntfy.sh."""
