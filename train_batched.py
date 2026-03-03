@@ -936,6 +936,20 @@ class TrainConfig:
     board_ladder_sizes: Tuple[Tuple[int, int], ...] = ((13, 7), (15, 9), (17, 11), (19, 13), (21, 15))
     board_ladder_reset_params: bool = False  # True = reinit weights on escalation (tabula rasa)
 
+    # Policy-loss plateau escalation (replaces ELO escalation)
+    plateau_escalation_enabled: bool = False
+    plateau_window: int = 20              # Rolling window size (iterations)
+    plateau_compare_window: int = 20      # Previous window to compare against
+    plateau_min_improvement: float = 0.005  # mean(prev) - mean(recent) must exceed this
+    plateau_patience: int = 2             # Consecutive plateau detections before escalation
+    plateau_min_iters_per_rung: int = 50  # Min iterations before escalation allowed
+    plateau_sim_tiers: Tuple[int, ...] = (32, 48, 64)
+
+    # KL early-stopping
+    kl_early_stop_enabled: bool = False
+    kl_early_stop_threshold: float = 0.5
+    kl_early_stop_max_reverts: int = 3
+
     # Curriculum learning (N-jump winning states)
     curriculum_enabled: bool = True
     curriculum_initial_ratio: float = 0.5    # Initial fraction of batch from curriculum
@@ -2210,9 +2224,22 @@ class TransformerTrainer:
         # Cumulative game results within a rung: {(iter_a, iter_b): [wins, draws, losses]}
         # wins/draws/losses are from iter_a's perspective
         self.elo_game_results = {}
+        # Per-color game results for color-specific ELO
+        self.elo_game_results_as_p1 = {}  # {(cur_iter, opp_iter): [w, d, l]} for games as P1
+        self.elo_game_results_as_p2 = {}  # same, for games as P2
 
         if self.config.elo_escalation_enabled:
             self.current_num_simulations = self.config.elo_sim_tiers[0]
+
+        # Policy-loss plateau escalation state
+        self.policy_loss_history = []
+        self.plateau_count = 0
+        self.plateau_sim_tier_index = 0
+        self.rung_start_iteration = 0
+        self.kl_consecutive_reverts = 0
+
+        if self.config.plateau_escalation_enabled:
+            self.current_num_simulations = self.config.plateau_sim_tiers[0]
 
         # Board ladder state
         self.board_ladder_index = 0
@@ -2283,10 +2310,23 @@ class TransformerTrainer:
             lines = [
                 f"Iter {self.iteration} | {self.config.rows}x{self.config.cols} board",
                 f"Games: {self.total_games:,} | Buffer: {len(self.replay_buffer):,}",
-                f"Sims: {self.current_num_simulations} (tier {self.elo_sim_tier_index}/{len(self.config.elo_sim_tiers)-1})",
             ]
+            # Sims line: adapt based on active escalation system
+            if self.config.plateau_escalation_enabled:
+                tiers = self.config.plateau_sim_tiers
+                lines.append(f"Sims: {self.current_num_simulations} (tier {self.plateau_sim_tier_index}/{len(tiers)-1})")
+            else:
+                lines.append(f"Sims: {self.current_num_simulations} (tier {self.elo_sim_tier_index}/{len(self.config.elo_sim_tiers)-1})")
             if self.config.board_ladder_enabled:
                 lines.append(f"Ladder: rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}")
+            # Plateau status
+            if self.config.plateau_escalation_enabled:
+                iters_on_rung = self.iteration - self.rung_start_iteration
+                window_mean = (sum(self.policy_loss_history[-self.config.plateau_window:]) /
+                               len(self.policy_loss_history[-self.config.plateau_window:])
+                               if self.policy_loss_history else 0.0)
+                lines.append(f"Plateau: {self.plateau_count}/{self.config.plateau_patience} | "
+                             f"Window loss: {window_mean:.3f} | Rung iters: {iters_on_rung}")
             if self.elo_history:
                 lines.append(f"ELO: {self.elo_history[-1]:.0f} (stag: {self.elo_stagnation_count})")
             if hasattr(self, '_recent_elo_ratings') and self._recent_elo_ratings:
@@ -2295,6 +2335,8 @@ class TransformerTrainer:
                     for it, elo in self._recent_elo_ratings.items()
                 )
                 lines.append(f"Top 5: {ratings_str}")
+            if self.config.kl_early_stop_enabled:
+                lines.append(f"KL reverts: {self.kl_consecutive_reverts}")
             if self.metrics_history:
                 m = self.metrics_history[-1]
                 lines.append(f"Loss: p={m.get('policy_loss', 0):.3f} v={m.get('value_loss', 0):.3f}")
@@ -2525,6 +2567,79 @@ class TransformerTrainer:
                 self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
             self._escalate_board_size()
 
+    def _check_policy_loss_plateau(self, policy_loss: float):
+        """Check if policy loss has plateaued and trigger sim/board escalation.
+
+        Compares mean of recent window vs previous window. If improvement is below
+        threshold, increments plateau_count. After plateau_patience consecutive
+        detections (guarded by min_iters_per_rung), escalates sims or board size.
+        """
+        self.policy_loss_history.append(policy_loss)
+
+        window = self.config.plateau_window
+        compare = self.config.plateau_compare_window
+        total_needed = window + compare
+
+        if len(self.policy_loss_history) < total_needed:
+            return
+
+        iters_on_rung = self.iteration - self.rung_start_iteration
+        if iters_on_rung < self.config.plateau_min_iters_per_rung:
+            return
+
+        recent = self.policy_loss_history[-window:]
+        previous = self.policy_loss_history[-(window + compare):-window]
+        recent_mean = sum(recent) / len(recent)
+        prev_mean = sum(previous) / len(previous)
+
+        # Improvement = decrease in loss (prev - recent should be positive)
+        improvement = prev_mean - recent_mean
+
+        if improvement < self.config.plateau_min_improvement:
+            self.plateau_count += 1
+            print(f"  [PLATEAU] Plateau detected {self.plateau_count}/{self.config.plateau_patience} "
+                  f"(prev_mean={prev_mean:.4f}, recent_mean={recent_mean:.4f}, "
+                  f"improvement={improvement:.4f} < {self.config.plateau_min_improvement})")
+        else:
+            if self.plateau_count > 0:
+                print(f"  [PLATEAU] Improvement detected, resetting count "
+                      f"(prev_mean={prev_mean:.4f}, recent_mean={recent_mean:.4f}, "
+                      f"improvement={improvement:.4f})")
+            self.plateau_count = 0
+            return
+
+        if self.plateau_count < self.config.plateau_patience:
+            return
+
+        tiers = self.config.plateau_sim_tiers
+
+        # Sim escalation: not at max tier yet
+        if self.plateau_sim_tier_index < len(tiers) - 1:
+            self.plateau_sim_tier_index += 1
+            self.current_num_simulations = tiers[self.plateau_sim_tier_index]
+            self.plateau_count = 0
+            self.policy_loss_history.clear()  # New sim count changes loss dynamics
+            self.rung_start_iteration = self.iteration
+            print(f"  [PLATEAU] SIM ESCALATION -> tier {self.plateau_sim_tier_index}/{len(tiers)-1} "
+                  f"({self.current_num_simulations} sims)")
+            self._send_ntfy(
+                "Plateau Sim Escalation",
+                f"Iter {self.iteration} | {self.config.rows}x{self.config.cols}\n"
+                f"Tier {self.plateau_sim_tier_index}/{len(tiers)-1} -> {self.current_num_simulations} sims\n"
+                f"Policy loss plateau (mean={recent_mean:.4f})",
+                priority="default",
+            )
+            return
+
+        # Board escalation: at max sim tier
+        if (self.config.board_ladder_enabled and
+                self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
+            print(f"  [PLATEAU] At max sim tier and plateau persists -> board escalation")
+            self._escalate_board_size()
+        else:
+            print(f"  [PLATEAU] At max sim tier and max board size, no further escalation")
+            self.plateau_count = 0  # Reset to avoid repeated messages
+
     def _escalate_board_size(self):
         """Escalate to next board size on the ladder (Jacob's Ladder).
 
@@ -2603,11 +2718,22 @@ class TransformerTrainer:
         self.elo_stagnation_count = 0
         self.elo_history = []
         self.elo_game_results = {}
+        self.elo_game_results_as_p1 = {}
+        self.elo_game_results_as_p2 = {}
         self.selfplay_color_dominant_count = 0
         self.eval_color_dominant_count = 0
 
+        # Reset plateau escalation state
+        self.policy_loss_history.clear()
+        self.plateau_count = 0
+        self.plateau_sim_tier_index = 0
+        self.rung_start_iteration = self.iteration
+        self.kl_consecutive_reverts = 0
+        if self.config.plateau_escalation_enabled:
+            self.current_num_simulations = self.config.plateau_sim_tiers[0]
+
         weight_mode = "reinitialized (tabula rasa)" if self.config.board_ladder_reset_params else "preserved"
-        print(f"  [LADDER] Params {weight_mode}, buffer/league cleared, sims reset to {tiers[0]}")
+        print(f"  [LADDER] Params {weight_mode}, buffer/league cleared, sims reset to {self.current_num_simulations}")
 
         # Update wandb config to reflect new board size
         if self.config.use_wandb and self.wandb_run is not None:
@@ -2630,7 +2756,7 @@ class TransformerTrainer:
             "Board Size Escalation",
             f"Iter {self.iteration} | {old_rows}x{old_cols} -> {new_rows}x{new_cols}\n"
             f"Rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}\n"
-            f"Sims reset to {tiers[0]}, buffer/league cleared\n"
+            f"Sims reset to {self.current_num_simulations}, buffer/league cleared\n"
             f"Weights {weight_mode}",
             priority="high",
         )
@@ -2999,6 +3125,15 @@ class TransformerTrainer:
             'board_ladder_index': self.board_ladder_index,
             'selfplay_color_dominant_count': self.selfplay_color_dominant_count,
             'eval_color_dominant_count': self.eval_color_dominant_count,
+            # Plateau escalation state
+            'policy_loss_history': self.policy_loss_history,
+            'plateau_count': self.plateau_count,
+            'plateau_sim_tier_index': self.plateau_sim_tier_index,
+            'rung_start_iteration': self.rung_start_iteration,
+            'kl_consecutive_reverts': self.kl_consecutive_reverts,
+            # Per-color ELO
+            'elo_game_results_as_p1': self.elo_game_results_as_p1,
+            'elo_game_results_as_p2': self.elo_game_results_as_p2,
         }
 
         with open(path, 'wb') as f:
@@ -3068,8 +3203,19 @@ class TransformerTrainer:
         self.elo_sim_tier_index = checkpoint.get('elo_sim_tier_index', 0)
         self.elo_history = checkpoint.get('elo_history', [])
         self.elo_game_results = checkpoint.get('elo_game_results', {})
+        self.elo_game_results_as_p1 = checkpoint.get('elo_game_results_as_p1', {})
+        self.elo_game_results_as_p2 = checkpoint.get('elo_game_results_as_p2', {})
         self.selfplay_color_dominant_count = checkpoint.get('selfplay_color_dominant_count', 0)
         self.eval_color_dominant_count = checkpoint.get('eval_color_dominant_count', 0)
+
+        # Restore plateau escalation state (backwards compatible)
+        self.policy_loss_history = checkpoint.get('policy_loss_history', [])
+        self.plateau_count = checkpoint.get('plateau_count', 0)
+        self.plateau_sim_tier_index = checkpoint.get('plateau_sim_tier_index', 0)
+        self.rung_start_iteration = checkpoint.get('rung_start_iteration', 0)
+        self.kl_consecutive_reverts = checkpoint.get('kl_consecutive_reverts', 0)
+        if self.config.plateau_escalation_enabled and self.plateau_sim_tier_index > 0:
+            self.current_num_simulations = self.config.plateau_sim_tiers[self.plateau_sim_tier_index]
 
         # Restore board ladder state and rebuild if board size changed
         self.board_ladder_index = checkpoint.get('board_ladder_index', 0)
@@ -3277,6 +3423,18 @@ class TransformerTrainer:
             else:
                 self.elo_game_results[key] = [wins, draws, losses]
 
+            # Per-color accumulation for color-specific ELO
+            if key in self.elo_game_results_as_p1:
+                prev = self.elo_game_results_as_p1[key]
+                self.elo_game_results_as_p1[key] = [prev[0] + _p1w, prev[1] + _p1d, prev[2] + _p1l]
+            else:
+                self.elo_game_results_as_p1[key] = [_p1w, _p1d, _p1l]
+            if key in self.elo_game_results_as_p2:
+                prev = self.elo_game_results_as_p2[key]
+                self.elo_game_results_as_p2[key] = [prev[0] + _p2w, prev[1] + _p2d, prev[2] + _p2l]
+            else:
+                self.elo_game_results_as_p2[key] = [_p2w, _p2d, _p2l]
+
             total = wins + draws + losses
             wr = wins / total if total > 0 else 0.0
             p1_total = _p1w + _p1d + _p1l
@@ -3329,6 +3487,31 @@ class TransformerTrainer:
         ratings = compute_elo_from_results(names, W, D, L)
         current_elo = float(ratings[iter_to_idx[current_iter]])
 
+        # Compute per-color ELO (P1-only and P2-only W/D/L matrices)
+        current_elo_p1 = current_elo  # fallback
+        current_elo_p2 = current_elo  # fallback
+        for color_label, color_results in [("P1", self.elo_game_results_as_p1),
+                                            ("P2", self.elo_game_results_as_p2)]:
+            if not color_results:
+                continue
+            cW = np.zeros((n, n), dtype=np.float64)
+            cD = np.zeros((n, n), dtype=np.float64)
+            cL = np.zeros((n, n), dtype=np.float64)
+            for (a, b), (w, d, l) in color_results.items():
+                if a in iter_to_idx and b in iter_to_idx:
+                    ia, ib = iter_to_idx[a], iter_to_idx[b]
+                    cW[ia, ib] += w
+                    cD[ia, ib] += d
+                    cL[ia, ib] += l
+                    cW[ib, ia] += l
+                    cD[ib, ia] += d
+                    cL[ib, ia] += w
+            color_ratings = compute_elo_from_results(names, cW, cD, cL)
+            if color_label == "P1":
+                current_elo_p1 = float(color_ratings[iter_to_idx[current_iter]])
+            else:
+                current_elo_p2 = float(color_ratings[iter_to_idx[current_iter]])
+
         # Compute ELO delta from last eval
         elo_delta = 0.0
         if self.elo_history:
@@ -3350,8 +3533,9 @@ class TransformerTrainer:
             default=-float('inf'),
         )
 
-        # Update escalation
-        self._update_elo_escalation(current_elo, best_prior_elo=best_prior_elo, color_dominant=color_dominant)
+        # Update escalation (only ELO-driven when plateau escalation is not active)
+        if self.config.elo_escalation_enabled and not self.config.plateau_escalation_enabled:
+            self._update_elo_escalation(current_elo, best_prior_elo=best_prior_elo, color_dominant=color_dominant)
 
         # Store stats for wandb
         board_key = f"{self.config.rows}x{self.config.cols}"
@@ -3373,6 +3557,10 @@ class TransformerTrainer:
             "color_dominant": color_dominant,
             "p1_win_rate": p1_wr,
             "p2_win_rate": p2_wr,
+            "elo_as_p1": current_elo_p1,
+            "elo_as_p2": current_elo_p2,
+            f"{board_key}/elo_as_p1": current_elo_p1,
+            f"{board_key}/elo_as_p2": current_elo_p2,
         }
         # Per-opponent win rates and ELOs
         for opp_iter, _ in opponents:
@@ -3443,7 +3631,37 @@ class TransformerTrainer:
                 else:
                     self.selfplay_color_dominant_count = 0
 
+            # Snapshot params/opt_state for KL early-stopping revert
+            if self.config.kl_early_stop_enabled:
+                self._prev_params = jax.tree.map(lambda x: x.copy(), self.params)
+                self._prev_opt_state = jax.tree.map(lambda x: x.copy(), self.opt_state)
+
             metrics = self.run_training()
+
+            # KL early-stopping: revert if policy_kl exceeds threshold
+            if (metrics and self.config.kl_early_stop_enabled and
+                    metrics.get('policy_kl', 0) > self.config.kl_early_stop_threshold):
+                self.kl_consecutive_reverts += 1
+                if self.kl_consecutive_reverts <= self.config.kl_early_stop_max_reverts:
+                    print(f"  [KL] policy_kl={metrics['policy_kl']:.4f} > {self.config.kl_early_stop_threshold} "
+                          f"-> REVERT ({self.kl_consecutive_reverts}/{self.config.kl_early_stop_max_reverts})")
+                    self.params = self._prev_params
+                    self.opt_state = self._prev_opt_state
+                    self._send_ntfy(
+                        "KL Revert",
+                        f"Iter {self.iteration} | policy_kl={metrics['policy_kl']:.4f}\n"
+                        f"Revert {self.kl_consecutive_reverts}/{self.config.kl_early_stop_max_reverts}",
+                        priority="default",
+                    )
+                    metrics = None  # Skip metrics processing for reverted iteration
+                else:
+                    print(f"  [KL] policy_kl={metrics['policy_kl']:.4f} > {self.config.kl_early_stop_threshold} "
+                          f"but max reverts ({self.config.kl_early_stop_max_reverts}) reached, accepting")
+                    self.kl_consecutive_reverts = 0
+            elif metrics and self.config.kl_early_stop_enabled:
+                # KL is fine, reset consecutive revert counter
+                if self.kl_consecutive_reverts > 0:
+                    self.kl_consecutive_reverts = 0
 
             if metrics:
                 self.metrics_history.append({
@@ -3455,6 +3673,10 @@ class TransformerTrainer:
                 })
                 total_loss = metrics.get('total_loss', metrics.get('policy_loss', 0) + metrics.get('value_loss', 0))
                 self._maybe_decay_lr(total_loss)
+
+                # Policy loss plateau escalation check
+                if self.config.plateau_escalation_enabled:
+                    self._check_policy_loss_plateau(metrics['policy_loss'])
 
             # Save to league pool if enabled
             self._maybe_save_to_league()
@@ -3501,8 +3723,22 @@ class TransformerTrainer:
                     "train/value_pred_mean": metrics["value_pred_mean"],
                     "train/value_pred_std": metrics["value_pred_std"],
                     "train/curriculum_ratio": metrics.get("curriculum_ratio", 0.0),
+                    "train/kl_consecutive_reverts": self.kl_consecutive_reverts,
                     "time/iteration_sec": iter_time,
                 }
+                # Plateau escalation metrics
+                if self.config.plateau_escalation_enabled:
+                    window = self.config.plateau_window
+                    window_mean = (sum(self.policy_loss_history[-window:]) /
+                                   len(self.policy_loss_history[-window:])
+                                   if self.policy_loss_history else 0.0)
+                    log_data.update({
+                        "escalation/plateau_count": self.plateau_count,
+                        "escalation/plateau_sim_tier": self.plateau_sim_tier_index,
+                        "escalation/sim_count": self.current_num_simulations,
+                        "escalation/policy_loss_window_mean": window_mean,
+                        "escalation/iters_on_rung": self.iteration - self.rung_start_iteration,
+                    })
                 if self.last_self_play_stats is not None:
                     for k, v in self.last_self_play_stats.items():
                         log_data[f"selfplay/{k}"] = v
