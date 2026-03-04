@@ -2542,8 +2542,9 @@ class TransformerTrainer:
         """Run a high-sample eval to confirm color dominance.
 
         Plays 50 games per perspective (100 total) against each of the
-        most recent league opponents. Returns True if P1 wr >= 90% and
-        P2 wr <= 10% across all games.
+        most recent league opponents. Results are recorded into the ELO
+        game results so they contribute to ratings. Returns True if
+        P1 wr >= 90% and P2 wr <= 10% across all games.
         """
         candidates = [(it, p) for it, p in self.league_pool if it != self.iteration]
         if len(candidates) < 4:
@@ -2551,6 +2552,7 @@ class TransformerTrainer:
 
         num_opponents = min(len(candidates), self.config.elo_eval_max_opponents)
         opponents = candidates[-num_opponents:]
+        current_iter = self.iteration
         current_params = self.get_network_params()
         recurrent_fn = make_transformer_recurrent_fn(self.network, self.env_config)
         num_games = 2 * 50  # 50 per perspective
@@ -2581,16 +2583,41 @@ class TransformerTrainer:
                 recurrent_fn=recurrent_fn,
             )
 
-            total_p1_wins += int(p1_wins)
-            total_p1_games += int(p1_wins) + int(p1_draws) + int(p1_losses)
-            total_p2_wins += int(p2_wins)
-            total_p2_games += int(p2_wins) + int(p2_draws) + int(p2_losses)
+            _p1w, _p1d, _p1l = int(p1_wins), int(p1_draws), int(p1_losses)
+            _p2w, _p2d, _p2l = int(p2_wins), int(p2_draws), int(p2_losses)
+            wins = _p1w + _p2w
+            draws = _p1d + _p2d
+            losses = _p1l + _p2l
 
-            p1_total = int(p1_wins) + int(p1_draws) + int(p1_losses)
-            p2_total = int(p2_wins) + int(p2_draws) + int(p2_losses)
+            total_p1_wins += _p1w
+            total_p1_games += _p1w + _p1d + _p1l
+            total_p2_wins += _p2w
+            total_p2_games += _p2w + _p2d + _p2l
+
+            # Record into ELO game results (same as evaluate_vs_league)
+            key = (current_iter, opp_iter)
+            if key in self.elo_game_results:
+                prev = self.elo_game_results[key]
+                self.elo_game_results[key] = [prev[0] + wins, prev[1] + draws, prev[2] + losses]
+            else:
+                self.elo_game_results[key] = [wins, draws, losses]
+
+            if key in self.elo_game_results_as_p1:
+                prev = self.elo_game_results_as_p1[key]
+                self.elo_game_results_as_p1[key] = [prev[0] + _p1w, prev[1] + _p1d, prev[2] + _p1l]
+            else:
+                self.elo_game_results_as_p1[key] = [_p1w, _p1d, _p1l]
+            if key in self.elo_game_results_as_p2:
+                prev = self.elo_game_results_as_p2[key]
+                self.elo_game_results_as_p2[key] = [prev[0] + _p2w, prev[1] + _p2d, prev[2] + _p2l]
+            else:
+                self.elo_game_results_as_p2[key] = [_p2w, _p2d, _p2l]
+
+            p1_total = _p1w + _p1d + _p1l
+            p2_total = _p2w + _p2d + _p2l
             print(f"    [confirm] vs iter_{opp_iter}: "
-                  f"P1: {int(p1_wins)}/{p1_total} ({int(p1_wins)/p1_total:.0%}) | "
-                  f"P2: {int(p2_wins)}/{p2_total} ({int(p2_wins)/p2_total:.0%})")
+                  f"P1: {_p1w}/{p1_total} ({_p1w/p1_total:.0%}) | "
+                  f"P2: {_p2w}/{p2_total} ({_p2w/p2_total:.0%})")
 
         p1_wr = total_p1_wins / total_p1_games if total_p1_games > 0 else 0.5
         p2_wr = total_p2_wins / total_p2_games if total_p2_games > 0 else 0.5
