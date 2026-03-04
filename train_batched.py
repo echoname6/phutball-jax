@@ -2496,19 +2496,15 @@ class TransformerTrainer:
                       f"random={ratios['random']:.0%}, league={ratios['league']:.0%}")
                 print(f"  [Curriculum] MCTS simulations: {self.current_num_simulations}")
 
-    def _update_elo_escalation(self, current_elo: float, best_prior_elo: float = -float('inf'), color_dominant: bool = False):
-        """Update ELO-based sim escalation state.
+    def _check_color_dominance_escalation(self, color_dominant: bool):
+        """Check if color dominance warrants board escalation.
 
-        Uses best_prior_elo (re-rated from the full tournament solver) instead of
-        a stale high-water mark, so earlier checkpoints whose ratings were inflated
-        by insufficient sampling get corrected before the stagnation comparison.
+        Runs independently of ELO/plateau escalation. When both eval and
+        self-play show sustained color dominance, the board is effectively
+        solved and we should escalate to the next board size.
         """
-        if not self.config.elo_escalation_enabled:
+        if not self.config.board_ladder_enabled:
             return
-
-        min_improvement = self.config.elo_min_improvement
-        patience = self.config.elo_stagnation_patience
-        tiers = self.config.elo_sim_tiers
 
         # Track consecutive eval-level color dominance
         if color_dominant:
@@ -2521,9 +2517,8 @@ class TransformerTrainer:
         #   - self-play P1 wr >= 85% sustained (tracked per-iteration)
         if (self.eval_color_dominant_count >= 4 and
                 self.selfplay_color_dominant_count >= 10 and
-                self.config.board_ladder_enabled and
                 self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
-            print(f"  [ELO] Color dominance confirmed (eval: {self.eval_color_dominant_count} consecutive, "
+            print(f"  [COLOR] Color dominance confirmed (eval: {self.eval_color_dominant_count} consecutive, "
                   f"self-play: {self.selfplay_color_dominant_count} consecutive) -> board escalation")
             self._send_ntfy(
                 "Color Dominance -> Board Escalation",
@@ -2534,7 +2529,20 @@ class TransformerTrainer:
                 priority="high",
             )
             self._escalate_board_size()
+
+    def _update_elo_escalation(self, current_elo: float, best_prior_elo: float = -float('inf')):
+        """Update ELO-based sim escalation state.
+
+        Uses best_prior_elo (re-rated from the full tournament solver) instead of
+        a stale high-water mark, so earlier checkpoints whose ratings were inflated
+        by insufficient sampling get corrected before the stagnation comparison.
+        """
+        if not self.config.elo_escalation_enabled:
             return
+
+        min_improvement = self.config.elo_min_improvement
+        patience = self.config.elo_stagnation_patience
+        tiers = self.config.elo_sim_tiers
 
         if current_elo > best_prior_elo + min_improvement:
             self.elo_stagnation_count = 0
@@ -3533,9 +3541,12 @@ class TransformerTrainer:
             default=-float('inf'),
         )
 
-        # Update escalation (only ELO-driven when plateau escalation is not active)
+        # Color dominance → board escalation (independent of ELO/plateau escalation)
+        self._check_color_dominance_escalation(color_dominant)
+
+        # ELO-driven sim escalation (only when plateau escalation is not active)
         if self.config.elo_escalation_enabled and not self.config.plateau_escalation_enabled:
-            self._update_elo_escalation(current_elo, best_prior_elo=best_prior_elo, color_dominant=color_dominant)
+            self._update_elo_escalation(current_elo, best_prior_elo=best_prior_elo)
 
         # Store stats for wandb
         board_key = f"{self.config.rows}x{self.config.cols}"
