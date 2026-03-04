@@ -2499,11 +2499,17 @@ class TransformerTrainer:
     def _check_color_dominance_escalation(self, color_dominant: bool):
         """Check if color dominance warrants board escalation.
 
-        Runs independently of ELO/plateau escalation. When both eval and
-        self-play show sustained color dominance, the board is effectively
-        solved and we should escalate to the next board size.
+        Runs independently of ELO/plateau escalation. When eval shows
+        sustained color dominance, the board is effectively solved and
+        we should escalate to the next board size.
+
+        On first detection, runs a high-sample confirmation eval (50 games
+        per perspective) to avoid false positives. If confirmed, escalates
+        immediately. Otherwise resets the counter.
         """
         if not self.config.board_ladder_enabled:
+            return
+        if self.board_ladder_index >= len(self.config.board_ladder_sizes) - 1:
             return
 
         # Track consecutive eval-level color dominance
@@ -2511,24 +2517,87 @@ class TransformerTrainer:
             self.eval_color_dominant_count += 1
         else:
             self.eval_color_dominant_count = 0
+            return
 
-        # Color dominance: board is effectively solved when BOTH:
-        #   - eval shows color dominance for 4 consecutive evals
-        #   - self-play P1 wr >= 85% sustained (tracked per-iteration)
-        if (self.eval_color_dominant_count >= 4 and
-                self.selfplay_color_dominant_count >= 10 and
-                self.board_ladder_index < len(self.config.board_ladder_sizes) - 1):
-            print(f"  [COLOR] Color dominance confirmed (eval: {self.eval_color_dominant_count} consecutive, "
-                  f"self-play: {self.selfplay_color_dominant_count} consecutive) -> board escalation")
-            self._send_ntfy(
-                "Color Dominance -> Board Escalation",
-                f"Iter {self.iteration} | {self.config.rows}x{self.config.cols}\n"
-                f"Eval color dominant {self.eval_color_dominant_count}x, "
-                f"self-play {self.selfplay_color_dominant_count}x\n"
-                f"Skipping sim tiers -> board escalation",
-                priority="high",
+        # First detection: run confirmation eval with 50 games/perspective
+        if self.eval_color_dominant_count == 1:
+            print(f"  [COLOR] Color dominance detected — running confirmation eval "
+                  f"(50 games/perspective)...")
+            confirmed = self._run_color_dominance_confirmation()
+            if confirmed:
+                print(f"  [COLOR] Confirmation passed — board is solved -> board escalation")
+                self._send_ntfy(
+                    "Color Dominance -> Board Escalation",
+                    f"Iter {self.iteration} | {self.config.rows}x{self.config.cols}\n"
+                    f"Confirmed with 50 games/perspective\n"
+                    f"Escalating board size",
+                    priority="high",
+                )
+                self._escalate_board_size()
+            else:
+                print(f"  [COLOR] Confirmation failed — resetting counter")
+                self.eval_color_dominant_count = 0
+
+    def _run_color_dominance_confirmation(self) -> bool:
+        """Run a high-sample eval to confirm color dominance.
+
+        Plays 50 games per perspective (100 total) against each of the
+        most recent league opponents. Returns True if P1 wr >= 90% and
+        P2 wr <= 10% across all games.
+        """
+        candidates = [(it, p) for it, p in self.league_pool if it != self.iteration]
+        if len(candidates) < 4:
+            return False
+
+        num_opponents = min(len(candidates), self.config.elo_eval_max_opponents)
+        opponents = candidates[-num_opponents:]
+        current_params = self.get_network_params()
+        recurrent_fn = make_transformer_recurrent_fn(self.network, self.env_config)
+        num_games = 2 * 50  # 50 per perspective
+
+        total_p1_wins = 0
+        total_p1_games = 0
+        total_p2_wins = 0
+        total_p2_games = 0
+
+        for opp_iter, opp_params in opponents:
+            self.rng, eval_rng = jax.random.split(self.rng)
+            (
+                p1_wins, p1_draws, p1_losses,
+                p2_wins, p2_draws, p2_losses,
+                turns,
+            ) = play_vs_checkpoint_batched(
+                current_params=current_params,
+                opponent_params=opp_params,
+                rng=eval_rng,
+                network=self.network,
+                env_config=self.env_config,
+                num_games=num_games,
+                max_moves=self.config.elo_eval_max_moves,
+                num_simulations=self.config.elo_eval_num_simulations,
+                temperature=0.0,
+                dirichlet_fraction=0.0,
+                mcts_policy_fn=transformer_mcts_policy,
+                recurrent_fn=recurrent_fn,
             )
-            self._escalate_board_size()
+
+            total_p1_wins += int(p1_wins)
+            total_p1_games += int(p1_wins) + int(p1_draws) + int(p1_losses)
+            total_p2_wins += int(p2_wins)
+            total_p2_games += int(p2_wins) + int(p2_draws) + int(p2_losses)
+
+            p1_total = int(p1_wins) + int(p1_draws) + int(p1_losses)
+            p2_total = int(p2_wins) + int(p2_draws) + int(p2_losses)
+            print(f"    [confirm] vs iter_{opp_iter}: "
+                  f"P1: {int(p1_wins)}/{p1_total} ({int(p1_wins)/p1_total:.0%}) | "
+                  f"P2: {int(p2_wins)}/{p2_total} ({int(p2_wins)/p2_total:.0%})")
+
+        p1_wr = total_p1_wins / total_p1_games if total_p1_games > 0 else 0.5
+        p2_wr = total_p2_wins / total_p2_games if total_p2_games > 0 else 0.5
+        print(f"    [confirm] Overall: P1={p1_wr:.0%}, P2={p2_wr:.0%} "
+              f"({total_p1_games + total_p2_games} games)")
+
+        return (p1_wr >= 0.9 or p1_wr <= 0.1) and (p2_wr >= 0.9 or p2_wr <= 0.1)
 
     def _update_elo_escalation(self, current_elo: float, best_prior_elo: float = -float('inf')):
         """Update ELO-based sim escalation state.
