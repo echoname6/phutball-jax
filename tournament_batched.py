@@ -123,18 +123,27 @@ def _run_megabatch(
 
     batch_arange = jnp.arange(batch_size)
 
+    import time as _time
+
     for step_idx in range(max_moves):
         if not bool(jnp.any(~terminated)):
             break
+
+        step_t0 = _time.time()
 
         # Which agent is acting in each game?
         current_agent = jnp.where(
             states.current_player == 1, p1_agent_idx, p2_agent_idx
         )
 
-        # Run MCTS for each agent on the full batch (wasteful but GPU-uniform)
+        # Run MCTS only for agents with active games (skip inactive agents)
         agent_actions = []
         for agent_id in range(num_agents):
+            mask = (current_agent == agent_id) & ~terminated
+            if not bool(jnp.any(mask)):
+                # No active games for this agent — use zeros as placeholder
+                agent_actions.append(jnp.zeros(batch_size, dtype=jnp.int32))
+                continue
             rng, agent_rng = jax.random.split(rng)
             a, _, _ = transformer_mcts_policy(
                 all_params[agent_id], states, agent_rng, network, env_config,
@@ -151,6 +160,12 @@ def _run_megabatch(
         jump_counts = jump_counts + (is_jump & ~terminated).astype(jnp.int32)
 
         states, terminated = _step_games_batched(states, actions, terminated, env_config)
+
+        # Timing diagnostics for first 3 steps and every 50th after
+        if step_idx < 3 or step_idx % 50 == 0:
+            active = int(jnp.sum(~terminated))
+            print(f"    Step {step_idx}: {_time.time()-step_t0:.1f}s "
+                  f"({active}/{batch_size} active, {num_agents} agents)")
 
     return states.winner, states.num_turns, jump_counts
 
@@ -451,21 +466,40 @@ def _play_fixed_perspective_batch(
         if not bool(jnp.any(~terminated)):
             break
 
-        use_p1 = (states.current_player == 1)
-        rng, rng_p1, rng_p2 = jax.random.split(rng, 3)
+        is_p1_turn = (states.current_player == 1)
+        p1_active = bool(jnp.any(is_p1_turn & ~terminated))
+        p2_active = bool(jnp.any(~is_p1_turn & ~terminated))
 
-        actions_p1, _, _ = mcts_policy_fn(
-            p1_params, states, rng_p1, network, env_config,
-            num_simulations=num_simulations, temperature=0.0,
-            dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
-        )
-        actions_p2, _, _ = mcts_policy_fn(
-            p2_params, states, rng_p2, network, env_config,
-            num_simulations=num_simulations, temperature=0.0,
-            dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
-        )
+        rng, mcts_rng = jax.random.split(rng)
 
-        actions = jnp.where(use_p1, actions_p1, actions_p2)
+        if p1_active and not p2_active:
+            # Only P1 needs actions — skip P2 MCTS entirely
+            actions, _, _ = mcts_policy_fn(
+                p1_params, states, mcts_rng, network, env_config,
+                num_simulations=num_simulations, temperature=0.0,
+                dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
+            )
+        elif p2_active and not p1_active:
+            # Only P2 needs actions — skip P1 MCTS entirely
+            actions, _, _ = mcts_policy_fn(
+                p2_params, states, mcts_rng, network, env_config,
+                num_simulations=num_simulations, temperature=0.0,
+                dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
+            )
+        else:
+            # Both players active — run both
+            rng, rng_p1, rng_p2 = jax.random.split(rng, 3)
+            actions_p1, _, _ = mcts_policy_fn(
+                p1_params, states, rng_p1, network, env_config,
+                num_simulations=num_simulations, temperature=0.0,
+                dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
+            )
+            actions_p2, _, _ = mcts_policy_fn(
+                p2_params, states, rng_p2, network, env_config,
+                num_simulations=num_simulations, temperature=0.0,
+                dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
+            )
+            actions = jnp.where(is_p1_turn, actions_p1, actions_p2)
 
         is_jump = (actions >= total_positions) & (actions < 2 * total_positions)
         jump_counts = jump_counts + (is_jump & ~terminated).astype(jnp.int32)
