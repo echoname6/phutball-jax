@@ -98,55 +98,60 @@ def _run_megabatch(
     """
     Play a batch of games where different games use different agent params.
 
-    At each step:
-    1. Determine current_agent_idx per game from p1/p2 assignment
-    2. Run transformer_mcts_policy for each unique agent on the full batch
-    3. Index into stacked outputs to pick the correct action per game
-    4. Step all envs
+    Uses jax.lax.while_loop for XLA compilation of the entire game loop.
+    All K agents are evaluated every step (no dynamic Python branching),
+    but XLA compiles and fuses everything for 10-100x speedup over
+    Python-dispatched selective calls.
+
+    The Python `for agent_id in range(num_agents)` inside body_fn is
+    traced ONCE at compile time and unrolled into the XLA program.
+    num_agents must be known at trace time (recompiles if changed).
 
     Returns:
         winners:     (batch,) — 1=P1 won, 2=P2 won, 0=draw
         num_turns:   (batch,) — game lengths
         jump_counts: (batch,) — total jumps per game
     """
+    from jax import lax
+
     batch_size = p1_agent_idx.shape[0]
     num_agents = len(all_params)
     rows, cols = env_config.rows, env_config.cols
     total_positions = rows * cols
-
-    states = batched_reset(env_config, batch_size)
-    terminated = jnp.zeros((batch_size,), dtype=jnp.bool_)
-    jump_counts = jnp.zeros((batch_size,), dtype=jnp.int32)
 
     if recurrent_fn is None:
         recurrent_fn = make_transformer_recurrent_fn(network, env_config)
 
     batch_arange = jnp.arange(batch_size)
 
-    import time as _time
+    init_states = batched_reset(env_config, batch_size)
+    init_terminated = jnp.zeros(batch_size, dtype=jnp.bool_)
+    init_jumps = jnp.zeros(batch_size, dtype=jnp.int32)
+    init_step = jnp.int32(0)
 
-    for step_idx in range(max_moves):
-        if not bool(jnp.any(~terminated)):
-            break
+    def cond_fn(carry):
+        states, terminated, jump_counts, rng, step_idx = carry
+        any_active = jnp.any(~terminated)
+        within_budget = step_idx < max_moves
+        return any_active & within_budget
 
-        step_t0 = _time.time()
+    def body_fn(carry):
+        states, terminated, jump_counts, rng, step_idx = carry
 
-        # Which agent is acting in each game?
         current_agent = jnp.where(
             states.current_player == 1, p1_agent_idx, p2_agent_idx
         )
 
-        # Run MCTS only for agents with active games (skip inactive agents)
+        # Run ALL agents on full batch — traced once, compiled into XLA
+        rngs = jax.random.split(rng, num_agents + 1)
+        rng_next = rngs[0]
+        agent_rngs = rngs[1:]
+
         agent_actions = []
         for agent_id in range(num_agents):
-            mask = (current_agent == agent_id) & ~terminated
-            if not bool(jnp.any(mask)):
-                # No active games for this agent — use zeros as placeholder
-                agent_actions.append(jnp.zeros(batch_size, dtype=jnp.int32))
-                continue
-            rng, agent_rng = jax.random.split(rng)
             a, _, _ = transformer_mcts_policy(
-                all_params[agent_id], states, agent_rng, network, env_config,
+                all_params[agent_id], states, agent_rngs[agent_id],
+                network, env_config,
                 num_simulations=num_simulations, temperature=0.0,
                 dirichlet_fraction=0.0, recurrent_fn=recurrent_fn,
             )
@@ -159,13 +164,22 @@ def _run_megabatch(
         is_jump = (actions >= total_positions) & (actions < 2 * total_positions)
         jump_counts = jump_counts + (is_jump & ~terminated).astype(jnp.int32)
 
-        states, terminated = _step_games_batched(states, actions, terminated, env_config)
+        # Step envs
+        new_states_raw = jax.vmap(
+            lambda s, a: step(s, a, env_config)
+        )(states, actions)
+        new_terminated = terminated | new_states_raw.terminated
+        new_states = _make_frozen_state(
+            states, new_states_raw, new_terminated, env_config
+        )
 
-        # Timing diagnostics for first 3 steps and every 50th after
-        if step_idx < 3 or step_idx % 50 == 0:
-            active = int(jnp.sum(~terminated))
-            print(f"    Step {step_idx}: {_time.time()-step_t0:.1f}s "
-                  f"({active}/{batch_size} active, {num_agents} agents)")
+        return (new_states, new_terminated, jump_counts, rng_next, step_idx + 1)
+
+    final = lax.while_loop(
+        cond_fn, body_fn,
+        (init_states, init_terminated, init_jumps, rng, init_step)
+    )
+    states, terminated, jump_counts, _, _ = final
 
     return states.winner, states.num_turns, jump_counts
 
@@ -302,6 +316,7 @@ def run_tournament_megabatch(
 
         rng, chunk_rng = jax.random.split(rng)
 
+        print(f"  Chunk {chunk_i + 1}/{num_chunks}: compiling + running {chunk_size} games...")
         ct0 = time.time()
         winners, turns, jumps = _run_megabatch(
             all_params=all_params,
@@ -314,6 +329,7 @@ def run_tournament_megabatch(
             max_moves=max_moves,
             recurrent_fn=recurrent_fn,
         )
+        winners.block_until_ready()
         ct1 = time.time()
 
         print(f"  Chunk {chunk_i + 1}/{num_chunks}: {chunk_size} games [{ct1 - ct0:.1f}s]")
