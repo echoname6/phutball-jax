@@ -13,6 +13,7 @@ Usage:
     results, ratings = run_tournament_megabatch(agents, network, env_config, rng)
 """
 
+import json
 import time
 from typing import Dict, List, Tuple
 
@@ -254,6 +255,7 @@ def run_tournament_megabatch(
     max_batch_size: int = 256,
     num_simulations: int = 32,
     max_moves: int = 2048,
+    save_path: str = None,
 ) -> Tuple[List[dict], Dict[str, float]]:
     """
     Full round-robin tournament using mega-batched games.
@@ -271,6 +273,7 @@ def run_tournament_megabatch(
         max_batch_size: chunk games into batches of this size
         num_simulations: MCTS simulations per move
         max_moves: max moves before game is declared draw
+        save_path: JSON path for incremental checkpoint after each chunk
 
     Returns:
         match_results: list of per-matchup result dicts
@@ -339,6 +342,23 @@ def run_tournament_megabatch(
         all_jumps.append(np.array(jumps))
         all_m_idx.append(m_idx[start:end])
         all_p1_idx.append(p1_idx[start:end])
+
+        if save_path:
+            games_completed = sum(len(w) for w in all_winners)
+            partial = {
+                'completed_chunks': chunk_i + 1,
+                'total_chunks': num_chunks,
+                'winners': np.concatenate(all_winners).tolist(),
+                'num_turns': np.concatenate(all_turns).tolist(),
+                'jump_counts': np.concatenate(all_jumps).tolist(),
+                'p1_agent_idx': p1_idx.tolist(),
+                'p2_agent_idx': p2_idx.tolist(),
+                'matchup_idx': m_idx.tolist(),
+                'agent_names': names,
+            }
+            with open(save_path, 'w') as f:
+                json.dump(partial, f)
+            print(f"  Checkpoint saved to {save_path} ({games_completed}/{total_games} games)")
 
     elapsed = time.time() - t0
     print(f"\nAll games complete [{elapsed:.1f}s total]\n")
