@@ -11,6 +11,7 @@ Public API:
     generate_n_move_win_state
     generate_two_move_win_state
     generate_curriculum_batch
+    generate_threat_recognition_state
 """
 
 import jax
@@ -18,10 +19,19 @@ import jax.numpy as jnp
 import numpy as np
 from typing import List, Tuple
 
-from phutball_env_jax import (
-    EnvConfig, PhutballState, state_to_network_input,
-    EMPTY, BALL, MAN, END_HI, END_LO, MAX_JUMP_SEQUENCE_LENGTH,
-)
+# Support both import styles: as a package member (`phutball_jax.curriculum_puzzles`,
+# used by server.py) or as a bare top-level module (used when test scripts inside
+# phutball_jax/ are invoked directly).
+try:
+    from .phutball_env_jax import (
+        EnvConfig, PhutballState, state_to_network_input,
+        EMPTY, BALL, MAN, END_HI, END_LO, MAX_JUMP_SEQUENCE_LENGTH,
+    )
+except ImportError:
+    from phutball_env_jax import (
+        EnvConfig, PhutballState, state_to_network_input,
+        EMPTY, BALL, MAN, END_HI, END_LO, MAX_JUMP_SEQUENCE_LENGTH,
+    )
 
 
 # ============================================================================
@@ -819,3 +829,110 @@ def generate_curriculum_batch(
         return states, policies, values, stats
 
     return states, policies, values
+
+
+# ============================================================================
+# Threat Recognition Puzzles
+# ============================================================================
+
+def _normalize_dir(dr: int, dc: int):
+    """Reduce a vector to its unit direction (sign-preserving)."""
+    from math import gcd
+    if dr == 0 and dc == 0:
+        return (0, 0)
+    g = gcd(abs(dr), abs(dc)) or 1
+    return (dr // g, dc // g)
+
+
+def _decode_jump_landings(actions, rows: int, cols: int):
+    total = rows * cols
+    out = []
+    for a in actions:
+        a = int(a)
+        if total <= a < 2 * total:
+            j = a - total
+            out.append((j // cols, j % cols))
+    return out
+
+
+def generate_threat_recognition_state(
+    rng: jax.Array,
+    env_config: EnvConfig,
+    num_jumps: int = 2,
+    threat_player: int = 1,
+    min_jump_len: int = 1,
+    max_jump_len: int = 3,
+    max_attempts: int = 32,
+):
+    """
+    Generate a state where `threat_player` has an n-jump winning threat that
+    contains at least one direction-change pivot. The state's current_player
+    is set to the OTHER player (the responder), whose canonical task is to
+    place a stone at any pivot to disrupt the threat.
+
+    A pivot is the cell where the opponent's chain changes direction between
+    consecutive jumps (intermediate landing whose preceding-jump direction
+    differs from the following-jump direction).
+
+    Returns:
+        state:                PhutballState ready for the responder to play
+        canonical_pivots:     list of (r, c) — placement targets that disrupt
+        chain_landings:       list of (r, c) — full opponent landing path,
+                              for env-replay validation of LLM responses
+        threat_actions:       opponent's canonical action indices (for replay)
+    """
+    if num_jumps < 2:
+        raise ValueError("Threat puzzles require num_jumps >= 2 (no pivot exists for n=1).")
+
+    rows, cols = env_config.rows, env_config.cols
+
+    for _ in range(max_attempts):
+        rng, sub_rng = jax.random.split(rng)
+        # Generate a winning sequence FOR threat_player. No noise — see methodology.
+        state, actions = generate_n_move_win_state(
+            sub_rng,
+            env_config,
+            num_jumps=num_jumps,
+            player=threat_player,
+            min_jump_len=min_jump_len,
+            max_jump_len=max_jump_len,
+            add_noise_men=False,
+            max_noise_men=0,
+        )
+
+        landings = _decode_jump_landings(actions, rows, cols)
+        if len(landings) != num_jumps:
+            continue  # malformed
+
+        # Compute the unit direction of each jump segment.
+        ball_pos = (int(state.ball_pos[0]), int(state.ball_pos[1]))
+        positions = [ball_pos] + landings
+        dirs = []
+        bad = False
+        for i in range(len(positions) - 1):
+            dr = positions[i+1][0] - positions[i][0]
+            dc = positions[i+1][1] - positions[i][1]
+            unit = _normalize_dir(dr, dc)
+            if unit == (0, 0):
+                bad = True
+                break
+            dirs.append(unit)
+        if bad:
+            continue
+
+        # Direction-change pivots: landing[i] is a pivot iff dirs[i] != dirs[i+1].
+        pivots = [landings[i] for i in range(len(dirs) - 1) if dirs[i] != dirs[i+1]]
+        if not pivots:
+            continue  # filter out pure same-direction chains
+
+        # Flip current_player so the responder is on move.
+        responder = 3 - threat_player
+        new_state = state._replace(
+            current_player=jnp.array(responder, dtype=jnp.int32),
+        )
+        return new_state, pivots, landings, [int(a) for a in actions]
+
+    raise RuntimeError(
+        f"Failed to generate a threat puzzle (n={num_jumps}, player={threat_player}) "
+        f"with a direction-change pivot after {max_attempts} attempts."
+    )
