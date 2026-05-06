@@ -14,7 +14,7 @@ from phutball_env_jax import (
     EnvConfig, PhutballState, reset, step, get_legal_actions,
     EMPTY, BALL, MAN, END_HI, END_LO,
 )
-from train_batched import (
+from curriculum_puzzles import (
     generate_one_move_win_state,
     generate_two_move_win_state,
     generate_n_move_win_state,

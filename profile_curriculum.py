@@ -12,7 +12,7 @@ from typing import List, Tuple
 from dataclasses import dataclass
 
 from phutball_env_jax import EnvConfig
-from train_batched import (
+from curriculum_puzzles import (
     generate_curriculum_batch,
     generate_one_move_win_state,
     generate_n_move_win_state,
