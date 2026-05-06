@@ -65,16 +65,16 @@ def generate_one_move_win_state(
     # Split RNG for each random choice
     rng, landing_col_rng, jump_len_rng, dir_rng, depth_rng, noise_rng = jax.random.split(rng, 6)
 
-    # P1 wins by reaching row >= rows-2 (bottom endzone)
-    # P2 wins by reaching row <= 1 (top endzone)
+    # P1 wins by reaching row <= 1 (top endzone, END_HI)
+    # P2 wins by reaching row >= rows-2 (bottom endzone, END_LO)
 
     # Directions toward each player's goal
-    if player == 1:
-        # P1 moves down (increasing row): vertical and both diagonals
+    if player == 2:
+        # P2 moves down (increasing row): vertical and both diagonals
         directions = [(1, 0), (1, -1), (1, 1)]  # down, down-left, down-right
         endzone_rows = [rows - 2, rows - 1]  # Can land on either endzone row
     else:
-        # P2 moves up (decreasing row): vertical and both diagonals
+        # P1 moves up (decreasing row): vertical and both diagonals
         directions = [(-1, 0), (-1, -1), (-1, 1)]  # up, up-left, up-right
         endzone_rows = [0, 1]  # Can land on either endzone row
 
@@ -98,10 +98,10 @@ def generate_one_move_win_state(
         else:
             max_possible_len = landing_col  # leftward diagonal
         # Also limit by board height
-        if player == 1:
-            max_by_height = landing_row - 2  # Can't start in endzone (rows 0,1 are P2's)
+        if player == 2:
+            max_by_height = landing_row - 2  # Can't start in endzone (rows 0,1 are P1's)
         else:
-            max_by_height = (rows - 1) - landing_row - 2  # Can't start in P1's endzone
+            max_by_height = (rows - 1) - landing_row - 2  # Can't start in P2's endzone
         max_jump_len = min(max_jump_len, max_possible_len, max_by_height)
         if max_jump_len < min_jump_len:
             # Fallback to vertical if diagonal not possible
@@ -125,15 +125,15 @@ def generate_one_move_win_state(
         ball_row = landing_row - (jump_len + 1) * dr
 
     # Make sure ball is in playable area (not in endzones)
-    if player == 1:
-        # Ball shouldn't be in P2's endzone (rows 0,1) or P1's endzone (rows-2, rows-1)
+    if player == 2:
+        # Ball shouldn't be in P1's endzone (rows 0,1) or P2's endzone (rows-2, rows-1)
         if ball_row <= 1 or ball_row >= rows - 2:
             # Reduce jump length to fit
             if ball_row <= 1:
                 ball_row = 2
                 jump_len = (landing_row - ball_row) // abs(dr) - 1
             else:
-                # This shouldn't happen for P1 moving down, but safety check
+                # This shouldn't happen for P1 moving up, but safety check
                 jump_len = max(1, jump_len - 1)
                 ball_row = landing_row - (jump_len + 1) * dr
     else:
@@ -283,11 +283,11 @@ def generate_n_move_win_state(
         max_jump_len = max(min_jump_len, adjusted_max)
 
     # Directions toward goal (for final jump into endzone)
-    if player == 1:
-        goal_directions = [(1, 0), (1, -1), (1, 1)]  # down, down-left, down-right
+    if player == 2:
+        goal_directions = [(1, 0), (1, -1), (1, 1)]  # P2 attacks bottom: down/down-left/down-right
         endzone_rows = [rows - 2, rows - 1]
     else:
-        goal_directions = [(-1, 0), (-1, -1), (-1, 1)]  # up, up-left, up-right
+        goal_directions = [(-1, 0), (-1, -1), (-1, 1)]  # P1 attacks top: up/up-left/up-right
         endzone_rows = [0, 1]
 
     # All directions for intermediate jumps (including horizontal)
@@ -356,8 +356,8 @@ def generate_n_move_win_state(
                     dc = 0
                     prev_col = curr_col
                     # If dr would be backward (away from goal), flip to forward
-                    if (player == 1 and dr < 0) or (player == 2 and dr > 0):
-                        dr = 1 if player == 1 else -1  # forward toward goal
+                    if (player == 2 and dr < 0) or (player == 1 and dr > 0):
+                        dr = 1 if player == 2 else -1  # forward toward goal
                     prev_row = curr_row - (jump_len + 1) * dr
                 else:
                     # Was horizontal (dr=0) - flip direction
@@ -365,7 +365,7 @@ def generate_n_move_win_state(
                     prev_col = curr_col - (jump_len + 1) * dc
                     if prev_col < 0 or prev_col >= cols:
                         # Still out of bounds, switch to goal-directed vertical
-                        dr = 1 if player == 1 else -1
+                        dr = 1 if player == 2 else -1
                         dc = 0
                         prev_row = curr_row - (jump_len + 1) * dr
                         prev_col = curr_col
@@ -375,7 +375,7 @@ def generate_n_move_win_state(
             # Note: for horizontal jumps (dr=0), row doesn't change so check column instead
             if dr != 0 and (prev_row <= 1 or prev_row >= rows - 2):
                 # Need to reduce jump length to fit (vertical/diagonal case)
-                if player == 1:
+                if player == 2:
                     # Moving down, prev must be above curr
                     available_space = curr_row - 2  # rows 0,1 are P2 endzone
                 else:
@@ -418,12 +418,12 @@ def generate_n_move_win_state(
                 # Ensure prev is exactly 2 rows away for a minimal valid jump (jump_len=1)
                 dc = 0
                 prev_col = curr_col
-                if player == 1:
-                    # P1 moves down (toward higher rows), so prev should be above curr
+                if player == 2:
+                    # P1 moves up (toward lower rows), so prev should be below curr
                     prev_row = curr_row - 2
                     dr = 1  # Ensure correct direction
                 else:
-                    # P2 moves up (toward lower rows), so prev should be below curr
+                    # P2 moves down (toward higher rows), so prev should be above curr
                     prev_row = curr_row + 2
                     dr = -1  # Ensure correct direction
                 jump_len = 1
@@ -437,7 +437,7 @@ def generate_n_move_win_state(
                     jump_len = actual_distance - 1
                 else:
                     # Can't make a valid jump, set minimal distance
-                    if player == 1:
+                    if player == 2:
                         prev_row = curr_row - 2
                     else:
                         prev_row = curr_row + 2
@@ -465,13 +465,13 @@ def generate_n_move_win_state(
                 # Try all directions with different jump lengths
                 # Prioritize goal-directed vertical, then horizontal, then diagonal
                 test_directions = [
-                    (1 if player == 1 else -1, 0),   # goal-directed vertical
+                    (1 if player == 2 else -1, 0),   # goal-directed vertical
                     (0, 1), (0, -1),                  # horizontal
-                    (1 if player == 1 else -1, 1),   # goal-directed diagonal right
-                    (1 if player == 1 else -1, -1),  # goal-directed diagonal left
-                    (-1 if player == 1 else 1, 0),   # backward vertical
-                    (-1 if player == 1 else 1, 1),   # backward diagonal right
-                    (-1 if player == 1 else 1, -1),  # backward diagonal left
+                    (1 if player == 2 else -1, 1),   # goal-directed diagonal right
+                    (1 if player == 2 else -1, -1),  # goal-directed diagonal left
+                    (-1 if player == 2 else 1, 0),   # backward vertical
+                    (-1 if player == 2 else 1, 1),   # backward diagonal right
+                    (-1 if player == 2 else 1, -1),  # backward diagonal left
                 ]
                 for test_dr, test_dc in test_directions:
                     if resolved:
