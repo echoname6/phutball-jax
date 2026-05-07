@@ -1373,14 +1373,29 @@ def generate_denial_recognition_state(
         # returns the ball to start_pos. Patterns are sampled uniformly.
         # Hook adds asymmetry so the loop doesn't read as a perfect square
         # — closer to the organic shapes that emerge in actual play.
+        # Each pattern is a closed loop returning to start, with all sides
+        # along Phutball's 8-direction grid (axis or 45° diagonal). The loop
+        # must dip into the player's defensive territory so its stones
+        # represent opponent setup material.
         feasible = []
         if num_jumps - 3 >= 1:
             feasible.append(('triangle', 3))
         if num_jumps - 4 >= 1:
             feasible.append(('rect', 4))
+            feasible.append(('tilted', 4))         # diamond rotated 45° pointing south
+            feasible.append(('parallelogram', 4))  # H + diag + H + diag
         if not feasible:
             continue
-        pattern, K = feasible[int(jax.random.randint(take(), (), 0, len(feasible)))]
+        pattern, K_base = feasible[int(jax.random.randint(take(), (), 0, len(feasible)))]
+        # Stone-gap fragmentation: each long leg can be split into 2 jumps
+        # by leaving an internal cell empty. Adds K without enlarging the
+        # loop geometrically. K_extras ∈ [0, num_legs_with_room_for_gap].
+        # We want K_loop = K_base + K_extras ≤ num_jumps - 1 (need M ≥ 1).
+        max_K_loop = num_jumps - 1
+        K_extras = max(0, max_K_loop - K_base)
+        if K_extras > 0:
+            K_extras = int(jax.random.randint(take(), (), 0, K_extras + 1))
+        K = K_base + K_extras
         M = num_jumps - K
 
         # 2. Sample horizontal mirror (+1 = loop extends right, -1 = left)
@@ -1424,14 +1439,38 @@ def generate_denial_recognition_state(
         max_width = min(6, max_width_col)
 
         if pattern == 'triangle':
-            # Hypotenuse forces width == height.
             min_dim = max(min_height, 3)
             max_dim = min(max_height, max_width)
             if min_dim > max_dim:
                 continue
             width = height = int(jax.random.randint(take(), (), min_dim, max_dim + 1))
-        else:
-            # rect / hook: independent w, h.
+        elif pattern == 'tilted':
+            # Rotated diamond pointing south: 4 diagonal legs of equal length s.
+            # Total north-south span is 2s; need ≥ defensive penetration so
+            # 2s ≥ defensive_min_row - start_row (P1) etc. Side dim is s.
+            need_south = (defensive_min_row - start_row) if player == 1 else (start_row - defensive_max_row)
+            min_dim = max(2, (need_south + 1) // 2)
+            # Also need sc ± s on board (loop extends both ways from start_col)
+            max_dim = min(max_height // 2, max_width, start_col, cols - 1 - start_col)
+            if min_dim > max_dim:
+                continue
+            width = height = int(jax.random.randint(take(), (), min_dim, max_dim + 1))
+        elif pattern == 'parallelogram':
+            # Horizontal width + diagonal height: total south-extent = height,
+            # total east-extent = width + height (the diagonal adds width).
+            if min_height > max_height or 3 > max_width:
+                continue
+            height = int(jax.random.randint(take(), (), min_height, max_height + 1))
+            # Diagonal extends past width by `height` cells; total horizontal
+            # extent of the loop is width + height. Constrain accordingly.
+            if mirror > 0:
+                max_w_par = cols - 1 - start_col - height
+            else:
+                max_w_par = start_col - height
+            if max_w_par < 3:
+                continue
+            width = int(jax.random.randint(take(), (), 3, max_w_par + 1))
+        else:  # rect
             if min_height > max_height or 3 > max_width:
                 continue
             height = int(jax.random.randint(take(), (), min_height, max_height + 1))
@@ -1439,42 +1478,98 @@ def generate_denial_recognition_state(
 
         start_pos = (start_row, start_col)
 
-        # 6. Build loop landings + stones for the chosen pattern.
-        loop_landings = []
-        loop_stones = []
-
+        # 6. Build leg specs as (start_cell, end_cell, dr_step, dc_step, length).
+        # We then fragment each leg with stone-gaps (up to one gap per leg)
+        # to add intermediate landings. The final loop_landings + loop_stones
+        # are computed from the leg specs after gap insertion.
+        leg_specs = []
         if pattern == 'rect':
-            # Width × height rectangle. Asymmetric when w != h, organic feel.
-            #   C0 = start
-            #   C1 (horizontal width)
-            #   C2 (forward vertical height)
-            #   C3 (horizontal back width)
-            #   → C0 (vertical back height)
             c1 = (start_row, start_col + mirror * width)
             c2 = (start_row + forward_dr * height, start_col + mirror * width)
             c3 = (start_row + forward_dr * height, start_col)
-            loop_landings = [c1, c2, c3, start_pos]
-            for k in range(1, width):
-                loop_stones.append((start_row, start_col + mirror * k))
-            for k in range(1, height):
-                loop_stones.append((start_row + forward_dr * k, start_col + mirror * width))
-            for k in range(1, width):
-                loop_stones.append((c2[0], start_col + mirror * (width - k)))
-            for k in range(1, height):
-                loop_stones.append((c3[0] + opp_dr * k, start_col))
-
+            leg_specs = [
+                (start_pos, c1, 0, mirror, width),
+                (c1, c2, forward_dr, 0, height),
+                (c2, c3, 0, -mirror, width),
+                (c3, start_pos, opp_dr, 0, height),
+            ]
         elif pattern == 'triangle':
-            # Right triangle with legs along the row + column axes and a
-            # 45° hypotenuse closing it. width == height by construction.
             c1 = (start_row, start_col + mirror * width)
             c2 = (start_row + forward_dr * height, start_col)
-            loop_landings = [c1, c2, start_pos]
-            for k in range(1, width):
-                loop_stones.append((start_row, start_col + mirror * k))
-            for k in range(1, height):
-                loop_stones.append((start_row + forward_dr * k, start_col + mirror * (width - k)))
-            for k in range(1, height):
-                loop_stones.append((c2[0] + opp_dr * k, start_col))
+            # Hypotenuse from c1 to c2 is diagonal (forward_dr, -mirror).
+            leg_specs = [
+                (start_pos, c1, 0, mirror, width),
+                (c1, c2, forward_dr, -mirror, height),
+                (c2, start_pos, opp_dr, 0, height),
+            ]
+        elif pattern == 'tilted':
+            s = width
+            c1 = (start_row + forward_dr * s, start_col + mirror * s)         # diag forward+mirror
+            c2 = (start_row + 2 * forward_dr * s, start_col)                  # diag forward+(-mirror)
+            c3 = (start_row + forward_dr * s, start_col - mirror * s)         # diag opp+(-mirror)
+            leg_specs = [
+                (start_pos, c1, forward_dr, mirror, s),
+                (c1, c2, forward_dr, -mirror, s),
+                (c2, c3, opp_dr, -mirror, s),
+                (c3, start_pos, opp_dr, mirror, s),
+            ]
+        else:  # parallelogram
+            c1 = (start_row, start_col + mirror * width)                                       # E width
+            c2 = (start_row + forward_dr * height, start_col + mirror * (width + height))      # diag SE
+            c3 = (start_row + forward_dr * height, start_col + mirror * height)                # W width
+            leg_specs = [
+                (start_pos, c1, 0, mirror, width),
+                (c1, c2, forward_dr, mirror, height),
+                (c2, c3, 0, -mirror, width),
+                (c3, start_pos, opp_dr, -mirror, height),
+            ]
+
+        # Fragment K_extras of the legs with stone-gaps. A leg of length L
+        # is fragmentable iff L ≥ 4 (need ≥1 stone before AND after the gap).
+        fragmentable = [i for i, leg in enumerate(leg_specs) if leg[4] >= 4]
+        if K_extras > len(fragmentable):
+            continue  # not enough fragmentable legs; bail and re-sample
+        # Pick K_extras legs to fragment (uniformly among fragmentable).
+        if K_extras > 0:
+            # JAX-friendly random sample: shuffle indices, take first K_extras.
+            perm = jax.random.permutation(take(), jnp.array(fragmentable))
+            chosen = set(int(perm[i]) for i in range(K_extras))
+        else:
+            chosen = set()
+
+        loop_landings = []
+        loop_stones = []
+        ok = True
+        for i, (start_cell, end_cell, dr_step, dc_step, length) in enumerate(leg_specs):
+            sr, sc = start_cell
+            if i in chosen:
+                # Sample gap position g ∈ [2, length-2]. The g range deliberately
+                # excludes g=1 and g=length-1 so the cell immediately adjacent to
+                # each corner is always a stone, never the gap — every leg starts
+                # with the ball jumping over at least one stone before reaching
+                # the gap landing, and ends with at least one stone before
+                # reaching the next corner. Corners themselves are open
+                # intersections (empty landings).
+                g = int(jax.random.randint(take(), (), 2, length - 1))
+                # First sub-leg stones (cells 1..g-1)
+                for k in range(1, g):
+                    cell = (sr + dr_step * k, sc + dc_step * k)
+                    loop_stones.append(cell)
+                # Intermediate landing (the gap cell)
+                loop_landings.append((sr + dr_step * g, sc + dc_step * g))
+                # Second sub-leg stones (cells g+1..length-1)
+                for k in range(g + 1, length):
+                    cell = (sr + dr_step * k, sc + dc_step * k)
+                    loop_stones.append(cell)
+                # End-of-leg landing
+                loop_landings.append(end_cell)
+            else:
+                for k in range(1, length):
+                    cell = (sr + dr_step * k, sc + dc_step * k)
+                    loop_stones.append(cell)
+                loop_landings.append(end_cell)
+        if not ok:
+            continue
 
 
         # 7. Validate landings: on board, not in any endzone (we don't want
