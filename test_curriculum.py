@@ -19,6 +19,7 @@ from curriculum_puzzles import (
     generate_two_move_win_state,
     generate_n_move_win_state,
     generate_curriculum_batch,
+    generate_passthrough_recognition_state,
 )
 
 
@@ -828,6 +829,158 @@ def run_all_tests():
     return total_failed == 0
 
 
+# ============================================================================
+# Passthrough Recognition Tests
+# ============================================================================
+
+def validate_passthrough_puzzle(state, env_config, landings, meta, player):
+    """
+    Verify a passthrough puzzle satisfies its category invariants:
+      - state's current_player matches the requested player
+      - replaying canonical actions: every jump succeeds
+      - at least one INTERMEDIATE landing is in the player's own endzone
+      - final landing is NOT in the player's own endzone (no self-loss)
+      - final landing is closer to opponent's endzone than the start
+
+    Returns (is_valid, message).
+    """
+    own_ez = list(meta.get('own_endzone_rows', []))
+    start_pos = list(meta.get('start_pos', []))
+
+    if int(state.current_player) != player:
+        return False, f"current_player={int(state.current_player)} expected {player}"
+
+    if (int(state.ball_pos[0]), int(state.ball_pos[1])) != (start_pos[0], start_pos[1]):
+        return False, f"ball at ({int(state.ball_pos[0])},{int(state.ball_pos[1])}) expected {tuple(start_pos)}"
+
+    # Replay canonical actions
+    rows, cols = env_config.rows, env_config.cols
+    total = rows * cols
+    s = state
+    for i, (r, c) in enumerate(landings):
+        action_idx = total + r * cols + c
+        s = step(s, jnp.array(action_idx, dtype=jnp.int32), env_config)
+        landed = (int(s.ball_pos[0]), int(s.ball_pos[1]))
+        if landed != (r, c):
+            return False, f"jump {i+1} expected to land at ({r},{c}) but landed at {landed}"
+
+    intermediates = landings[:-1]
+    if not any(r in own_ez for (r, _) in intermediates):
+        return False, f"no intermediate landing in own endzone {own_ez}; intermediates={intermediates}"
+
+    final_r, _ = landings[-1]
+    if final_r in own_ez:
+        return False, f"final landing row {final_r} is in own endzone (self-loss)"
+
+    # Closer to opponent endzone than start
+    if player == 1:
+        progress = start_pos[0] - final_r  # P1 wants smaller row
+    else:
+        progress = final_r - start_pos[0]
+    if progress <= 0:
+        return False, f"no net progress: start row {start_pos[0]} → final row {final_r}"
+
+    return True, f"passthrough OK ({progress} rows progress)"
+
+
+def test_passthrough_board_size(rows: int, cols: int, num_samples: int = 20) -> Tuple[int, int]:
+    """Sweep passthrough generation for both players at one board size."""
+    env_config = EnvConfig(rows=rows, cols=cols)
+    rng = jax.random.PRNGKey(2026 + rows * 31 + cols)
+
+    passed = 0
+    failed = 0
+
+    print(f"\n{Colors.HEADER}Testing passthrough {rows}x{cols} ({num_samples} samples, both players){Colors.RESET}")
+    print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}")
+
+    for i in range(num_samples):
+        rng, sub_rng, p_rng = jax.random.split(rng, 3)
+        player = 1 if int(jax.random.randint(p_rng, (), 0, 2)) == 0 else 2
+        try:
+            state, landings, _actions, meta = generate_passthrough_recognition_state(
+                sub_rng, env_config, player=player, num_jumps=2,
+            )
+            ok, msg = validate_passthrough_puzzle(state, env_config, landings, meta, player)
+            if ok:
+                passed += 1
+            else:
+                failed += 1
+                print(f"  Sample {i+1} (P{player}): {Colors.ERROR}✗ FAIL{Colors.RESET} - {msg}")
+        except Exception as e:
+            failed += 1
+            print(f"  Sample {i+1} (P{player}): {Colors.ERROR}✗ ERROR{Colors.RESET} - {e}")
+
+    pct = 100 * passed / num_samples if num_samples else 0
+    color = Colors.SUCCESS if failed == 0 else Colors.ERROR
+    print(f"  {color}Results: {passed}/{num_samples} passed ({pct:.1f}%){Colors.RESET}")
+    return passed, failed
+
+
+def test_passthrough_uniqueness(rows: int, cols: int, num_samples: int = 5) -> Tuple[int, int]:
+    """
+    Methodology check: with no noise, the canonical sequence should be the
+    only legal jump sequence available from the puzzle position. Verify by
+    enumerating opponent-style search from the current player's perspective
+    and confirming the only winning OR own-endzone-passing sequence is the
+    canonical one.
+
+    This is approximate — we don't enumerate non-passthrough sequences (the
+    puzzle generator allows other legal jumps that don't traverse the own
+    endzone, which is fine — the test is whether the LLM finds the
+    intended passthrough). What we DO verify:
+      * The canonical sequence is reachable as a legal series of jumps
+        (already covered by validate_passthrough_puzzle's replay check).
+      * The first canonical jump is one of the legal first actions.
+    """
+    from phutball_env_jax import get_legal_actions
+    env_config = EnvConfig(rows=rows, cols=cols)
+    rng = jax.random.PRNGKey(7777 + rows * 13)
+
+    passed = 0
+    failed = 0
+    total_pos = rows * cols
+
+    print(f"\n{Colors.HEADER}Passthrough first-jump-legality sanity ({rows}x{cols}, {num_samples} samples){Colors.RESET}")
+
+    for i in range(num_samples):
+        rng, sub_rng, p_rng = jax.random.split(rng, 3)
+        player = 1 if int(jax.random.randint(p_rng, (), 0, 2)) == 0 else 2
+        try:
+            state, landings, _actions, _meta = generate_passthrough_recognition_state(
+                sub_rng, env_config, player=player, num_jumps=2,
+            )
+            first_landing = landings[0]
+            first_action = total_pos + first_landing[0] * cols + first_landing[1]
+            legal = np.asarray(get_legal_actions(state, env_config))
+            if bool(legal[first_action]):
+                passed += 1
+            else:
+                failed += 1
+                print(f"  Sample {i+1} (P{player}): canonical first jump {first_landing} not legal")
+        except Exception as e:
+            failed += 1
+            print(f"  Sample {i+1} (P{player}): {Colors.ERROR}{e}{Colors.RESET}")
+
+    color = Colors.SUCCESS if failed == 0 else Colors.ERROR
+    print(f"  {color}Results: {passed}/{num_samples} passed{Colors.RESET}")
+    return passed, failed
+
+
 if __name__ == "__main__":
     success = run_all_tests()
-    exit(0 if success else 1)
+    # Run passthrough tests as an addendum (run_all_tests focuses on the
+    # win-recognition family; passthrough is reported separately so its
+    # numbers don't get conflated).
+    print(f"\n{Colors.HEADER}{'═' * 60}{Colors.RESET}")
+    print(f"{Colors.HEADER}  PASSTHROUGH RECOGNITION TESTS{Colors.RESET}")
+    print(f"{Colors.HEADER}{'═' * 60}{Colors.RESET}")
+    p_total = 0; f_total = 0
+    for (r, c) in [(15, 11), (21, 15)]:
+        p, f = test_passthrough_board_size(r, c, num_samples=20)
+        p_total += p; f_total += f
+        p, f = test_passthrough_uniqueness(r, c, num_samples=10)
+        p_total += p; f_total += f
+    print(f"\n{Colors.HEADER}Passthrough TOTAL: {p_total} passed, {f_total} failed{Colors.RESET}")
+
+    exit(0 if (success and f_total == 0) else 1)
