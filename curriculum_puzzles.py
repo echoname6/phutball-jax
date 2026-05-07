@@ -1072,23 +1072,25 @@ def generate_passthrough_recognition_state(
         meta:                 dict carrying own_endzone_rows + start_pos for
                               the validator
     """
-    if num_jumps != 2:
-        raise NotImplementedError(
-            "Passthrough puzzles currently support only num_jumps=2. "
-            "Higher depths require chaining setup jumps (TODO)."
-        )
+    if num_jumps < 2 or num_jumps > 4:
+        raise ValueError("Passthrough puzzles support num_jumps in [2, 4].")
 
     rows, cols = env_config.rows, env_config.cols
 
     if player == 1:
         own_ez_rows = [rows - 2, rows - 1]  # P1 defends bottom
         forward_dr = 1                       # ball moves south to reach own endzone
+        opp_dr = -1                          # toward opp endzone
     else:
         own_ez_rows = [0, 1]
         forward_dr = -1
+        opp_dr = 1
 
     for _ in range(max_attempts):
-        rng, *subs = jax.random.split(rng, 6)
+        # Need extra rng splits for the append jumps. Core uses subs[0..4]
+        # (5 keys); each append adds 2 more (direction + length).
+        rng, *subs = jax.random.split(rng, 6 + 2 * (num_jumps - 2))
+        sub_idx = 5  # first append key index after the core's 5 keys
 
         # 1. Pick start row: at least 4 rows from own endzone, but close enough
         # that one jump (max 9 cells = 8 stones consumed) can land in it.
@@ -1157,6 +1159,54 @@ def generate_passthrough_recognition_state(
         if not ok:
             continue
 
+        # Extend the chain for n > 2 by appending more forward jumps from the
+        # current end of the path. Each append jump heads toward the opponent
+        # endzone (vertical or diagonal) and consumes a fresh stone line.
+        # No noise: each leg's stones are dedicated to that leg, so the
+        # canonical sequence remains the only legal jump sequence.
+        landings = [(landing1_row, start_col), (target_row, target_col)]
+        cur_row, cur_col = target_row, target_col
+        for _extra in range(num_jumps - 2):
+            d_rng = subs[sub_idx]; sub_idx += 1
+            l_rng = subs[sub_idx]; sub_idx += 1
+            ddir = int(jax.random.randint(d_rng, (), 0, 3))  # 0=vert, 1=col+1, 2=col-1
+            dr_app = opp_dr
+            dc_app = 0 if ddir == 0 else (1 if ddir == 1 else -1)
+            length = int(jax.random.randint(l_rng, (), 2, 7))  # 2..6 cells (1..5 stones)
+            next_row = cur_row + dr_app * length
+            next_col = cur_col + dc_app * length
+            if not (0 <= next_row < rows and 0 <= next_col < cols):
+                ok = False; break
+            if next_row in own_ez_rows:
+                ok = False; break  # don't re-enter own endzone
+
+            new_stones = []
+            for k in range(1, length):
+                sr, sc = cur_row + dr_app * k, cur_col + dc_app * k
+                if not (0 <= sr < rows and 0 <= sc < cols):
+                    ok = False; break
+                if (sr, sc) == (start_row, start_col):
+                    ok = False; break
+                if (sr, sc) in all_stones:
+                    ok = False; break
+                new_stones.append((sr, sc))
+            if not ok:
+                break
+            for s in new_stones:
+                all_stones.add(s)
+            landings.append((next_row, next_col))
+            cur_row, cur_col = next_row, next_col
+
+        if not ok:
+            continue
+
+        # Final landing must still be strictly closer to opp endzone than start.
+        final_row = landings[-1][0]
+        if player == 1 and final_row >= start_row:
+            continue
+        if player == 2 and final_row <= start_row:
+            continue
+
         # Build the board
         board = np.zeros((rows, cols), dtype=np.int32)
         board[0, :] = END_HI
@@ -1180,7 +1230,6 @@ def generate_passthrough_recognition_state(
             jump_sequence_length=jnp.array(0, dtype=jnp.int32),
         )
 
-        landings = [(landing1_row, start_col), (target_row, target_col)]
         canonical_actions = [rows * cols + r * cols + c for (r, c) in landings]
         meta = {
             'own_endzone_rows': own_ez_rows,

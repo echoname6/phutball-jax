@@ -883,15 +883,15 @@ def validate_passthrough_puzzle(state, env_config, landings, meta, player):
     return True, f"passthrough OK ({progress} rows progress)"
 
 
-def test_passthrough_board_size(rows: int, cols: int, num_samples: int = 20) -> Tuple[int, int]:
-    """Sweep passthrough generation for both players at one board size."""
+def test_passthrough_board_size(rows: int, cols: int, num_samples: int = 20, num_jumps: int = 2) -> Tuple[int, int]:
+    """Sweep passthrough generation for both players at one board size and depth."""
     env_config = EnvConfig(rows=rows, cols=cols)
-    rng = jax.random.PRNGKey(2026 + rows * 31 + cols)
+    rng = jax.random.PRNGKey(2026 + rows * 31 + cols + num_jumps * 17)
 
     passed = 0
     failed = 0
 
-    print(f"\n{Colors.HEADER}Testing passthrough {rows}x{cols} ({num_samples} samples, both players){Colors.RESET}")
+    print(f"\n{Colors.HEADER}Testing passthrough {rows}x{cols} n={num_jumps} ({num_samples} samples, both players){Colors.RESET}")
     print(f"{Colors.DIM}{'─' * 60}{Colors.RESET}")
 
     for i in range(num_samples):
@@ -899,9 +899,12 @@ def test_passthrough_board_size(rows: int, cols: int, num_samples: int = 20) -> 
         player = 1 if int(jax.random.randint(p_rng, (), 0, 2)) == 0 else 2
         try:
             state, landings, _actions, meta = generate_passthrough_recognition_state(
-                sub_rng, env_config, player=player, num_jumps=2,
+                sub_rng, env_config, player=player, num_jumps=num_jumps,
             )
             ok, msg = validate_passthrough_puzzle(state, env_config, landings, meta, player)
+            if ok and len(landings) != num_jumps:
+                ok = False
+                msg = f"expected {num_jumps} landings, got {len(landings)}"
             if ok:
                 passed += 1
             else:
@@ -977,8 +980,9 @@ if __name__ == "__main__":
     print(f"{Colors.HEADER}{'═' * 60}{Colors.RESET}")
     p_total = 0; f_total = 0
     for (r, c) in [(15, 11), (21, 15)]:
-        p, f = test_passthrough_board_size(r, c, num_samples=20)
-        p_total += p; f_total += f
+        for n in [2, 3, 4]:
+            p, f = test_passthrough_board_size(r, c, num_samples=15, num_jumps=n)
+            p_total += p; f_total += f
         p, f = test_passthrough_uniqueness(r, c, num_samples=10)
         p_total += p; f_total += f
     print(f"\n{Colors.HEADER}Passthrough TOTAL: {p_total} passed, {f_total} failed{Colors.RESET}")
