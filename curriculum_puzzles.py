@@ -1072,140 +1072,196 @@ def generate_passthrough_recognition_state(
         meta:                 dict carrying own_endzone_rows + start_pos for
                               the validator
     """
-    if num_jumps < 2 or num_jumps > 4:
-        raise ValueError("Passthrough puzzles support num_jumps in [2, 4].")
+    if num_jumps < 2 or num_jumps > 8:
+        raise ValueError("Passthrough puzzles support num_jumps in [2, 8].")
 
     rows, cols = env_config.rows, env_config.cols
 
     if player == 1:
         own_ez_rows = [rows - 2, rows - 1]  # P1 defends bottom
-        forward_dr = 1                       # ball moves south to reach own endzone
-        opp_dr = -1                          # toward opp endzone
+        forward_dr = 1                       # toward own endzone (south)
+        opp_dr = -1                          # toward opp endzone (north)
     else:
         own_ez_rows = [0, 1]
         forward_dr = -1
         opp_dr = 1
 
-    for _ in range(max_attempts):
-        # Need extra rng splits for the append jumps. Core uses subs[0..4]
-        # (5 keys); each append adds 2 more (direction + length).
-        rng, *subs = jax.random.split(rng, 6 + 2 * (num_jumps - 2))
-        sub_idx = 5  # first append key index after the core's 5 keys
+    def append_leg(cur_row, cur_col, dr_step, length, dc_step,
+                   start_pos, all_stones, allow_endzone_landing):
+        """Try to extend the chain by one jump. Returns (ok, new_row, new_col,
+        list_of_stones_added). The leg consumes (length-1) stones along the
+        axis (dr_step, dc_step) and lands at length cells away."""
+        next_row = cur_row + dr_step * length
+        next_col = cur_col + dc_step * length
+        if not (0 <= next_row < rows and 0 <= next_col < cols):
+            return False, None, None, None
+        if not allow_endzone_landing and next_row in own_ez_rows:
+            return False, None, None, None
+        new_stones = []
+        for k in range(1, length):
+            sr, sc = cur_row + dr_step * k, cur_col + dc_step * k
+            if not (0 <= sr < rows and 0 <= sc < cols):
+                return False, None, None, None
+            if (sr, sc) == start_pos:
+                return False, None, None, None
+            if (sr, sc) in all_stones:
+                return False, None, None, None
+            new_stones.append((sr, sc))
+        return True, next_row, next_col, new_stones
 
-        # 1. Pick start row: at least 4 rows from own endzone, but close enough
-        # that one jump (max 9 cells = 8 stones consumed) can land in it.
-        dist_to_endzone = int(jax.random.randint(subs[0], (), 4, 10))  # 4..9
+    for _ in range(max_attempts):
+        # Generous split allocation: split point + start + jumps_in legs +
+        # jumps_out legs (each consumes direction + length keys).
+        rng, *subs = jax.random.split(rng, 16 + 4 * num_jumps)
+        sub_idx = 0
+        def take():
+            nonlocal sub_idx
+            v = subs[sub_idx]; sub_idx += 1; return v
+
+        # 1. Pre-compute the feasible (jumps_in, jumps_out) splits and sample
+        # uniformly among them. Without this filter, naive uniform sampling
+        # over [1..n-1] for jumps_in skews the OUTPUT distribution toward
+        # easy splits — harder splits keep failing construction and the
+        # outer retry happens to land on an easy split.
+        feasible_splits = []
+        for ji in range(1, num_jumps):
+            jo = num_jumps - ji
+            ji_min = 2 * ji
+            ji_max = min(6 * ji, 6 * jo - 1, rows - 4)
+            if ji_min <= ji_max:
+                feasible_splits.append((ji, jo))
+        if not feasible_splits:
+            continue
+        sel = int(jax.random.randint(take(), (), 0, len(feasible_splits)))
+        jumps_in, jumps_out = feasible_splits[sel]
+
+        # 2. Pick the BALL'S START POSITION. The ball needs enough room
+        # for jumps_in legs to reach the endzone, AND for jumps_out legs
+        # to bring the ball back past start_row from the endzone landing.
+        # Each leg is 2..6 cells. Sum of out-leg lengths must exceed in_dist
+        # (final_row < start_row), so in_dist ≤ 6*jumps_out - 1.
+        min_in_dist = 2 * jumps_in
+        max_in_dist = min(6 * jumps_in, 6 * jumps_out - 1, rows - 4)
+        if min_in_dist > max_in_dist:
+            continue  # this (jumps_in, jumps_out) split is infeasible
+        in_dist = int(jax.random.randint(take(), (), min_in_dist, max_in_dist + 1))
         if player == 1:
-            start_row = (rows - 2) - dist_to_endzone
+            start_row = (rows - 2) - in_dist
         else:
-            start_row = 1 + dist_to_endzone
+            start_row = 1 + in_dist
         if not (2 <= start_row < rows - 2):
             continue
+        start_col = int(jax.random.randint(take(), (), 0, cols))
+        start_pos = (start_row, start_col)
 
-        start_col = int(jax.random.randint(subs[1], (), 0, cols))
-
-        # 2. Jump 1: vertical into own endzone. Pick which endzone row.
-        landing1_row = own_ez_rows[int(jax.random.randint(subs[2], (), 0, 2))]
-        delta1 = abs(landing1_row - start_row)
-        if delta1 - 1 < 1 or delta1 - 1 > 8:
-            continue  # need at least 1 stone, at most 8
-
-        jump1_stones = [(start_row + k * forward_dr, start_col) for k in range(1, delta1)]
-
-        # 3. Jump 2: diagonal back out. NW or NE for P1; SW or SE for P2.
-        diag_col_dir = 1 if int(jax.random.randint(subs[3], (), 0, 2)) == 0 else -1
-
-        # delta2 must be > delta1 so target_row crosses past start_row toward opp endzone.
-        # Bounded by max jump length and by board edge in the backward-row direction.
-        if player == 1:
-            min_delta2 = delta1 + 1
-            max_delta2_by_row = landing1_row              # so target_row >= 0
-        else:
-            min_delta2 = delta1 + 1
-            max_delta2_by_row = (rows - 1) - landing1_row  # so target_row <= rows-1
-        max_delta2_by_chain = 9  # max 8 stones + 1 step
-        max_delta2 = min(max_delta2_by_row, max_delta2_by_chain)
-        if min_delta2 > max_delta2:
-            continue
-
-        delta2 = int(jax.random.randint(subs[4], (), min_delta2, max_delta2 + 1))
-        target_row = landing1_row - delta2 * forward_dr  # ↑ for P1, ↓ for P2
-        target_col = start_col + delta2 * diag_col_dir
-        if not (0 <= target_col < cols):
-            continue
-        if target_row in own_ez_rows:
-            continue  # final landing must NOT be in own endzone (self-loss)
-        if target_row < 0 or target_row >= rows:
-            continue
-
-        jump2_stones = [
-            (landing1_row - k * forward_dr, start_col + k * diag_col_dir)
-            for k in range(1, delta2)
-        ]
-
-        # Check no stone collides with start cell or overlaps another stone or
-        # falls off the board.
+        # 3. Forward-chain the IN-LEG: jumps_in legs from start_pos toward own
+        # endzone. Each leg is forward (dr=forward_dr) plus 0/+1/-1 column
+        # offset. Total row delta must equal in_dist; the LAST leg must land
+        # in an own-endzone row.
         all_stones = set()
+        landings_in = []
+        cur_row, cur_col = start_row, start_col
         ok = True
-        for s in jump1_stones + jump2_stones:
-            r, c = s
-            if not (0 <= r < rows and 0 <= c < cols):
+
+        # Distribute in_dist across jumps_in legs (each ∈ [2, 6]).
+        # Pick lengths sequentially from the range [2, max_for_this_leg].
+        remaining = in_dist
+        leg_lengths = []
+        for li in range(jumps_in):
+            legs_left = jumps_in - li
+            # Each remaining leg needs at least 2 cells; this leg's max is
+            # bounded so future legs can each have ≥ 2.
+            min_l = 2
+            max_l = min(6, remaining - 2 * (legs_left - 1))
+            if max_l < min_l:
                 ok = False; break
-            if (r, c) == (start_row, start_col):
-                ok = False; break
-            if s in all_stones:
-                ok = False; break
-            all_stones.add(s)
-        if not ok:
+            l = int(jax.random.randint(take(), (), min_l, max_l + 1))
+            leg_lengths.append(l)
+            remaining -= l
+        if not ok or remaining != 0:
             continue
 
-        # Extend the chain for n > 2 by appending more forward jumps from the
-        # current end of the path. Each append jump heads toward the opponent
-        # endzone (vertical or diagonal) and consumes a fresh stone line.
-        # No noise: each leg's stones are dedicated to that leg, so the
-        # canonical sequence remains the only legal jump sequence.
-        landings = [(landing1_row, start_col), (target_row, target_col)]
-        cur_row, cur_col = target_row, target_col
-        for _extra in range(num_jumps - 2):
-            d_rng = subs[sub_idx]; sub_idx += 1
-            l_rng = subs[sub_idx]; sub_idx += 1
-            ddir = int(jax.random.randint(d_rng, (), 0, 3))  # 0=vert, 1=col+1, 2=col-1
-            dr_app = opp_dr
-            dc_app = 0 if ddir == 0 else (1 if ddir == 1 else -1)
-            length = int(jax.random.randint(l_rng, (), 2, 7))  # 2..6 cells (1..5 stones)
-            next_row = cur_row + dr_app * length
-            next_col = cur_col + dc_app * length
-            if not (0 <= next_row < rows and 0 <= next_col < cols):
+        # The last leg must land in own endzone. Force its direction to be
+        # vertical (dc=0) to ensure the row math lines up; column constraints
+        # already passed.
+        for li, length in enumerate(leg_lengths):
+            is_last_in_leg = (li == jumps_in - 1)
+            if is_last_in_leg:
+                dc_step = 0  # vertical into endzone
+            else:
+                ddir = int(jax.random.randint(take(), (), 0, 3))  # 0=vert, 1=col+, 2=col-
+                dc_step = 0 if ddir == 0 else (1 if ddir == 1 else -1)
+            ok2, nr, nc, new_stones = append_leg(
+                cur_row, cur_col, forward_dr, length, dc_step,
+                start_pos, all_stones, allow_endzone_landing=is_last_in_leg,
+            )
+            if not ok2:
                 ok = False; break
-            if next_row in own_ez_rows:
-                ok = False; break  # don't re-enter own endzone
-
-            new_stones = []
-            for k in range(1, length):
-                sr, sc = cur_row + dr_app * k, cur_col + dc_app * k
-                if not (0 <= sr < rows and 0 <= sc < cols):
-                    ok = False; break
-                if (sr, sc) == (start_row, start_col):
-                    ok = False; break
-                if (sr, sc) in all_stones:
-                    ok = False; break
-                new_stones.append((sr, sc))
-            if not ok:
-                break
+            # Last leg must actually land in endzone
+            if is_last_in_leg and nr not in own_ez_rows:
+                ok = False; break
             for s in new_stones:
                 all_stones.add(s)
-            landings.append((next_row, next_col))
-            cur_row, cur_col = next_row, next_col
-
+            landings_in.append((nr, nc))
+            cur_row, cur_col = nr, nc
         if not ok:
             continue
 
-        # Final landing must still be strictly closer to opp endzone than start.
-        final_row = landings[-1][0]
+        # 4. Forward-chain the OUT-LEG: jumps_out legs from endzone landing
+        # back toward opp endzone. First leg must be diagonal (dc != 0) so its
+        # line doesn't reuse cells already consumed in the in-leg's same column.
+        # Subsequent legs can be vert/diag.
+        # Total out_dist must exceed in_dist so final_row strictly < start_row.
+        # Sample a target out_dist first, then partition across legs (mirrors
+        # the in-leg construction).
+        min_out_dist = in_dist + 1
+        max_out_dist = min(6 * jumps_out, in_dist + 1 + 6 * (jumps_out - 1) + 5)
+        if min_out_dist > max_out_dist:
+            continue
+        out_dist = int(jax.random.randint(take(), (), min_out_dist, max_out_dist + 1))
+        out_remaining = out_dist
+        out_lengths = []
+        for oi in range(jumps_out):
+            legs_left = jumps_out - oi
+            min_l = 2
+            max_l = min(6, out_remaining - 2 * (legs_left - 1))
+            if max_l < min_l:
+                ok = False; break
+            l = int(jax.random.randint(take(), (), min_l, max_l + 1))
+            out_lengths.append(l)
+            out_remaining -= l
+        if not ok or out_remaining != 0:
+            continue
+
+        landings_out = []
+        for oj, length in enumerate(out_lengths):
+            if oj == 0:
+                dc_step = 1 if int(jax.random.randint(take(), (), 0, 2)) == 0 else -1
+            else:
+                ddir = int(jax.random.randint(take(), (), 0, 3))
+                dc_step = 0 if ddir == 0 else (1 if ddir == 1 else -1)
+            ok2, nr, nc, new_stones = append_leg(
+                cur_row, cur_col, opp_dr, length, dc_step,
+                start_pos, all_stones, allow_endzone_landing=False,
+            )
+            if not ok2:
+                ok = False; break
+            for s in new_stones:
+                all_stones.add(s)
+            landings_out.append((nr, nc))
+            cur_row, cur_col = nr, nc
+        if not ok:
+            continue
+
+        # 5. Final landing must be strictly closer to opp endzone than the
+        # start (otherwise the whole exercise was a wash).
+        final_row, _ = landings_out[-1]
         if player == 1 and final_row >= start_row:
             continue
         if player == 2 and final_row <= start_row:
             continue
+
+        landings = landings_in + landings_out
 
         # Build the board
         board = np.zeros((rows, cols), dtype=np.int32)
