@@ -12,6 +12,7 @@ Public API:
     generate_two_move_win_state
     generate_curriculum_batch
     generate_threat_recognition_state
+    generate_passthrough_recognition_state
 """
 
 import jax
@@ -1029,4 +1030,165 @@ def generate_threat_recognition_state(
         f"Failed to generate a threat puzzle (n={num_jumps}, player={threat_player}) "
         f"with a true-disruption pivot after {max_attempts} attempts. "
         f"Consider raising max_attempts or relaxing constraints."
+    )
+
+
+# ============================================================================
+# Passthrough Recognition Puzzles
+# ============================================================================
+
+def generate_passthrough_recognition_state(
+    rng: jax.Array,
+    env_config: EnvConfig,
+    player: int = 1,
+    num_jumps: int = 2,
+    max_attempts: int = 64,
+):
+    """
+    Generate a state where `player`'s only canonical winning move requires
+    passing through their own (defensive) endzone mid-sequence.
+
+    Construction (forward-chained, no noise):
+      - Ball starts in playable territory, with at least 4 rows of clearance
+        from the player's own endzone (so the test isn't trivial).
+      - Jump 1 is a vertical jump from the start cell into the player's own
+        endzone (rows rows-2..rows-1 for P1, rows 0..1 for P2).
+      - Jump 2 is a diagonal jump from the endzone landing back out, ending
+        at a row strictly closer to the opponent's endzone than the start
+        (and explicitly NOT in the player's own endzone — that would be a
+        self-loss).
+      - Stones are placed exactly along the canonical path. With no noise,
+        the canonical sequence is the only legal jump sequence available, so
+        no opponent-recovery search is needed.
+
+    Currently supports num_jumps=2 only. Higher depths require chaining
+    additional setup jumps; left as TODO since n=2 is the minimal test of
+    the "endzone use is legal mid-sequence" concept.
+
+    Returns:
+        state:                PhutballState ready for `player` to play
+        canonical_landings:   [(r1,c1), (r2,c2)] — the two-jump solution
+        canonical_actions:    list of action indices for the env
+        meta:                 dict carrying own_endzone_rows + start_pos for
+                              the validator
+    """
+    if num_jumps != 2:
+        raise NotImplementedError(
+            "Passthrough puzzles currently support only num_jumps=2. "
+            "Higher depths require chaining setup jumps (TODO)."
+        )
+
+    rows, cols = env_config.rows, env_config.cols
+
+    if player == 1:
+        own_ez_rows = [rows - 2, rows - 1]  # P1 defends bottom
+        forward_dr = 1                       # ball moves south to reach own endzone
+    else:
+        own_ez_rows = [0, 1]
+        forward_dr = -1
+
+    for _ in range(max_attempts):
+        rng, *subs = jax.random.split(rng, 6)
+
+        # 1. Pick start row: at least 4 rows from own endzone, but close enough
+        # that one jump (max 9 cells = 8 stones consumed) can land in it.
+        dist_to_endzone = int(jax.random.randint(subs[0], (), 4, 10))  # 4..9
+        if player == 1:
+            start_row = (rows - 2) - dist_to_endzone
+        else:
+            start_row = 1 + dist_to_endzone
+        if not (2 <= start_row < rows - 2):
+            continue
+
+        start_col = int(jax.random.randint(subs[1], (), 0, cols))
+
+        # 2. Jump 1: vertical into own endzone. Pick which endzone row.
+        landing1_row = own_ez_rows[int(jax.random.randint(subs[2], (), 0, 2))]
+        delta1 = abs(landing1_row - start_row)
+        if delta1 - 1 < 1 or delta1 - 1 > 8:
+            continue  # need at least 1 stone, at most 8
+
+        jump1_stones = [(start_row + k * forward_dr, start_col) for k in range(1, delta1)]
+
+        # 3. Jump 2: diagonal back out. NW or NE for P1; SW or SE for P2.
+        diag_col_dir = 1 if int(jax.random.randint(subs[3], (), 0, 2)) == 0 else -1
+
+        # delta2 must be > delta1 so target_row crosses past start_row toward opp endzone.
+        # Bounded by max jump length and by board edge in the backward-row direction.
+        if player == 1:
+            min_delta2 = delta1 + 1
+            max_delta2_by_row = landing1_row              # so target_row >= 0
+        else:
+            min_delta2 = delta1 + 1
+            max_delta2_by_row = (rows - 1) - landing1_row  # so target_row <= rows-1
+        max_delta2_by_chain = 9  # max 8 stones + 1 step
+        max_delta2 = min(max_delta2_by_row, max_delta2_by_chain)
+        if min_delta2 > max_delta2:
+            continue
+
+        delta2 = int(jax.random.randint(subs[4], (), min_delta2, max_delta2 + 1))
+        target_row = landing1_row - delta2 * forward_dr  # ↑ for P1, ↓ for P2
+        target_col = start_col + delta2 * diag_col_dir
+        if not (0 <= target_col < cols):
+            continue
+        if target_row in own_ez_rows:
+            continue  # final landing must NOT be in own endzone (self-loss)
+        if target_row < 0 or target_row >= rows:
+            continue
+
+        jump2_stones = [
+            (landing1_row - k * forward_dr, start_col + k * diag_col_dir)
+            for k in range(1, delta2)
+        ]
+
+        # Check no stone collides with start cell or overlaps another stone or
+        # falls off the board.
+        all_stones = set()
+        ok = True
+        for s in jump1_stones + jump2_stones:
+            r, c = s
+            if not (0 <= r < rows and 0 <= c < cols):
+                ok = False; break
+            if (r, c) == (start_row, start_col):
+                ok = False; break
+            if s in all_stones:
+                ok = False; break
+            all_stones.add(s)
+        if not ok:
+            continue
+
+        # Build the board
+        board = np.zeros((rows, cols), dtype=np.int32)
+        board[0, :] = END_HI
+        board[1, :] = END_HI
+        board[rows - 2, :] = END_LO
+        board[rows - 1, :] = END_LO
+        board[start_row, start_col] = BALL
+        for (r, c) in all_stones:
+            board[r, c] = MAN
+
+        jump_sequence = jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32)
+        state = PhutballState(
+            board=jnp.array(board, dtype=jnp.int32),
+            ball_pos=jnp.array([start_row, start_col], dtype=jnp.int32),
+            current_player=jnp.array(player, dtype=jnp.int32),
+            is_jumping=jnp.array(False, dtype=jnp.bool_),
+            terminated=jnp.array(False, dtype=jnp.bool_),
+            winner=jnp.array(0, dtype=jnp.int32),
+            num_turns=jnp.array(0, dtype=jnp.int32),
+            jump_sequence=jump_sequence,
+            jump_sequence_length=jnp.array(0, dtype=jnp.int32),
+        )
+
+        landings = [(landing1_row, start_col), (target_row, target_col)]
+        canonical_actions = [rows * cols + r * cols + c for (r, c) in landings]
+        meta = {
+            'own_endzone_rows': own_ez_rows,
+            'start_pos': [start_row, start_col],
+        }
+        return state, landings, canonical_actions, meta
+
+    raise RuntimeError(
+        f"Failed to generate a passthrough puzzle (player={player}, n={num_jumps}) "
+        f"after {max_attempts} attempts."
     )
