@@ -1606,50 +1606,79 @@ def generate_denial_recognition_state(
         if not ok:
             continue
 
-        # 9. Build advance: M vertical legs from start toward opp endzone.
-        # final_row: any row strictly past start (toward opp), not in either
-        # endzone. Advance just needs net progress; a single short hop counts
-        # as much as a deep one for puzzle correctness.
-        adv_total_min, adv_total_max = 2 * M, 6 * M
+        # 9. Build advance: M legs from start, mixed directions. Each leg
+        # is either FORWARD (vert / diag toward opp endzone) or LATERAL
+        # (horizontal). At least one forward leg required so net row
+        # progress is positive; lateral legs add side-to-side variety.
+        if M >= 2:
+            n_lateral = int(jax.random.randint(take(), (), 0, M))  # 0..M-1
+        else:
+            n_lateral = 0
+        n_forward = M - n_lateral
+
+        # Forward total row progress = adv_dist.
+        adv_total_min, adv_total_max = 2 * n_forward, 6 * n_forward
         if player == 1:
-            # P1: advance north, final_row < start_row, ≥ 2 (out of opp ez).
-            fr_min = max(final_row_min, start_row - adv_total_max)
+            fr_min = max(final_row_min if final_row_min is not None else 2,
+                         start_row - adv_total_max)
             fr_max = min(start_row - 1, start_row - adv_total_min)
         else:
             fr_min = max(start_row + 1, start_row + adv_total_min)
-            fr_max = min(final_row_max, start_row + adv_total_max)
+            fr_max = min(final_row_max if final_row_max is not None else rows - 3,
+                         start_row + adv_total_max)
         if fr_min > fr_max:
             continue
         final_row = int(jax.random.randint(take(), (), fr_min, fr_max + 1))
         adv_dist = abs(final_row - start_row)
 
-        # Partition adv_dist across M legs (each in [2, 6]).
+        # Partition adv_dist across the n_forward legs.
         remaining = adv_dist
-        adv_lengths = []
-        for ai in range(M):
-            legs_left = M - ai
+        fwd_lengths = []
+        for fi in range(n_forward):
+            legs_left = n_forward - fi
             min_l = 2
             max_l = min(6, remaining - 2 * (legs_left - 1))
             if max_l < min_l:
                 ok = False; break
             l = int(jax.random.randint(take(), (), min_l, max_l + 1))
-            adv_lengths.append(l)
+            fwd_lengths.append(l)
             remaining -= l
         if not ok or remaining != 0:
             continue
 
-        # 10. Build advance landings + stones (all vertical for v1).
+        # Lateral leg lengths each independently in [2, 6].
+        lat_lengths = [int(jax.random.randint(take(), (), 2, 7)) for _ in range(n_lateral)]
+
+        # Pick which of the M slots are forward vs lateral via a permutation.
+        if n_forward > 0 and n_lateral > 0:
+            slot_perm = jax.random.permutation(take(), jnp.arange(M))
+            forward_slot_set = set(int(slot_perm[i]) for i in range(n_forward))
+        else:
+            forward_slot_set = set(range(M))
+
+        # 10. Build advance: walk slots in order, sample direction per leg.
         advance_landings = []
         cur_row, cur_col = start_row, start_col
-        for length in adv_lengths:
-            nr = cur_row + opp_dr * length
-            nc = cur_col
+        fwd_idx = 0
+        lat_idx = 0
+        for slot_i in range(M):
+            if slot_i in forward_slot_set:
+                length = fwd_lengths[fwd_idx]; fwd_idx += 1
+                ddir = int(jax.random.randint(take(), (), 0, 3))  # 0=vert,1=diag+,2=diag-
+                dr_step, dc_step = opp_dr, (0 if ddir == 0 else (1 if ddir == 1 else -1))
+            else:
+                length = lat_lengths[lat_idx]; lat_idx += 1
+                dr_step, dc_step = 0, (1 if int(jax.random.randint(take(), (), 0, 2)) == 0 else -1)
+            nr = cur_row + dr_step * length
+            nc = cur_col + dc_step * length
             if not (0 <= nr < rows and 0 <= nc < cols):
                 ok = False; break
-            if nr in own_ez_rows:
+            # Mid-advance landing must not be in either endzone (no winning
+            # mid-advance, no self-loss).
+            if nr in own_ez_rows or nr in opp_ez_rows:
                 ok = False; break
             for k in range(1, length):
-                sr, sc = cur_row + opp_dr * k, cur_col
+                sr, sc = cur_row + dr_step * k, cur_col + dc_step * k
                 if (sr, sc) == start_pos:
                     ok = False; break
                 if (sr, sc) in all_stones:
