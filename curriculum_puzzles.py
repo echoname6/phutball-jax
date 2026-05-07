@@ -26,11 +26,13 @@ try:
     from .phutball_env_jax import (
         EnvConfig, PhutballState, state_to_network_input,
         EMPTY, BALL, MAN, END_HI, END_LO, MAX_JUMP_SEQUENCE_LENGTH,
+        step as env_step, get_legal_actions as env_get_legal_actions,
     )
 except ImportError:
     from phutball_env_jax import (
         EnvConfig, PhutballState, state_to_network_input,
         EMPTY, BALL, MAN, END_HI, END_LO, MAX_JUMP_SEQUENCE_LENGTH,
+        step as env_step, get_legal_actions as env_get_legal_actions,
     )
 
 
@@ -855,6 +857,75 @@ def _decode_jump_landings(actions, rows: int, cols: int):
     return out
 
 
+def _state_key_for_visit(state: PhutballState) -> bytes:
+    """Compact key for memoizing search states. Captures everything that
+    affects future legal moves: board contents, ball position, jump-sequence
+    history, and active jump count."""
+    return (
+        np.asarray(state.board, dtype=np.int8).tobytes()
+        + np.asarray(state.ball_pos, dtype=np.int8).tobytes()
+        + np.asarray(state.jump_sequence, dtype=np.int8).tobytes()
+        + bytes([int(state.jump_sequence_length)])
+    )
+
+
+def _opponent_has_winning_jump(
+    state: PhutballState,
+    env_config: EnvConfig,
+    opp_player: int,
+    max_depth: int = 14,
+) -> bool:
+    """
+    Return True iff the opponent (`opp_player`) has any sequence of jumps
+    from `state` that lands the ball in their endzone, scoring a win on
+    this turn.
+
+    Placement actions are skipped (placements end the turn without scoring,
+    so they cannot constitute a winning move on a single turn).
+
+    Sparse boards (noise-free puzzles) make the DFS cheap in practice —
+    most positions have ≤2 legal jump directions and stones get consumed
+    along each branch.
+    """
+    rows, cols = env_config.rows, env_config.cols
+    total = rows * cols
+
+    # Reset turn-state so the opponent is fresh-on-move.
+    starting_state = state._replace(
+        current_player=jnp.array(opp_player, dtype=jnp.int32),
+        is_jumping=jnp.array(False, dtype=jnp.bool_),
+        terminated=jnp.array(False, dtype=jnp.bool_),
+        winner=jnp.array(0, dtype=jnp.int32),
+        jump_sequence=jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32),
+        jump_sequence_length=jnp.array(0, dtype=jnp.int32),
+    )
+
+    visited: set = set()
+
+    def dfs(s: PhutballState, depth: int) -> bool:
+        if depth > max_depth:
+            return False
+        legal_np = np.asarray(env_get_legal_actions(s, env_config))
+        # Only consider jump actions; placements end the turn without winning.
+        for a in range(total, 2 * total):
+            if not bool(legal_np[a]):
+                continue
+            new_s = env_step(s, jnp.array(a, dtype=jnp.int32), env_config)
+            if bool(new_s.terminated):
+                if int(new_s.winner) == opp_player:
+                    return True
+                continue
+            key = _state_key_for_visit(new_s)
+            if key in visited:
+                continue
+            visited.add(key)
+            if dfs(new_s, depth + 1):
+                return True
+        return False
+
+    return dfs(starting_state, 0)
+
+
 def generate_threat_recognition_state(
     rng: jax.Array,
     env_config: EnvConfig,
@@ -862,24 +933,32 @@ def generate_threat_recognition_state(
     threat_player: int = 1,
     min_jump_len: int = 1,
     max_jump_len: int = 3,
-    max_attempts: int = 32,
+    max_attempts: int = 64,
 ):
     """
-    Generate a state where `threat_player` has an n-jump winning threat that
-    contains at least one direction-change pivot. The state's current_player
-    is set to the OTHER player (the responder), whose canonical task is to
-    place a stone at any pivot to disrupt the threat.
+    Generate a state where `threat_player` has an n-jump winning threat AND
+    at least one direction-change pivot is a TRUE disruption — i.e., placing
+    a defender stone at that pivot leaves the opponent with no winning jump
+    sequence on their next turn.
 
-    A pivot is the cell where the opponent's chain changes direction between
-    consecutive jumps (intermediate landing whose preceding-jump direction
-    differs from the following-jump direction).
+    Per-attempt pipeline:
+      1. Generate a candidate canonical winning sequence for `threat_player`
+         (no noise, per methodology).
+      2. Compute direction-change pivots (intermediate landings where the
+         chain pivots between two unit directions). Skip same-direction chains.
+      3. Sanity-check the threat: opponent must in fact have a winning jump
+         from the unmodified state (`_opponent_has_winning_jump` returns True).
+      4. For each candidate pivot, simulate placing a defender stone at the
+         pivot and re-run the opponent's winning-jump search. A pivot is a
+         TRUE disruption iff the search returns False — no opponent recovery
+         exists, canonical or otherwise.
+      5. Emit the puzzle iff at least one true-disruption pivot was found.
+         Returned `canonical_pivots` includes only the verified true
+         disruptions; any of them is a valid response.
 
-    Returns:
-        state:                PhutballState ready for the responder to play
-        canonical_pivots:     list of (r, c) — placement targets that disrupt
-        chain_landings:       list of (r, c) — full opponent landing path,
-                              for env-replay validation of LLM responses
-        threat_actions:       opponent's canonical action indices (for replay)
+    Same-direction chains, mid-board threats with diagonal alternatives,
+    and other geometries where the opponent can recover from the canonical
+    path are filtered automatically by step 4.
     """
     if num_jumps < 2:
         raise ValueError("Threat puzzles require num_jumps >= 2 (no pivot exists for n=1).")
@@ -888,7 +967,6 @@ def generate_threat_recognition_state(
 
     for _ in range(max_attempts):
         rng, sub_rng = jax.random.split(rng)
-        # Generate a winning sequence FOR threat_player. No noise — see methodology.
         state, actions = generate_n_move_win_state(
             sub_rng,
             env_config,
@@ -902,9 +980,8 @@ def generate_threat_recognition_state(
 
         landings = _decode_jump_landings(actions, rows, cols)
         if len(landings) != num_jumps:
-            continue  # malformed
+            continue
 
-        # Compute the unit direction of each jump segment.
         ball_pos = (int(state.ball_pos[0]), int(state.ball_pos[1]))
         positions = [ball_pos] + landings
         dirs = []
@@ -920,19 +997,36 @@ def generate_threat_recognition_state(
         if bad:
             continue
 
-        # Direction-change pivots: landing[i] is a pivot iff dirs[i] != dirs[i+1].
-        pivots = [landings[i] for i in range(len(dirs) - 1) if dirs[i] != dirs[i+1]]
-        if not pivots:
-            continue  # filter out pure same-direction chains
+        pivot_candidates = [landings[i] for i in range(len(dirs) - 1) if dirs[i] != dirs[i+1]]
+        if not pivot_candidates:
+            continue
 
-        # Flip current_player so the responder is on move.
+        # Sanity: opponent must actually have a winning jump from the
+        # unmodified state. (If not, the candidate is malformed — skip.)
+        if not _opponent_has_winning_jump(state, env_config, threat_player):
+            continue
+
+        # Test each pivot: place a defender stone, check opponent recovery.
+        valid_pivots = []
+        for (pr, pc) in pivot_candidates:
+            modified_board = state.board.at[pr, pc].set(MAN)
+            modified_state = state._replace(board=modified_board)
+            if not _opponent_has_winning_jump(modified_state, env_config, threat_player):
+                valid_pivots.append((pr, pc))
+
+        if not valid_pivots:
+            # Every candidate pivot leaves the opponent with an alternative
+            # winning sequence — discard and retry.
+            continue
+
         responder = 3 - threat_player
         new_state = state._replace(
             current_player=jnp.array(responder, dtype=jnp.int32),
         )
-        return new_state, pivots, landings, [int(a) for a in actions]
+        return new_state, valid_pivots, landings, [int(a) for a in actions]
 
     raise RuntimeError(
         f"Failed to generate a threat puzzle (n={num_jumps}, player={threat_player}) "
-        f"with a direction-change pivot after {max_attempts} attempts."
+        f"with a true-disruption pivot after {max_attempts} attempts. "
+        f"Consider raising max_attempts or relaxing constraints."
     )
