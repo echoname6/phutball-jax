@@ -1353,15 +1353,17 @@ def generate_denial_recognition_state(
         own_ez_rows = [rows - 2, rows - 1]
         opp_ez_rows = [0, 1]
         defensive_min_row = rows - 7    # rows ≥ 14 are "deep enough" to count as defensive
-        # final_row 2..4 → 2-4 rows from opp endzone (rows 0-1)
-        final_row_min, final_row_max = 2, 4
+        # final_row constraint: net forward progress past start, not in either
+        # endzone. The advance doesn't need to press up to row 2-4 — short
+        # advances are fine. Just must advance some.
+        final_row_min, final_row_max = 2, None  # max derived from start_row
     else:
         forward_dr = -1
         opp_dr = 1
         own_ez_rows = [0, 1]
         opp_ez_rows = [rows - 2, rows - 1]
         defensive_max_row = 6
-        final_row_min, final_row_max = rows - 5, rows - 3
+        final_row_min, final_row_max = None, rows - 3
 
     for _ in range(max_attempts):
         rng, *subs = jax.random.split(rng, 24)
@@ -1387,28 +1389,23 @@ def generate_denial_recognition_state(
         if not feasible:
             continue
         pattern, K_base = feasible[int(jax.random.randint(take(), (), 0, len(feasible)))]
-        # Stone-gap fragmentation: each long leg can be split into 2 jumps
-        # by leaving an internal cell empty. Adds K without enlarging the
-        # loop geometrically. K_extras ∈ [0, num_legs_with_room_for_gap].
-        # We want K_loop = K_base + K_extras ≤ num_jumps - 1 (need M ≥ 1).
-        max_K_loop = num_jumps - 1
-        K_extras = max(0, max_K_loop - K_base)
-        if K_extras > 0:
-            K_extras = int(jax.random.randint(take(), (), 0, K_extras + 1))
-        K = K_base + K_extras
-        M = num_jumps - K
+        # K_extras (loop fragmentation count) is sampled AFTER leg specs are
+        # built — see step 6. We need to know each leg's length to cap K_extras
+        # at the number of legs that can actually accept a stone-gap.
 
         # 2. Sample horizontal mirror (+1 = loop extends right, -1 = left)
         mirror = 1 if int(jax.random.randint(take(), (), 0, 2)) == 0 else -1
 
-        # 3. Pick start row. Need room above for advance (M legs × ≥2 cells
-        # landing in [final_row_min, final_row_max]) and below for loop side.
+        # 3. Pick start row. Mid-board placement; advance just needs to be
+        # NET-progress (any amount past start), so we don't constrain by M.
+        # Loop dips into defensive territory (≥ rows-7 for P1) so the loop
+        # height bounds are checked when we sample width/height below.
         if player == 1:
-            sr_min = max(7, final_row_min + 2 * M)
-            sr_max = min(11, final_row_max + 6 * M, rows - 9)
+            sr_min = max(7, 4)
+            sr_max = min(11, rows - 9)
         else:
-            sr_min = max(rows - 12, final_row_max - 6 * M)
-            sr_max = min(rows - 8, final_row_min - 2 * M, 9)
+            sr_min = max(rows - 12, 9)
+            sr_max = min(rows - 8, rows - 5)
         if sr_min > sr_max:
             continue
         start_row = int(jax.random.randint(take(), (), sr_min, sr_max + 1))
@@ -1524,14 +1521,26 @@ def generate_denial_recognition_state(
                 (c3, start_pos, opp_dr, -mirror, height),
             ]
 
-        # Fragment K_extras of the legs with stone-gaps. A leg of length L
-        # is fragmentable iff L ≥ 4 (need ≥1 stone before AND after the gap).
+        # Sample K_extras NOW that we know each leg's length. Fragmentable
+        # legs are those with length ≥ 4 (need ≥1 stone before AND after the
+        # gap, plus the gap cell itself). The cap is the smaller of:
+        #   - fragmentable leg count (geometric ceiling)
+        #   - num_jumps - K_base - 1 (need M ≥ 1)
+        # Sampled uniformly so high K_loop is just as likely as low when both
+        # are feasible — fixes the prior bias toward shallow loops at high n.
         fragmentable = [i for i, leg in enumerate(leg_specs) if leg[4] >= 4]
-        if K_extras > len(fragmentable):
-            continue  # not enough fragmentable legs; bail and re-sample
-        # Pick K_extras legs to fragment (uniformly among fragmentable).
+        max_extras = min(len(fragmentable), num_jumps - K_base - 1)
+        if max_extras < 0:
+            continue
+        if max_extras == 0:
+            K_extras = 0
+        else:
+            K_extras = int(jax.random.randint(take(), (), 0, max_extras + 1))
+        K = K_base + K_extras
+        M = num_jumps - K
+        if M < 1:
+            continue
         if K_extras > 0:
-            # JAX-friendly random sample: shuffle indices, take first K_extras.
             perm = jax.random.permutation(take(), jnp.array(fragmentable))
             chosen = set(int(perm[i]) for i in range(K_extras))
         else:
@@ -1598,14 +1607,16 @@ def generate_denial_recognition_state(
             continue
 
         # 9. Build advance: M vertical legs from start toward opp endzone.
-        # Sample final_row in [final_row_min, final_row_max] s.t. the
-        # required total advance distance is partitionable.
+        # final_row: any row strictly past start (toward opp), not in either
+        # endzone. Advance just needs net progress; a single short hop counts
+        # as much as a deep one for puzzle correctness.
         adv_total_min, adv_total_max = 2 * M, 6 * M
         if player == 1:
+            # P1: advance north, final_row < start_row, ≥ 2 (out of opp ez).
             fr_min = max(final_row_min, start_row - adv_total_max)
-            fr_max = min(final_row_max, start_row - adv_total_min)
+            fr_max = min(start_row - 1, start_row - adv_total_min)
         else:
-            fr_min = max(final_row_min, start_row + adv_total_min)
+            fr_min = max(start_row + 1, start_row + adv_total_min)
             fr_max = min(final_row_max, start_row + adv_total_max)
         if fr_min > fr_max:
             continue
@@ -1650,11 +1661,14 @@ def generate_denial_recognition_state(
         if not ok:
             continue
 
-        # Final landing constraints.
+        # Final landing constraints: not in either endzone, must be net
+        # progress past start (toward opp).
         final_pos = advance_landings[-1]
         if final_pos[0] in opp_ez_rows or final_pos[0] in own_ez_rows:
             continue
-        if not (final_row_min <= final_pos[0] <= final_row_max):
+        if player == 1 and final_pos[0] >= start_row:
+            continue
+        if player == 2 and final_pos[0] <= start_row:
             continue
 
         # 11. Build the state.
