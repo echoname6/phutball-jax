@@ -1297,3 +1297,314 @@ def generate_passthrough_recognition_state(
         f"Failed to generate a passthrough puzzle (player={player}, n={num_jumps}) "
         f"after {max_attempts} attempts."
     )
+
+
+# ============================================================================
+# Denial Recognition Puzzles
+# ============================================================================
+
+def generate_denial_recognition_state(
+    rng: jax.Array,
+    env_config: EnvConfig,
+    player: int = 1,
+    num_jumps: int = 5,
+    max_attempts: int = 64,
+):
+    """
+    Generate a denial puzzle. Ball is at a mid-board cell from which an
+    "obvious" advance toward the opponent endzone is available, but the
+    correct play is to first execute a multi-jump LOOP that consumes
+    opponent-aligned setup material in the player's own defensive
+    territory, RETURNS to the start cell, and then ADVANCES toward the
+    opponent endzone — deliberately stopping 2-4 rows short of scoring
+    this turn.
+
+    The total turn:
+        chain = [loop_1, ..., loop_K, advance_1, ..., advance_M]
+                                ↑
+                  ball returns to start (chain[K-1] == start_pos)
+
+    Loop patterns (one is sampled uniformly per attempt, with a horizontal
+    mirror flip for variety):
+        - 'diamond':  4-jump square (K=4)
+        - 'triangle': 3-jump right triangle (K=3)
+    The loop's stones live in the player's defensive territory (rows ≥
+    rows-7 for P1, rows ≤ 6 for P2) — i.e. the cells that represent the
+    opponent's "setup material" the puzzle is testing whether the LLM
+    eliminates before advancing.
+
+    Advance phase: M = num_jumps - K vertical legs from start_pos toward
+    the opponent endzone. Final landing must be 2-4 rows from the
+    opponent endzone and NOT inside any endzone.
+
+    Returns:
+        state, all_landings, canonical_actions, meta where meta has:
+            pattern, loop_landings, advance_landings, loop_stones, K, M,
+            start_pos, opp_endzone_rows, own_endzone_rows.
+    """
+    if num_jumps < 4 or num_jumps > 12:
+        raise ValueError("Denial puzzles support num_jumps in [4, 12].")
+
+    rows, cols = env_config.rows, env_config.cols
+
+    if player == 1:
+        forward_dr = 1   # toward own (defensive) endzone
+        opp_dr = -1      # toward opponent endzone (advance direction)
+        own_ez_rows = [rows - 2, rows - 1]
+        opp_ez_rows = [0, 1]
+        defensive_min_row = rows - 7    # rows ≥ 14 are "deep enough" to count as defensive
+        # final_row 2..4 → 2-4 rows from opp endzone (rows 0-1)
+        final_row_min, final_row_max = 2, 4
+    else:
+        forward_dr = -1
+        opp_dr = 1
+        own_ez_rows = [0, 1]
+        opp_ez_rows = [rows - 2, rows - 1]
+        defensive_max_row = 6
+        final_row_min, final_row_max = rows - 5, rows - 3
+
+    for _ in range(max_attempts):
+        rng, *subs = jax.random.split(rng, 24)
+        idx = [0]
+        def take():
+            v = subs[idx[0]]; idx[0] += 1; return v
+
+        # 1. Loop pattern. Each pattern is a closed polygon traversal that
+        # returns the ball to start_pos. Patterns are sampled uniformly.
+        # Hook adds asymmetry so the loop doesn't read as a perfect square
+        # — closer to the organic shapes that emerge in actual play.
+        feasible = []
+        if num_jumps - 3 >= 1:
+            feasible.append(('triangle', 3))
+        if num_jumps - 4 >= 1:
+            feasible.append(('rect', 4))
+        if not feasible:
+            continue
+        pattern, K = feasible[int(jax.random.randint(take(), (), 0, len(feasible)))]
+        M = num_jumps - K
+
+        # 2. Sample horizontal mirror (+1 = loop extends right, -1 = left)
+        mirror = 1 if int(jax.random.randint(take(), (), 0, 2)) == 0 else -1
+
+        # 3. Pick start row. Need room above for advance (M legs × ≥2 cells
+        # landing in [final_row_min, final_row_max]) and below for loop side.
+        if player == 1:
+            sr_min = max(7, final_row_min + 2 * M)
+            sr_max = min(11, final_row_max + 6 * M, rows - 9)
+        else:
+            sr_min = max(rows - 12, final_row_max - 6 * M)
+            sr_max = min(rows - 8, final_row_min - 2 * M, 9)
+        if sr_min > sr_max:
+            continue
+        start_row = int(jax.random.randint(take(), (), sr_min, sr_max + 1))
+
+        # 4. Pick start col. Loop side is bounded by what fits horizontally.
+        sc_min = 4 if mirror < 0 else 1
+        sc_max = (cols - 5) if mirror > 0 else (cols - 2)
+        if sc_min > sc_max:
+            continue
+        start_col = int(jax.random.randint(take(), (), sc_min, sc_max + 1))
+
+        # 5. Sample loop dimensions. Width (horizontal extent) and height
+        # (vertical extent into defensive territory) are sampled
+        # independently for rect/hook so the cycle isn't necessarily square.
+        # Triangle stays isoceles because Phutball diagonal jumps must travel
+        # equal rows and cols per step.
+        if player == 1:
+            min_height = max(3, defensive_min_row - start_row)
+            max_height_row = rows - 2 - start_row - 1
+        else:
+            min_height = max(3, start_row - defensive_max_row)
+            max_height_row = start_row - 2 - 1
+        if mirror > 0:
+            max_width_col = cols - 1 - start_col
+        else:
+            max_width_col = start_col
+        max_height = min(6, max_height_row)
+        max_width = min(6, max_width_col)
+
+        if pattern == 'triangle':
+            # Hypotenuse forces width == height.
+            min_dim = max(min_height, 3)
+            max_dim = min(max_height, max_width)
+            if min_dim > max_dim:
+                continue
+            width = height = int(jax.random.randint(take(), (), min_dim, max_dim + 1))
+        else:
+            # rect / hook: independent w, h.
+            if min_height > max_height or 3 > max_width:
+                continue
+            height = int(jax.random.randint(take(), (), min_height, max_height + 1))
+            width = int(jax.random.randint(take(), (), 3, max_width + 1))
+
+        start_pos = (start_row, start_col)
+
+        # 6. Build loop landings + stones for the chosen pattern.
+        loop_landings = []
+        loop_stones = []
+
+        if pattern == 'rect':
+            # Width × height rectangle. Asymmetric when w != h, organic feel.
+            #   C0 = start
+            #   C1 (horizontal width)
+            #   C2 (forward vertical height)
+            #   C3 (horizontal back width)
+            #   → C0 (vertical back height)
+            c1 = (start_row, start_col + mirror * width)
+            c2 = (start_row + forward_dr * height, start_col + mirror * width)
+            c3 = (start_row + forward_dr * height, start_col)
+            loop_landings = [c1, c2, c3, start_pos]
+            for k in range(1, width):
+                loop_stones.append((start_row, start_col + mirror * k))
+            for k in range(1, height):
+                loop_stones.append((start_row + forward_dr * k, start_col + mirror * width))
+            for k in range(1, width):
+                loop_stones.append((c2[0], start_col + mirror * (width - k)))
+            for k in range(1, height):
+                loop_stones.append((c3[0] + opp_dr * k, start_col))
+
+        elif pattern == 'triangle':
+            # Right triangle with legs along the row + column axes and a
+            # 45° hypotenuse closing it. width == height by construction.
+            c1 = (start_row, start_col + mirror * width)
+            c2 = (start_row + forward_dr * height, start_col)
+            loop_landings = [c1, c2, start_pos]
+            for k in range(1, width):
+                loop_stones.append((start_row, start_col + mirror * k))
+            for k in range(1, height):
+                loop_stones.append((start_row + forward_dr * k, start_col + mirror * (width - k)))
+            for k in range(1, height):
+                loop_stones.append((c2[0] + opp_dr * k, start_col))
+
+
+        # 7. Validate landings: on board, not in any endzone (we don't want
+        #    the loop to traverse an endzone — that's a different puzzle).
+        ok = True
+        for (r, c) in loop_landings:
+            if not (0 <= r < rows and 0 <= c < cols):
+                ok = False; break
+            if r in own_ez_rows or r in opp_ez_rows:
+                ok = False; break
+        if not ok:
+            continue
+
+        # 8. Validate stones: on board, no collision, none on start.
+        all_stones = set()
+        for s in loop_stones:
+            r, c = s
+            if not (0 <= r < rows and 0 <= c < cols):
+                ok = False; break
+            if (r, c) == start_pos:
+                ok = False; break
+            if s in all_stones:
+                ok = False; break
+            all_stones.add(s)
+        if not ok:
+            continue
+
+        # 9. Build advance: M vertical legs from start toward opp endzone.
+        # Sample final_row in [final_row_min, final_row_max] s.t. the
+        # required total advance distance is partitionable.
+        adv_total_min, adv_total_max = 2 * M, 6 * M
+        if player == 1:
+            fr_min = max(final_row_min, start_row - adv_total_max)
+            fr_max = min(final_row_max, start_row - adv_total_min)
+        else:
+            fr_min = max(final_row_min, start_row + adv_total_min)
+            fr_max = min(final_row_max, start_row + adv_total_max)
+        if fr_min > fr_max:
+            continue
+        final_row = int(jax.random.randint(take(), (), fr_min, fr_max + 1))
+        adv_dist = abs(final_row - start_row)
+
+        # Partition adv_dist across M legs (each in [2, 6]).
+        remaining = adv_dist
+        adv_lengths = []
+        for ai in range(M):
+            legs_left = M - ai
+            min_l = 2
+            max_l = min(6, remaining - 2 * (legs_left - 1))
+            if max_l < min_l:
+                ok = False; break
+            l = int(jax.random.randint(take(), (), min_l, max_l + 1))
+            adv_lengths.append(l)
+            remaining -= l
+        if not ok or remaining != 0:
+            continue
+
+        # 10. Build advance landings + stones (all vertical for v1).
+        advance_landings = []
+        cur_row, cur_col = start_row, start_col
+        for length in adv_lengths:
+            nr = cur_row + opp_dr * length
+            nc = cur_col
+            if not (0 <= nr < rows and 0 <= nc < cols):
+                ok = False; break
+            if nr in own_ez_rows:
+                ok = False; break
+            for k in range(1, length):
+                sr, sc = cur_row + opp_dr * k, cur_col
+                if (sr, sc) == start_pos:
+                    ok = False; break
+                if (sr, sc) in all_stones:
+                    ok = False; break
+                all_stones.add((sr, sc))
+            if not ok: break
+            advance_landings.append((nr, nc))
+            cur_row, cur_col = nr, nc
+        if not ok:
+            continue
+
+        # Final landing constraints.
+        final_pos = advance_landings[-1]
+        if final_pos[0] in opp_ez_rows or final_pos[0] in own_ez_rows:
+            continue
+        if not (final_row_min <= final_pos[0] <= final_row_max):
+            continue
+
+        # 11. Build the state.
+        board = np.zeros((rows, cols), dtype=np.int32)
+        board[0, :] = END_HI
+        board[1, :] = END_HI
+        board[rows - 2, :] = END_LO
+        board[rows - 1, :] = END_LO
+        board[start_row, start_col] = BALL
+        for (r, c) in all_stones:
+            board[r, c] = MAN
+
+        jump_sequence = jnp.full((MAX_JUMP_SEQUENCE_LENGTH, 2), -1, dtype=jnp.int32)
+        state = PhutballState(
+            board=jnp.array(board, dtype=jnp.int32),
+            ball_pos=jnp.array([start_row, start_col], dtype=jnp.int32),
+            current_player=jnp.array(player, dtype=jnp.int32),
+            is_jumping=jnp.array(False, dtype=jnp.bool_),
+            terminated=jnp.array(False, dtype=jnp.bool_),
+            winner=jnp.array(0, dtype=jnp.int32),
+            num_turns=jnp.array(0, dtype=jnp.int32),
+            jump_sequence=jump_sequence,
+            jump_sequence_length=jnp.array(0, dtype=jnp.int32),
+        )
+
+        all_landings = loop_landings + advance_landings
+        canonical_actions = [rows * cols + r * cols + c for (r, c) in all_landings]
+
+        meta = {
+            'pattern': pattern,
+            'mirror': mirror,
+            'width': width,
+            'height': height,
+            'K': K,
+            'M': M,
+            'loop_landings': [list(p) for p in loop_landings],
+            'advance_landings': [list(p) for p in advance_landings],
+            'loop_stones': [list(s) for s in loop_stones],
+            'start_pos': [start_row, start_col],
+            'opp_endzone_rows': list(opp_ez_rows),
+            'own_endzone_rows': list(own_ez_rows),
+        }
+        return state, all_landings, canonical_actions, meta
+
+    raise RuntimeError(
+        f"Failed to generate a denial puzzle (player={player}, n={num_jumps}) "
+        f"after {max_attempts} attempts."
+    )
