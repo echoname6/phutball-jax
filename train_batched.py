@@ -147,6 +147,7 @@ class TrainConfig:
     board_ladder_enabled: bool = False
     board_ladder_sizes: Tuple[Tuple[int, int], ...] = ((13, 7), (15, 9), (17, 11), (19, 13), (21, 15))
     board_ladder_reset_params: bool = False  # True = reinit weights on escalation (tabula rasa)
+    board_ladder_reset_value_head: bool = False  # True = reinit only value-head Dense layers, carry trunk + policy. Ignored if board_ladder_reset_params is True.
 
     # Policy-loss plateau escalation (replaces ELO escalation)
     plateau_escalation_enabled: bool = False
@@ -2003,12 +2004,34 @@ class TransformerTrainer:
             pos_encoding=self.config.pos_encoding,
         )
 
-        # Reinit params from scratch (tabula rasa) or keep them (ladder)
+        # Reinit params from scratch (tabula rasa), reinit only the value-head
+        # Dense layers (carry trunk + policy), or keep everything (ladder).
+        # The two value-head Denses are the last two nn.Dense calls in
+        # PhutballTransformer.__call__ (network.py): Dense_4 -> Dense(64),
+        # Dense_5 -> Dense(1). The value head is board-size agnostic (it
+        # operates on the pooled (batch, d_model) vector), so the fresh
+        # init produces shapes identical to the carried params.
         if self.config.board_ladder_reset_params:
             self.rng, init_rng = jax.random.split(self.rng)
             variables = init_transformer_network(init_rng, self.network)
             self.params = variables['params']
             print(f"  [LADDER] Params reinitialized (tabula rasa)")
+        elif self.config.board_ladder_reset_value_head:
+            self.rng, init_rng = jax.random.split(self.rng)
+            fresh = init_transformer_network(init_rng, self.network)
+            value_head_keys = ('Dense_4', 'Dense_5')
+            for k in value_head_keys:
+                if k not in self.params or k not in fresh['params']:
+                    raise KeyError(
+                        f"board_ladder_reset_value_head: expected param key {k!r} in PhutballTransformer "
+                        f"(value-head Dense layers). Network layout changed; "
+                        f"update value_head_keys in train_batched.py:_escalate_board_ladder."
+                    )
+            new_params = dict(self.params)
+            for k in value_head_keys:
+                new_params[k] = fresh['params'][k]
+            self.params = new_params
+            print(f"  [LADDER] Value head reinitialized; trunk + policy preserved")
 
         # Reset optimizer state (Adam momentum is stale)
         self.opt_state = self.optimizer.init(self.params)
@@ -2048,7 +2071,12 @@ class TransformerTrainer:
         if self.config.plateau_escalation_enabled:
             self.current_num_simulations = self.config.plateau_sim_tiers[0]
 
-        weight_mode = "reinitialized (tabula rasa)" if self.config.board_ladder_reset_params else "preserved"
+        if self.config.board_ladder_reset_params:
+            weight_mode = "reinitialized (tabula rasa)"
+        elif self.config.board_ladder_reset_value_head:
+            weight_mode = "value head reinit, trunk + policy preserved"
+        else:
+            weight_mode = "preserved"
         print(f"  [LADDER] Params {weight_mode}, buffer/league cleared, sims reset to {self.current_num_simulations}")
 
         # Update wandb config to reflect new board size
