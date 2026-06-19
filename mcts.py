@@ -274,7 +274,7 @@ def test_mcts_basic():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=9)
+    variables = init_network(init_rng, network, num_input_channels=10)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],
@@ -318,7 +318,7 @@ def test_select_action():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=9)
+    variables = init_network(init_rng, network, num_input_channels=10)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],
@@ -355,7 +355,7 @@ def test_play_game():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=9)
+    variables = init_network(init_rng, network, num_input_channels=10)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],

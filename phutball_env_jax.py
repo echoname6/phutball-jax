@@ -537,12 +537,16 @@ def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
     Convert PhutballState to neural network input.
 
     Returns:
-        Array of shape (9, rows, cols):
+        Array of shape (10, rows, cols):
         - Channel 0: ball position (binary)
         - Channel 1: men positions (binary)
         - Channel 2: my-goal endzone (endzone the current player attacks toward)
         - Channel 3: opponent-goal endzone
         - Channels 4-8: jump sequence encoding
+        - Channel 9: single-jump reachability mask (which squares the ball
+          can land on with one legal jump from here). Same mask the policy
+          uses for action masking, but exposed spatially so the trunk gets
+          a free planning prior instead of having to rederive it.
 
     The board is encoded as 4 binary channels instead of raw tile values.
     My-goal is the endzone the current player is trying to push the ball into:
@@ -639,13 +643,20 @@ def state_to_network_input(state: PhutballState, config: EnvConfig) -> Array:
         no_sequence
     )
 
-    # Stack all channels: (9, rows, cols)
+    # Channel 9: single-jump reachability prior. Same mask used for action
+    # masking (get_legal_jumps), reshaped to the board so the network sees
+    # "what squares can the ball jump-land on from here" as a spatial input.
+    reach_flat = get_legal_jumps(state, config).astype(jnp.float32)
+    reach_channel = reach_flat.reshape(rows, cols)
+
+    # Stack all channels: (10, rows, cols)
     observation = jnp.concatenate([
         ball_channel[None, :, :],    # (1, rows, cols)
         men_channel[None, :, :],     # (1, rows, cols)
         my_goal[None, :, :],         # (1, rows, cols)
         opp_goal[None, :, :],        # (1, rows, cols)
-        jump_layers                   # (5, rows, cols)
+        jump_layers,                  # (5, rows, cols)
+        reach_channel[None, :, :],   # (1, rows, cols)
     ], axis=0)
 
     # Perspective normalization: P1 attacks towards row 0, P2 attacks towards row max
@@ -767,8 +778,8 @@ def test_network_input_encoding():
     
     obs = state_to_network_input(state, config)
 
-    # Check shape (9 channels: 4 board + 5 jump)
-    assert obs.shape == (9, 9, 9), f"Observation shape: {obs.shape}"
+    # Check shape (10 channels: 4 board + 5 jump + 1 reachability)
+    assert obs.shape == (10, 9, 9), f"Observation shape: {obs.shape}"
 
     # Check channel 0 is ball position (binary)
     assert float(obs[0, 4, 4]) == 1.0, f"Ball position in channel 0: {obs[0, 4, 4]}"

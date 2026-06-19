@@ -592,7 +592,7 @@ def play_games_batched(
         TrajectoryData with all game trajectories
     """
     action_space_size = 2 * env_config.rows * env_config.cols + 1
-    num_channels = 9
+    num_channels = 10  # see state_to_network_input; +1 vs old layout for single-jump reachability mask
     rows, cols = env_config.rows, env_config.cols
     use_mcts = num_simulations > 0
 
@@ -1353,7 +1353,7 @@ def play_games_vs_random_training(
         TrajectoryData with all game trajectories
     """
     action_space_size = 2 * env_config.rows * env_config.cols + 1
-    num_channels = 9
+    num_channels = 10  # see state_to_network_input; +1 vs old layout for single-jump reachability mask
     rows, cols = env_config.rows, env_config.cols
     use_mcts = num_simulations > 0
 
@@ -1983,7 +1983,7 @@ def test_batched_games():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=9)
+    variables = init_network(init_rng, network, num_input_channels=10)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],
@@ -2054,7 +2054,7 @@ def benchmark_batched_games():
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
     
-    variables = init_network(init_rng, network, num_input_channels=9)
+    variables = init_network(init_rng, network, num_input_channels=10)
     params = {
         'network_params': variables['params'],
         'batch_stats': variables['batch_stats'],

@@ -51,11 +51,11 @@ def _create_network_and_params(rows, cols, channels, blocks, use_transformer=Fal
             rows=rows, cols=cols, d_model=d_model,
             n_layers=n_layers, n_heads=n_heads, ffn_dim=ffn_dim,
         )
-        variables = init_transformer_network(rng, network, num_input_channels=9)
+        variables = init_transformer_network(rng, network, num_input_channels=10)
         params = {'network_params': variables['params']}
     else:
         network = create_network(rows=rows, cols=cols, num_channels=channels, num_res_blocks=blocks)
-        variables = init_network(rng, network, num_input_channels=9)
+        variables = init_network(rng, network, num_input_channels=10)
         params = {
             'network_params': variables['params'],
             'batch_stats': variables['batch_stats'],

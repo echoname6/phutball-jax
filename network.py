@@ -50,12 +50,13 @@ class PhutballTransformer(nn.Module):
     """
     Transformer-based Policy-Value network for Phutball.
 
-    Input: (batch, channels, rows, cols) where channels = 9 (4 board + 5 jump layers)
+    Input: (batch, channels, rows, cols) where channels = 10
+        (4 board + 5 jump-history layers + 1 single-jump reachability mask)
 
     Tokenization:
-    - Each cell (r, c) becomes a token with 11 dims:
-      [ball, men, my_goal, opp_goal, jump_seq[0:5], row_enc, col_enc]
-    - Full board: (rows × cols, 11)
+    - Each cell (r, c) becomes a token with 12 dims:
+      [ball, men, my_goal, opp_goal, jump_seq[0:5], reach, row_enc, col_enc]
+    - Full board: (rows × cols, 12)
 
     Architecture:
     - Linear projection to d_model
@@ -76,7 +77,7 @@ class PhutballTransformer(nn.Module):
     def __call__(self, x, train: bool = True):
         """
         Args:
-            x: Input (batch, 9, rows, cols) - 4 board channels + 5 jump layers
+            x: Input (batch, 10, rows, cols) - 4 board + 5 jump-history + 1 reachability
         Returns:
             policy_logits: (batch, 2 * rows * cols + 1)
             value: (batch,)
@@ -89,10 +90,12 @@ class PhutballTransformer(nn.Module):
         x = jnp.transpose(x, (0, 2, 3, 1))  # NCHW -> NHWC
 
         # Extract components:
-        # x[:, :, :, 0:4] = board features (ball, men, my_goal, opp_goal)
-        # x[:, :, :, 4:9] = jump sequence channels
-        board_features = x[:, :, :, 0:4]  # (batch, rows, cols, 4)
-        jump_seq = x[:, :, :, 4:9]         # (batch, rows, cols, 5)
+        # x[:, :, :, 0:4]  = board features (ball, men, my_goal, opp_goal)
+        # x[:, :, :, 4:9]  = jump sequence channels
+        # x[:, :, :, 9:10] = single-jump reachability mask
+        board_features = x[:, :, :, 0:4]   # (batch, rows, cols, 4)
+        jump_seq       = x[:, :, :, 4:9]    # (batch, rows, cols, 5)
+        reach          = x[:, :, :, 9:10]   # (batch, rows, cols, 1)
 
         # Create positional encodings
         if self.pos_encoding == "goal_distance":
@@ -112,11 +115,12 @@ class PhutballTransformer(nn.Module):
         row_enc = jnp.broadcast_to(row_enc[None, :, :, None], (batch_size, self.rows, self.cols, 1))
         col_enc = jnp.broadcast_to(col_enc[None, :, :, None], (batch_size, self.rows, self.cols, 1))
 
-        # Concatenate all features: (batch, rows, cols, 11)
-        tokens = jnp.concatenate([board_features, jump_seq, row_enc, col_enc], axis=-1)
+        # Concatenate all features: (batch, rows, cols, 12)
+        # 4 board + 5 jump_seq + 1 reach + 1 row_enc + 1 col_enc
+        tokens = jnp.concatenate([board_features, jump_seq, reach, row_enc, col_enc], axis=-1)
 
-        # Flatten spatial dims: (batch, rows * cols, 11)
-        tokens = tokens.reshape(batch_size, num_cells, 11)
+        # Flatten spatial dims: (batch, rows * cols, 12)
+        tokens = tokens.reshape(batch_size, num_cells, 12)
 
         # Linear projection to d_model: (batch, num_cells, d_model)
         x = nn.Dense(self.d_model)(tokens)
@@ -181,7 +185,7 @@ def create_transformer_network(
     )
 
 
-def init_transformer_network(rng, network: PhutballTransformer, num_input_channels: int = 9):
+def init_transformer_network(rng, network: PhutballTransformer, num_input_channels: int = 10):
     """Initialize transformer network parameters."""
     dummy_input = jnp.zeros((1, num_input_channels, network.rows, network.cols))
     variables = network.init(rng, dummy_input, train=False)
@@ -316,7 +320,7 @@ def create_chimera_network(
     )
 
 
-def init_chimera_network(rng, network: ChimeraNetwork, num_input_channels: int = 9):
+def init_chimera_network(rng, network: ChimeraNetwork, num_input_channels: int = 10):
     """Initialize chimera - needs dummy input for each board size."""
     # Create dummy inputs for all board sizes
     inputs_dict = {}
@@ -334,7 +338,7 @@ def expand_chimera_network(
     old_board_sizes: tuple,
     new_network: ChimeraNetwork,
     rng,
-    num_input_channels: int = 9,
+    num_input_channels: int = 10,
 ):
     """
     Expand a trained ChimeraNetwork to include new board sizes.
@@ -539,14 +543,14 @@ def create_network(rows: int = 21, cols: int = 15, num_channels: int = 64, num_r
     )
 
 
-def init_network(rng, network: PhutballNetwork, num_input_channels: int = 9):
+def init_network(rng, network: PhutballNetwork, num_input_channels: int = 10):
     """
     Initialize network parameters.
     
     Args:
         rng: JAX random key
         network: PhutballNetwork instance
-        num_input_channels: Number of input channels (default 9: 4 board + 5 jump layers)
+        num_input_channels: Number of input channels (default 10: 4 board + 5 jump + 1 reachability)
         
     Returns:
         params: Network parameters
@@ -769,7 +773,7 @@ def test_network_shapes():
     """Test that network produces correct output shapes."""
     rows, cols = 21, 15
     batch_size = 8
-    num_input_channels = 9
+    num_input_channels=10
     action_space_size = 2 * rows * cols + 1  # 631
     
     # Create network
@@ -821,7 +825,7 @@ def test_training_step():
     """Test that training step runs and reduces loss."""
     rows, cols = 21, 15
     batch_size = 4
-    num_input_channels = 9
+    num_input_channels=10
     action_space_size = 2 * rows * cols + 1
     
     # Create network and optimizer
@@ -884,7 +888,7 @@ def test_different_board_sizes():
     
     for rows, cols in configs:
         network = create_network(rows=rows, cols=cols, num_channels=32, num_res_blocks=2)
-        variables = init_network(rng, network, num_input_channels=9)
+        variables = init_network(rng, network, num_input_channels=10)
         
         dummy_input = jax.random.normal(rng, (2, 9, rows, cols))
         policy, value = predict(
@@ -903,7 +907,7 @@ def test_transformer_shapes():
     """Test that transformer network produces correct output shapes."""
     rows, cols = 21, 15
     batch_size = 8
-    num_input_channels = 9
+    num_input_channels=10
     action_space_size = 2 * rows * cols + 1  # 631
 
     # Create transformer network
@@ -957,7 +961,7 @@ def test_transformer_training():
     """Test transformer training step."""
     rows, cols = 11, 9  # Smaller for faster test
     batch_size = 4
-    num_input_channels = 9
+    num_input_channels=10
     action_space_size = 2 * rows * cols + 1
 
     # Create network and optimizer
@@ -1028,7 +1032,7 @@ def benchmark_networks():
 
     rows, cols = 21, 15
     batch_size = 32
-    num_input_channels = 9
+    num_input_channels=10
     num_warmup = 5
     num_iterations = 50
 
