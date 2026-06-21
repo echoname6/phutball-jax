@@ -1514,46 +1514,66 @@ class TransformerTrainer:
                 else:
                     print(f"[ntfy] Failed after {max_retries} attempts: {e}")
 
+    def _heartbeat_lines(self):
+        """Build the body of a heartbeat / boot / exit notification.
+
+        Ordered most-important-first so a quick glance at the phone tells
+        you whether the run is alive and learning, then how the active
+        escalation knobs are set, then volume metrics."""
+        cfg = self.config
+        # Line 1: where in the run are we
+        loc = f"Iter {self.iteration} | {cfg.rows}x{cfg.cols}"
+        if cfg.board_ladder_enabled:
+            loc += f" | rung {self.board_ladder_index}/{len(cfg.board_ladder_sizes)-1}"
+        lines = [loc]
+        # Line 2: is it learning (most recent loss + ELO)
+        if self.metrics_history:
+            m = self.metrics_history[-1]
+            lines.append(
+                f"Loss: p={m.get('policy_loss', 0):.3f} v={m.get('value_loss', 0):.3f}"
+            )
+        if self.elo_history:
+            elo_line = f"ELO: {self.elo_history[-1]:.0f} (stag {self.elo_stagnation_count})"
+            if hasattr(self, '_recent_elo_ratings') and self._recent_elo_ratings:
+                top = ", ".join(
+                    f"{'cur' if it == self.iteration else f'i{it}'}:{elo:.0f}"
+                    for it, elo in self._recent_elo_ratings.items()
+                )
+                elo_line += f" | top: {top}"
+            lines.append(elo_line)
+        # Line 3+: active escalation state
+        if cfg.plateau_escalation_enabled:
+            tiers = cfg.plateau_sim_tiers
+            iters_on_rung = self.iteration - self.rung_start_iteration
+            window_mean = (
+                sum(self.policy_loss_history[-cfg.plateau_window:]) /
+                len(self.policy_loss_history[-cfg.plateau_window:])
+            ) if self.policy_loss_history else 0.0
+            lines.append(
+                f"Sims: {self.current_num_simulations} (tier {self.plateau_sim_tier_index}/{len(tiers)-1})"
+                f" | Plateau: {self.plateau_count}/{cfg.plateau_patience}"
+                f" | Window loss: {window_mean:.3f}"
+                f" | Rung iters: {iters_on_rung}"
+            )
+        else:
+            elo_tiers = cfg.elo_sim_tiers
+            lines.append(
+                f"Sims: {self.current_num_simulations} (tier {self.elo_sim_tier_index}/{len(elo_tiers)-1})"
+            )
+        # Final line: volume + safety counters
+        last = f"Games: {self.total_games:,} | Buffer: {len(self.replay_buffer):,}"
+        if cfg.kl_early_stop_enabled:
+            last += f" | KL reverts: {self.kl_consecutive_reverts}"
+        lines.append(last)
+        return lines
+
     def _maybe_send_heartbeat(self):
         """Send heartbeat notification via ntfy.sh if configured."""
         if not self.config.ntfy_topic or self.config.heartbeat_minutes <= 0:
             return
         now = time.time()
         if now - self._last_heartbeat >= self.config.heartbeat_minutes * 60:
-            lines = [
-                f"Iter {self.iteration} | {self.config.rows}x{self.config.cols} board",
-                f"Games: {self.total_games:,} | Buffer: {len(self.replay_buffer):,}",
-            ]
-            # Sims line: adapt based on active escalation system
-            if self.config.plateau_escalation_enabled:
-                tiers = self.config.plateau_sim_tiers
-                lines.append(f"Sims: {self.current_num_simulations} (tier {self.plateau_sim_tier_index}/{len(tiers)-1})")
-            else:
-                lines.append(f"Sims: {self.current_num_simulations} (tier {self.elo_sim_tier_index}/{len(self.config.elo_sim_tiers)-1})")
-            if self.config.board_ladder_enabled:
-                lines.append(f"Ladder: rung {self.board_ladder_index}/{len(self.config.board_ladder_sizes)-1}")
-            # Plateau status
-            if self.config.plateau_escalation_enabled:
-                iters_on_rung = self.iteration - self.rung_start_iteration
-                window_mean = (sum(self.policy_loss_history[-self.config.plateau_window:]) /
-                               len(self.policy_loss_history[-self.config.plateau_window:])
-                               if self.policy_loss_history else 0.0)
-                lines.append(f"Plateau: {self.plateau_count}/{self.config.plateau_patience} | "
-                             f"Window loss: {window_mean:.3f} | Rung iters: {iters_on_rung}")
-            if self.elo_history:
-                lines.append(f"ELO: {self.elo_history[-1]:.0f} (stag: {self.elo_stagnation_count})")
-            if hasattr(self, '_recent_elo_ratings') and self._recent_elo_ratings:
-                ratings_str = " | ".join(
-                    f"{'*cur*' if it == self.iteration else f'i{it}'}:{elo:.0f}"
-                    for it, elo in self._recent_elo_ratings.items()
-                )
-                lines.append(f"Top 5: {ratings_str}")
-            if self.config.kl_early_stop_enabled:
-                lines.append(f"KL reverts: {self.kl_consecutive_reverts}")
-            if self.metrics_history:
-                m = self.metrics_history[-1]
-                lines.append(f"Loss: p={m.get('policy_loss', 0):.3f} v={m.get('value_loss', 0):.3f}")
-            self._send_ntfy("Training Heartbeat", "\n".join(lines))
+            self._send_ntfy("Training Heartbeat", "\n".join(self._heartbeat_lines()))
             self._last_heartbeat = now
 
     def _init_network(self):
@@ -2956,9 +2976,69 @@ class TransformerTrainer:
         print("=" * 60)
         print()
 
-        # Send initial heartbeat at training start
-        self._maybe_send_heartbeat()
+        # Dedicated boot notification (separate from heartbeats so the user
+        # gets a one-time message confirming the run started + how it is
+        # configured, instead of an unsigned-looking heartbeat).
+        cfg = self.config
+        if cfg.board_ladder_reset_params:
+            ladder_weight_mode = "tabula rasa each rung"
+        elif cfg.board_ladder_reset_value_head:
+            ladder_weight_mode = "value head reset each rung, trunk + policy carried"
+        else:
+            ladder_weight_mode = "all weights carried each rung"
+        if cfg.board_ladder_enabled:
+            ladder_line = (
+                f"Ladder: {len(cfg.board_ladder_sizes)} rungs, starting rung "
+                f"{self.board_ladder_index}/{len(cfg.board_ladder_sizes)-1} | "
+                f"{ladder_weight_mode}"
+            )
+        else:
+            ladder_line = "Ladder: disabled (single board size)"
+        boot_lines = [
+            f"From iter {self.iteration}/{cfg.num_iterations} | {cfg.rows}x{cfg.cols} | fresh_start={cfg.fresh_start}",
+            f"Network: d_model={cfg.num_channels} layers={cfg.num_res_blocks}",
+            f"Self-play: {cfg.games_per_iteration} games/iter, {cfg.num_simulations} sims",
+            f"Training: {cfg.train_steps_per_iteration} steps/iter, batch={cfg.batch_size_train}",
+            f"LR: {cfg.learning_rate:.1e} -> {cfg.lr_end:.1e} (cosine={'on' if cfg.cosine_lr_enabled else 'off'}, warmup {cfg.lr_warmup_iters} iters)",
+            ladder_line,
+            f"KL early-stop: {'on (thr=' + f'{cfg.kl_early_stop_threshold:.2f}' + ')' if cfg.kl_early_stop_enabled else 'off'} | Plateau escalation: {'on tiers=' + str(cfg.plateau_sim_tiers) if cfg.plateau_escalation_enabled else 'off'}",
+            f"Checkpoints: {cfg.checkpoint_dir}",
+        ]
+        self._train_start_time = time.time()
+        self._send_ntfy("Training Started", "\n".join(boot_lines), priority="default")
+        self._last_heartbeat = self._train_start_time  # so the next regular heartbeat lands ~heartbeat_minutes from now
 
+        try:
+            self._train_loop()
+        except Exception as exc:
+            import traceback as _tb
+            tb_tail = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))[-400:]
+            self._send_ntfy(
+                "Training Crashed",
+                f"Iter {self.iteration} | {cfg.rows}x{cfg.cols}\n"
+                f"{type(exc).__name__}: {exc}\n"
+                f"Last 400 chars of traceback:\n{tb_tail}",
+                priority="high",
+            )
+            raise
+
+        # Clean exit notification
+        elapsed = time.time() - self._train_start_time
+        h = int(elapsed // 3600); m = int((elapsed % 3600) // 60); s = int(elapsed % 60)
+        best_elo = self.best_elo if self.best_elo != -float('inf') else None
+        final_elo = self.elo_history[-1] if self.elo_history else None
+        exit_lines = [
+            f"Reached iter {self.iteration}/{cfg.num_iterations} | {cfg.rows}x{cfg.cols}",
+            f"Games: {self.total_games:,} | Examples: {self.total_examples:,}",
+            f"Final ELO: {final_elo:.0f} | Best ELO: {best_elo:.0f}" if final_elo is not None and best_elo is not None
+            else f"Final ELO: {final_elo}" if final_elo is not None
+            else "No ELO recorded",
+            f"Duration: {h}h{m:02d}m{s:02d}s",
+        ]
+        self._send_ntfy("Training Complete", "\n".join(exit_lines), priority="default")
+
+    def _train_loop(self):
+        """Iteration loop, factored out so train() can wrap it in try/except for crash notifications."""
         for iteration in range(self.iteration, self.config.num_iterations):
             self.iteration = iteration
             iter_start = time.time()
