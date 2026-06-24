@@ -2510,6 +2510,30 @@ class TransformerTrainer:
         with open(path, 'rb') as f:
             checkpoint = pickle.load(f)
 
+        # Fail fast on architecture mismatch. The first nn.Dense in
+        # PhutballTransformer.__call__ is the input projection, keyed
+        # 'Dense_0' at the params root, with kernel shape
+        # (token_dim, d_model). token_dim depends on input channels +
+        # token composition. A checkpoint from a different network
+        # layout will otherwise silently load and crash later on the
+        # first forward pass with an opaque shape error. self.params
+        # exists at this point because _init_network() ran in __init__.
+        try:
+            fresh_shape = self.params['Dense_0']['kernel'].shape
+            saved_shape = checkpoint['params']['Dense_0']['kernel'].shape
+        except (KeyError, TypeError):
+            fresh_shape = saved_shape = None
+        if fresh_shape is not None and saved_shape is not None and fresh_shape != saved_shape:
+            raise RuntimeError(
+                f"Checkpoint architecture mismatch at {path}: input projection "
+                f"'Dense_0' has saved kernel shape {saved_shape} but the current "
+                f"network expects {fresh_shape}. The checkpoint was saved against "
+                f"a different input layout (likely a different num_input_channels "
+                f"or token composition). Use a fresh checkpoint dir (bump RUN_TAG "
+                f"in the notebook), point at a matching checkpoint, or revert the "
+                f"network change."
+            )
+
         self.params = checkpoint['params']
         self.iteration = checkpoint['iteration']
         self.total_games = checkpoint['total_games']
