@@ -18,7 +18,7 @@ Promotion when the match score stays below --promote-below for --patience evalua
 
 Search: SEARCH gives (simulations, root candidates) phases per size: 32x16 on the small boards; 21x15 starts at 64x16
 and moves to 128x16 when 64 plateaus.
-Live control: <run-dir>/control.json is re-read every iteration. Keys (all optional): sims, considered (override SEARCH), games, reuse, lr,
+Live control: <run-dir>/control.json is re-read every iteration. Keys (all optional): sims, considered (override SEARCH), games, slots, batch, scan, reuse, lr,
 kl_puzzle, kl_prev, kl_prev_half, share_old, share_puzzle, eval_every, match_games, promote_below, patience,
 min_iters, max_iters, temperature, pause (sleep until cleared), promote_now, stop (checkpoint and exit 0),
 reload (checkpoint and exit 3: the notebook pulls the branch and relaunches).
@@ -52,7 +52,7 @@ PUZZLES = [("jumps", "expert_data/pools/J*_*.npz"), ("forced", "expert_data/plac
            ("block", "expert_data/place_pools/block_*.npz"), ("prevent", "expert_data/place_pools/prevent_*.npz")]
 PUZZLE_EVAL = [("forced", "expert_data/place_pools/heldout/forced.npz"), ("block", "expert_data/place_pools/heldout/block.npz"),
                ("prevent", "expert_data/place_pools/heldout/prevent.npz")]
-HOT = ("sims", "considered", "games", "slots", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
+HOT = ("sims", "considered", "games", "slots", "batch", "scan", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
        "match_games", "promote_below", "patience", "min_iters", "max_iters", "temperature")
 
 
