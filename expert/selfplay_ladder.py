@@ -127,6 +127,10 @@ def main():
         line = f"{time.strftime('%H:%M:%S')} {msg}"; print(line, flush=True); logf.write(line + "\n"); logf.flush()
 
     import jax
+    if not hasattr(jax.core, "get_opaque_trace_state"):   # JAX >= 0.11 moved it; older Flax still calls jax.core's
+        import jax.extend.core
+        jax.core.get_opaque_trace_state = jax.extend.core.get_opaque_trace_state
+    import flax
     import jax.numpy as jnp
     import optax
     from network import create_transformer_network
@@ -135,7 +139,7 @@ def main():
     from expert.selfplay_fast import Collector, make_selfplay
     from expert.net_policy import NetPolicy
     from expert.puzzle_eval import evaluate, load_set
-    say(f"devices: {jax.devices()}")
+    say(f"devices: {jax.devices()} | jax {jax.__version__}, flax {flax.__version__}")
 
     nets, fns = {}, {}
     def net_for(rc):
