@@ -115,3 +115,41 @@ def make_block(base: State):
         if not _wins_for(nb, s.ball, rows, cols, att, 4000): good.append(i)
     if not good: return None
     return s, {p: 1.0 / len(good) for p in good}, {"blocks": len(good)}
+
+
+def attacker_threatens(t: State) -> bool:
+    """t: attacker to move. True if the attacker wins this turn or has an unstoppable placement (win in two)."""
+    rows, cols = t.rows, t.cols
+    if _wins_for(t.board, t.ball, rows, cols, t.player): return True
+    for p in range(cols, rows * cols - cols):
+        if t.board[p] in (BALL, MAN): continue
+        nb = t.board[:]; nb[p] = MAN
+        if best_completions(State(rows, cols, nb, t.ball, t.player), cap_nodes=20_000) and unstoppable(t, p): return True
+    return False
+
+
+def make_prevent(base: State, rng: random.Random):
+    """Denial, engine-verified. From an unstoppable-threat position, give the move to the DEFENDER one turn early.
+    Target: every defender move (placement, or the halting point of a jump chain, labelled by its first landing)
+    after which the attacker has neither a winning chain nor an unstoppable placement. Kept only if the defender
+    cannot win outright, some move saves, and not every move does. Value: unknown -> weight 0.
+    Returns (state, {placement square: w}, {first jump landing: w}, meta)."""
+    r = make_forced(base, rng)
+    if not r: return None
+    s_att, _, meta = r; rows, cols = s_att.rows, s_att.cols; att = s_att.player; dfd = 3 - att
+    s = State(rows, cols, s_att.board[:], s_att.ball, dfd)
+    place_ok, jump_ok, total = [], {}, 0
+    for p in range(cols, rows * cols - cols):
+        if s.board[p] in (BALL, MAN): continue
+        nb = s.board[:]; nb[p] = MAN; total += 1
+        if not attacker_threatens(State(rows, cols, nb, s.ball, att)): place_ok.append(p)
+    for path, nb, nbl, w in chains(s.board, s.ball, rows, cols, 20000):
+        if w == dfd: return None                                          # the defender just wins
+        total += 1
+        if w or attacker_threatens(State(rows, cols, nb, nbl, att)): continue
+        jump_ok.setdefault(path[0], []).append(path)                      # a saving chain starts with this jump
+    good = len(place_ok) + sum(len(v) for v in jump_ok.values())
+    if good == 0 or good == total: return None
+    k = len(place_ok) + len(jump_ok)
+    return s, {p: 1.0 / k for p in place_ok}, {l: 1.0 / k for l in jump_ok}, \
+        {**meta, "saving_placements": len(place_ok), "saving_first_jumps": len(jump_ok), "moves": total}

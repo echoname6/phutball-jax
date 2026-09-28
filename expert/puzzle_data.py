@@ -161,7 +161,8 @@ class Generator:
 
 # --------------------------------------------------------------------------------------------------------------
 # encoding (same format as expert/dataset.py: visual coords for P2)
-def encode(examples, rows=21, cols=15):
+def encode(examples, rows=21, cols=15, actions: bool = False):
+    """examples: [(State, {key: weight})]; keys are jump landings (action n + key), or full action indices if actions."""
     import jax
     import jax.numpy as jnp
     import phutball_env_jax as J
@@ -170,7 +171,7 @@ def encode(examples, rows=21, cols=15):
     P, boards, balls, players, jumping, turns, seqs, seqlen = [], [], [], [], [], [], [], []
     for s, tw in examples:
         pol = np.zeros(A, np.float32)
-        for m, w in tw.items(): pol[n + m] = w
+        for m, w in tw.items(): pol[m if actions else n + m] = w
         if s.player == 2: pol[:n] = pol[:n][::-1].copy(); pol[n:2 * n] = pol[n:2 * n][::-1].copy()
         P.append(pol); boards.append(np.array(s.board, np.int32).reshape(rows, cols)); balls.append(divmod(s.ball, cols))
         players.append(s.player); jumping.append(s.jumping); turns.append(s.turns)
