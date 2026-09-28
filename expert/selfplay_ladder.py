@@ -45,8 +45,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 SIZES = [(13, 9), (15, 11), (17, 13), (21, 15)]
 # search schedule per size: (simulations, Gumbel root candidates) phases; a plateau moves to the next phase before the
-# size promotes (21x15: 64 sims, then 128 once 64 plateaus)
-SEARCH = {(13, 9): [(32, 16)], (15, 11): [(32, 16)], (17, 13): [(32, 16)], (21, 15): [(64, 16), (128, 16)]}
+# size promotes (17x13: 32 then 64 sims; 21x15: 64, then 128 once 64 plateaus)
+SEARCH = {(13, 9): [(32, 16)], (15, 11): [(32, 16)], (17, 13): [(32, 16), (64, 16)], (21, 15): [(64, 16), (128, 16)]}
 MAX_TURNS = {(13, 9): 200, (15, 11): 250, (17, 13): 300, (21, 15): 400}
 PUZZLES = [("jumps", "expert_data/pools/J*_*.npz"), ("forced", "expert_data/place_pools/forced_*.npz"),
            ("block", "expert_data/place_pools/block_*.npz"), ("prevent", "expert_data/place_pools/prevent_*.npz")]
