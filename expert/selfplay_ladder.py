@@ -190,6 +190,7 @@ def main():
     puzzle_eval = [(n, load(a.data_root, p)) for n, p in PUZZLE_EVAL]
     recs = load_set(a.data_root / "expert_data" / "puzzle_eval.npz")
     puzzle_ref = pickle.load(open(a.puzzle_ref, "rb"))["params"]
+    start_params = pickle.load(open(a.init, "rb"))["params"]            # fixed yardstick: the model self-play began from
     rings = {rc: Ring(a.ring, rc) for rc in sizes}
 
     def make_opt(lr):
@@ -361,22 +362,28 @@ def main():
         ms = wc = bc = float("nan"); pe = ""; promote = False
         if st["it"] % a.eval_every == 0 or c.get("promote_now"):
             rng, r = jax.random.split(rng)
-            ms, w_, l_ = match(params, st["snap"], rc, r)
+            prev_snap = st["snap"]
+            ms, w_, l_ = match(params, prev_snap, rc, r)
+            rng, r = jax.random.split(rng)
+            ys, yw, yl = match(params, start_params, rc, r)                  # vs the starting model (absolute progress)
             pol = NetPolicy(net_for((21, 15)), params); ch = []
             for fam in ("win", "back"):
                 res = evaluate(pol, recs, limit_per_diff=a.eval_per_diff, family=fam); tot_ = sum(v["n"] for v in res.values())
                 ch.append(sum(v["chain"] * v["n"] for v in res.values()) / tot_)
             wc, bc = ch; pe = " ".join(f"{n} {top1(params, (21, 15), d):.1%}" for n, d in puzzle_eval)
             st["stale"] = st["stale"] + 1 if ms < a.promote_below else 0
-            st["hist"].append({"size": rc, "it": st["it"], "match": ms}); st["snap"] = params
+            st["hist"].append({"size": rc, "it": st["it"], "match": ms, "vs_start": ys}); st["snap"] = params
             say(f"  [eval] vs itself {a.eval_every} iterations ago: {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) | stale "
-                f"{st['stale']}/{a.patience} | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
+                f"{st['stale']}/{a.patience} | vs the starting model {ys:.1%} ({yw}W {yl}L) | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
             plateau = st["it"] >= a.min_iters and st["stale"] >= a.patience
             if plateau and st["phase"] < len(SEARCH[rc]) - 1 and not c.get("promote_now"):
                 st["phase"] += 1; st["stale"] = 0
                 say(f"  plateau: search budget up to {search(rc)[0]} simulations x {search(rc)[1]} candidates")
             elif not last and (c.get("promote_now") or st["it"] >= a.max_iters or plateau):
                 promote = True
+                if ms < 0.5:                         # the earlier snapshot beat the current network: promote the stronger
+                    params = prev_snap
+                    say(f"  the snapshot from {a.eval_every} iterations ago won the match ({1 - ms:.1%}): promoting it instead")
             if c.get("promote_now"): clear_flag("promote_now")
         elif not last and st["it"] >= a.max_iters: promote = True
         log.writerow([st["total_it"], f"{rc[0]}x{rc[1]}", st["it"], *[round(row[k], 4) for k in
