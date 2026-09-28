@@ -44,7 +44,11 @@ CELLS = ([("win", J, L, nz, cl) for J in (1, 2, 3, 4) for L in (1, 2, 3) for nz 
 
 # --------------------------------------------------------------------------------------------------------------
 # relabelling
-def best_completions(s: State, cap_nodes: int = 200_000) -> dict:
+class CapHit(Exception):
+    """A bounded search hit its cap, so its answer may be incomplete."""
+
+
+def best_completions(s: State, cap_nodes: int = 200_000, strict: bool = False) -> dict:
     """For the side to move (jumping or not): {next jump landing: (fewest jumps to win incl. this one,
     most stones removed among those shortest wins)} over every winning continuation this turn.
     Exhaustive search over distinct (ball, removed stones) states, depth-first with memoisation."""
@@ -56,7 +60,9 @@ def best_completions(s: State, cap_nodes: int = 200_000) -> dict:
         if key in memo: return memo[key]
         memo[key] = None                     # guards cycles through the same state
         nodes[0] += 1
-        if nodes[0] > cap_nodes: return None
+        if nodes[0] > cap_nodes:
+            if strict: raise CapHit("best_completions")
+            return None
         best = None
         for land, jumped in jump_landings(board, ball, rows, cols):
             w = winner_at(rows, land // cols)

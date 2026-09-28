@@ -23,8 +23,32 @@ import math
 import random
 
 from expert.engine import BALL, EMPTY, MAN, State, jump_landings, step
-from expert.oracle import chains
-from expert.puzzle_data import best_completions, target_weights
+from expert.oracle import chains as _chains
+from expert.puzzle_data import CapHit, target_weights
+from expert.puzzle_data import best_completions as _best_completions
+
+
+# Every search here is strict: if it hits its cap its answer may be incomplete, so it raises CapHit and the puzzle
+# builders (make_forced / make_block / make_prevent) drop that puzzle instead of trusting a partial answer.
+CAP_DROPS = [0]
+
+
+def best_completions(s: State, cap_nodes: int = 200_000) -> dict:
+    return _best_completions(s, cap_nodes, strict=True)
+
+
+def chains(board, ball, rows, cols, cap):
+    out = _chains(board, ball, rows, cols, cap)
+    if len(out) >= cap: raise CapHit("chains")
+    return out
+
+
+def _dropping_capped(fn):
+    def wrap(*a, **k):
+        try: return fn(*a, **k)
+        except CapHit: CAP_DROPS[0] += 1; return None
+    wrap.__name__, wrap.__doc__ = fn.__name__, fn.__doc__
+    return wrap
 
 
 def _wins_for(board, ball, rows, cols, player, cap=20000):
@@ -88,6 +112,7 @@ def make_threat(base: State, rng: random.Random):
     return None
 
 
+@_dropping_capped
 def make_forced(base: State, rng: random.Random):
     r = make_threat(base, rng)
     if not r: return None
@@ -97,6 +122,7 @@ def make_forced(base: State, rng: random.Random):
     return s, {p: 1.0 / len(good) for p in good}, {**meta, "threats": len(tw), "forced": len(good)}
 
 
+@_dropping_capped
 def make_block(base: State):
     """The attacker (base.player) threatens a win; the defender moves. Both sides jump the same ball, so the defender
     could also defend by jumping: keep the puzzle only if NO defending jump chain exists (every chain either lands in
@@ -128,6 +154,7 @@ def attacker_threatens(t: State) -> bool:
     return False
 
 
+@_dropping_capped
 def make_prevent(base: State, rng: random.Random):
     """Denial, engine-verified. From an unstoppable-threat position, give the move to the DEFENDER one turn early.
     Target: every defender move (placement, or the halting point of a jump chain, labelled by its first landing)

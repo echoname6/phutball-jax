@@ -21,7 +21,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from expert.puzzle_data import CELLS, Generator, encode  # noqa: E402
-from expert.puzzle_place import make_block, make_forced, make_prevent  # noqa: E402
+from expert.puzzle_place import CAP_DROPS, make_block, make_forced, make_prevent  # noqa: E402
 
 
 def sample(kind: str, n: int, seed: int, max_jumps: int = 3):
@@ -57,4 +57,4 @@ if __name__ == "__main__":
     S, P, _ = encode(ex, actions=True)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(a.out, states=S.astype(np.int8), policy_targets=P, value_targets=V, value_weights=W)
-    print(f"{a.kind}: {len(ex)} puzzles from {tries} bases in {time.time() - t0:.0f}s; {dict(meta)}")
+    print(f"{a.kind}: {len(ex)} puzzles from {tries} bases in {time.time() - t0:.0f}s; {dict(meta)}; dropped for a search cap: {CAP_DROPS[0]}")
