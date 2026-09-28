@@ -535,8 +535,11 @@ def _make_frozen_state(old_states: PhutballState, new_states_raw: PhutballState,
         ball_pos=jnp.where(done_mask[:, None], old_states.ball_pos, new_states_raw.ball_pos),
         current_player=jnp.where(done_mask, old_states.current_player, new_states_raw.current_player),
         is_jumping=jnp.where(done_mask, old_states.is_jumping, new_states_raw.is_jumping),
-        terminated=done_mask,
-        winner=jnp.where(done_mask & old_states.terminated, old_states.winner, new_states_raw.winner),
+        # A game that ended on the previous step is in done_mask now, but its stored `terminated` flag was never set,
+        # so the old `done_mask & old_states.terminated` test let the next (discarded) step overwrite its winner:
+        # a win could be recorded as a draw or as the other side's win. Freeze the winner whenever the game is done.
+        terminated=done_mask | new_states_raw.terminated,
+        winner=jnp.where(done_mask, old_states.winner, new_states_raw.winner),
         num_turns=jnp.where(done_mask, old_states.num_turns, new_states_raw.num_turns),
         jump_sequence=jnp.where(
             done_mask[:, None, None], 

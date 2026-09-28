@@ -161,7 +161,7 @@ def main():
             se += float((d[3][i:i + 512] * (v - d[2][i:i + 512]) ** 2).sum()); wsum += float(d[3][i:i + 512].sum())
         return hit / len(d[0]), (se / wsum if wsum else float("nan"))
 
-    recs = load_set(); new_log = not (a.run_dir / "log.csv").exists()
+    recs = load_set(DATA_ROOT / "expert_data" / "puzzle_eval.npz"); new_log = not (a.run_dir / "log.csv").exists()
     lf = open(a.run_dir / "log.csv", "a", newline=""); log = csv.writer(lf)
     if new_log: log.writerow(["rung", "size", "rung_step", "passes", "kl_prev_c", "cur_policy", "cur_value", "old_kl", "puz_kl",
                               "heldout", "win_chain", "back_chain", "placement", "minutes"])

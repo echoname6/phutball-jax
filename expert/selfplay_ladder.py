@@ -1,0 +1,346 @@
+"""Self-play board-size ladder (GPU / Colab): Gumbel-MCTS self-play at 13x9 -> 15x11 -> 17x13 -> 21x15, one
+size-agnostic parameter set, starting from the expert-game ladder checkpoint.
+
+Each iteration, at the current size:
+  1. play --games games of self-play (the repo's batched JAX env + mctx Gumbel MuZero, jitted once per size);
+  2. add them to that size's replay ring;
+  3. train --reuse x (new examples) / (current-size share of the batch) steps. Every step sums fixed-count sub-batches:
+       current size   self-play policy (MCTS visit targets) + value (game results)
+       earlier sizes  their frozen replay rings, plus kl_prev(t) * KL(promoted snapshot || model), halving every
+                      --kl-prev-half iterations after a promotion
+       puzzles        21x15 proven targets (value only where known) + --kl-puzzle * KL(puzzle model || model)
+Every --eval-every iterations: a match against the snapshot from the previous evaluation (--match-games per colour
+pair, main network side recomputed from the same key the game loop uses), 21x15 puzzle scores, self-play statistics.
+Promotion when the match score stays below --promote-below for --patience evaluations (after --min-iters), or at
+--max-iters. The last size never promotes; it keeps milestone checkpoints.
+
+Live control: <run-dir>/control.json is re-read every iteration. Keys (all optional): sims, games, reuse, lr,
+kl_puzzle, kl_prev, kl_prev_half, share_old, share_puzzle, eval_every, match_games, promote_below, patience,
+min_iters, max_iters, temperature, pause (sleep until cleared), promote_now, stop (checkpoint and exit 0),
+reload (checkpoint and exit 3: the notebook pulls the branch and relaunches).
+Outputs in <run-dir>: train.log, log.csv, status.json, latest.pkl (+ buffers_*.npz), milestone checkpoints.
+
+  python -m expert.selfplay_ladder --init expert_data/ladder/rung3_21x15.pkl --puzzle-ref expert_data/place_run/latest.pkl \\
+      --run-dir /content/drive/MyDrive/phutball/selfplay --data-root /content/data
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import json
+import pickle
+import sys
+import time
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+SIZES = [(13, 9), (15, 11), (17, 13), (21, 15)]
+MAX_TURNS = {(13, 9): 200, (15, 11): 250, (17, 13): 300, (21, 15): 400}
+PUZZLES = [("jumps", "expert_data/pools/J*_*.npz"), ("forced", "expert_data/place_pools/forced_*.npz"),
+           ("block", "expert_data/place_pools/block_*.npz"), ("prevent", "expert_data/place_pools/prevent_*.npz")]
+PUZZLE_EVAL = [("forced", "expert_data/place_pools/heldout/forced.npz"), ("block", "expert_data/place_pools/heldout/block.npz"),
+               ("prevent", "expert_data/place_pools/heldout/prevent.npz")]
+HOT = ("sims", "games", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
+       "match_games", "promote_below", "patience", "min_iters", "max_iters", "temperature")
+
+
+def load(root: Path, pattern: str):
+    files = sorted(glob.glob(str(root / pattern)))
+    if not files: raise FileNotFoundError(root / pattern)
+    S, P, V, W = [], [], [], []
+    for f in files:
+        z = np.load(f)
+        S.append(z["states"].astype(np.int8)); P.append(z["policy_targets"].astype(np.float16))
+        V.append(z["value_targets"].astype(np.float32))
+        W.append(z["value_weights"].astype(np.float32) if "value_weights" in z else np.ones(len(V[-1]), np.float32))
+    return [np.concatenate(x) for x in (S, P, V, W)]
+
+
+class Ring:
+    """Replay ring for one board size: int8 states, float16 policies."""
+    def __init__(self, cap, rc):
+        n = rc[0] * rc[1]; self.cap, self.n, self.i = cap, 0, 0
+        self.S = np.zeros((cap, 9, rc[0], rc[1]), np.int8); self.P = np.zeros((cap, 2 * n + 1), np.float16)
+        self.V = np.zeros(cap, np.float32)
+
+    def add(self, S, P, V):
+        for k in range(len(V)):
+            self.S[self.i] = S[k]; self.P[self.i] = P[k]; self.V[self.i] = V[k]
+            self.i = (self.i + 1) % self.cap; self.n = min(self.n + 1, self.cap)
+
+    def sample(self, rng, m):
+        idx = rng.integers(0, self.n, m)
+        return {"states": self.S[idx].astype(np.float32), "policy_targets": self.P[idx].astype(np.float32),
+                "value_targets": self.V[idx], "value_weights": np.ones(m, np.float32)}
+
+    def save(self, path):
+        np.savez(path, S=self.S[:self.n], P=self.P[:self.n], V=self.V[:self.n], i=self.i)
+
+    def load(self, path):
+        z = np.load(path); k = len(z["V"])
+        self.S[:k], self.P[:k], self.V[:k] = z["S"], z["P"], z["V"]; self.n, self.i = k, int(z["i"])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--init", type=Path, required=True); ap.add_argument("--puzzle-ref", type=Path, required=True)
+    ap.add_argument("--run-dir", type=Path, required=True); ap.add_argument("--data-root", type=Path, default=ROOT)
+    ap.add_argument("--sizes", default="0,1,2,3")
+    ap.add_argument("--width", type=int, default=128); ap.add_argument("--layers", type=int, default=6)
+    ap.add_argument("--games", type=int, default=256, help="self-play games per iteration (played in parallel)")
+    ap.add_argument("--sims", type=int, default=32); ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--batch", type=int, default=256); ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--reuse", type=float, default=4.0, help="times each new current-size example is trained on")
+    ap.add_argument("--ring", type=int, default=300_000)
+    ap.add_argument("--share-old", type=float, default=0.15); ap.add_argument("--share-puzzle", type=float, default=0.15)
+    ap.add_argument("--kl-puzzle", type=float, default=0.5)
+    ap.add_argument("--kl-prev", type=float, default=1.0); ap.add_argument("--kl-prev-half", type=float, default=10)
+    ap.add_argument("--eval-every", type=int, default=5); ap.add_argument("--match-games", type=int, default=64)
+    ap.add_argument("--promote-below", type=float, default=0.55); ap.add_argument("--patience", type=int, default=2)
+    ap.add_argument("--min-iters", type=int, default=10); ap.add_argument("--max-iters", type=int, default=80)
+    ap.add_argument("--milestone-every", type=int, default=20); ap.add_argument("--eval-per-diff", type=int, default=40)
+    ap.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args(); a.run_dir.mkdir(parents=True, exist_ok=True)
+    sizes = [SIZES[int(x)] for x in a.sizes.split(",")]
+    logf = open(a.run_dir / "train.log", "a")
+
+    def say(msg):
+        line = f"{time.strftime('%H:%M:%S')} {msg}"; print(line, flush=True); logf.write(line + "\n"); logf.flush()
+
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from network import create_transformer_network
+    from phutball_env_jax import EnvConfig
+    from self_play_batched import (make_transformer_recurrent_fn, play_games_batched, trajectory_to_training_examples,
+                                   transformer_mcts_policy)
+    from expert.net_policy import NetPolicy
+    from expert.puzzle_eval import evaluate, load_set
+    say(f"devices: {jax.devices()}")
+
+    nets, fns = {}, {}
+    def net_for(rc):
+        if rc not in nets:
+            nets[rc] = create_transformer_network(rows=rc[0], cols=rc[1], d_model=a.width, n_layers=a.layers, n_heads=4,
+                                                  ffn_dim=a.width * 2, pos_encoding="goal_distance")
+        return nets[rc]
+
+    def games_fn(rc, n_games, sims, temp, vs_opponent):
+        """Jitted batched games at one size (compiled once per setting)."""
+        key = (rc, n_games, sims, temp, vs_opponent)
+        if key not in fns:
+            cfg = EnvConfig(rows=rc[0], cols=rc[1]); T = MAX_TURNS[rc]
+            kw = dict(network=net_for(rc), env_config=cfg, batch_size=n_games, max_turns=T, max_moves=2 * T,
+                      temperature=temp, temp_threshold=rc[0], temp_final=0.1 if not vs_opponent else temp,
+                      num_simulations=sims, random_opponent_ratio=0.0, mcts_policy_fn=transformer_mcts_policy,
+                      recurrent_fn=make_transformer_recurrent_fn(net_for(rc), cfg))
+            if vs_opponent:
+                fns[key] = jax.jit(lambda p, r, o: play_games_batched({"network_params": p}, r, opponent_params={"network_params": o},
+                                                                      opponent_ratio=1.0, **kw))
+            else:
+                fns[key] = jax.jit(lambda p, r: play_games_batched({"network_params": p}, r, **kw))
+        return fns[key]
+
+    # ---------------------------------------------------------------- data and state
+    say("loading puzzles ...")
+    puzzles = [(n, load(a.data_root, p)) for n, p in PUZZLES]
+    puzzle_eval = [(n, load(a.data_root, p)) for n, p in PUZZLE_EVAL]
+    recs = load_set(a.data_root / "expert_data" / "puzzle_eval.npz")
+    puzzle_ref = pickle.load(open(a.puzzle_ref, "rb"))["params"]
+    rings = {rc: Ring(a.ring, rc) for rc in sizes}
+
+    def make_opt(lr):
+        return optax.inject_hyperparams(lambda learning_rate: optax.chain(
+            optax.clip_by_global_norm(1.0), optax.adamw(learning_rate, weight_decay=1e-4)))(learning_rate=lr)
+    optimizer = make_opt(a.lr)
+    ck = a.run_dir / "latest.pkl"
+    if ck.exists():
+        st = pickle.load(open(ck, "rb")); params, opt_state = st["params"], st["opt_state"]
+        for rc in sizes:
+            f = a.run_dir / f"buffers_{rc[0]}x{rc[1]}.npz"
+            if f.exists(): rings[rc].load(f)
+        say(f"resumed: size {st['pos']}, iteration {st['it']} (buffers: " +
+            ", ".join(f"{rc[0]}x{rc[1]} {rings[rc].n:,}" for rc in sizes) + ")")
+    else:
+        params = pickle.load(open(a.init, "rb"))["params"]; opt_state = optimizer.init(params)
+        st = {"pos": 0, "it": 0, "total_it": 0, "promoted": None, "snap": params, "stale": 0, "hist": []}
+    ctl_seen = {}
+
+    def control():
+        f = a.run_dir / "control.json"
+        try: c = json.loads(f.read_text()) if f.exists() else {}
+        except Exception as e: say(f"control.json unreadable ({e}); ignored"); return {}
+        for k in HOT:
+            if k in c and getattr(a, k) != c[k]:
+                say(f"control: {k} {getattr(a, k)} -> {c[k]}"); setattr(a, k, type(getattr(a, k))(c[k]))
+        return c
+
+    def clear_flag(flag):
+        f = a.run_dir / "control.json"
+        try:
+            c = json.loads(f.read_text()); c.pop(flag, None); f.write_text(json.dumps(c, indent=1))
+        except Exception: pass
+
+    # ---------------------------------------------------------------- training step
+    def sub_loss(p, net, b, anchor):
+        logits, v = net.apply({"params": p}, b["states"], train=True)
+        logp = jax.nn.log_softmax(logits)
+        pol = -jnp.mean(jnp.sum(b["policy_targets"] * logp, -1))
+        w = b["value_weights"]; val = jnp.sum(w * jnp.square(v - b["value_targets"])) / jnp.maximum(jnp.sum(w), 1.0)
+        kl = jnp.float32(0.0)
+        if anchor is not None:
+            rl = jax.lax.stop_gradient(net.apply({"params": anchor}, b["states"], train=False)[0])
+            rlp = jax.nn.log_softmax(rl); kl = jnp.mean(jnp.sum(jnp.exp(rlp) * (rlp - logp), -1))
+        return pol, val, kl
+
+    steps_cache = {}
+    def step_fn(layout):
+        if layout in steps_cache: return steps_cache[layout]
+        def loss_fn(p, subs, kl_prev_c, kl_puz_c, prev, pref):
+            tot = 0.0; m = {}
+            for (role, rc, cnt), b in zip(layout, subs):
+                anchor = None if role == "cur" else (prev if role == "old" else pref)
+                pol, val, kl = sub_loss(p, net_for(rc), b, anchor)
+                kc = 0.0 if role == "cur" else (kl_prev_c if role == "old" else kl_puz_c)
+                frac = cnt / a.batch; tot = tot + frac * (pol + val + kc * kl)
+                for k, x in (("policy", pol), ("value", val), ("kl", kl)):
+                    m[f"{role}_{k}"] = m.get(f"{role}_{k}", 0.0) + x * frac
+            return tot, m
+
+        @jax.jit
+        def f(p, o, subs, kl_prev_c, kl_puz_c, prev, pref):
+            (_, m), g = jax.value_and_grad(loss_fn, has_aux=True)(p, subs, kl_prev_c, kl_puz_c, prev, pref)
+            u, o = optimizer.update(g, o, p); return optax.apply_updates(p, u), o, m
+        steps_cache[layout] = f; return f
+
+    fwd_cache = {}
+    def top1(p, rc, d):
+        if rc not in fwd_cache:
+            net = net_for(rc); fwd_cache[rc] = jax.jit(lambda q, x: net.apply({"params": q}, x, train=False))
+        hit = 0
+        for i in range(0, len(d[0]), 1024):
+            lg = np.array(fwd_cache[rc](p, d[0][i:i + 1024].astype(np.float32))[0])
+            hit += int((d[1][i:i + 1024][np.arange(len(lg)), lg.argmax(1)] > 0).sum())
+        return hit / len(d[0])
+
+    def match(p, opp, rc, rng):
+        """Score of p vs opp (win 1, draw 0.5) over 2 x match_games games, sides as the game loop assigns them."""
+        n = a.match_games; tot = 0.0; wins = losses = 0
+        for k in range(2):
+            rng, r = jax.random.split(rng)
+            traj = games_fn(rc, n, a.sims, 0.25, True)(p, r, opp)
+            _, _, side_rng, _ = jax.random.split(r, 4)                     # same split as play_games_batched
+            main_p1 = np.array(jax.random.uniform(side_rng, (n,)) < 0.5)
+            wn = np.array(traj.winners)
+            for w, m1 in zip(wn, main_p1):
+                if w == 0: tot += 0.5
+                elif (w == 1) == m1: tot += 1; wins += 1
+                else: losses += 1
+        return tot / (2 * n), wins, losses
+
+    new_log = not (a.run_dir / "log.csv").exists()
+    lf = open(a.run_dir / "log.csv", "a", newline=""); log = csv.writer(lf)
+    if new_log: log.writerow(["total_it", "size", "it", "games", "examples", "mean_moves", "p1_win", "draws", "cur_policy",
+                              "cur_value", "old_kl", "puz_kl", "kl_prev_c", "match_score", "win_chain", "back_chain",
+                              "placements", "sec_play", "sec_train", "time"])
+    rng = jax.random.PRNGKey(a.seed + 7919 * st["total_it"]); nrng = np.random.default_rng(a.seed + st["total_it"])
+
+    def checkpoint(save_buffers):
+        st.update(params=params, opt_state=opt_state)
+        pickle.dump(st, open(str(ck) + ".tmp", "wb")); Path(str(ck) + ".tmp").replace(ck)
+        if save_buffers:
+            for rc in sizes:
+                if rings[rc].n: rings[rc].save(a.run_dir / f"buffers_{rc[0]}x{rc[1]}.tmp.npz"); \
+                    Path(a.run_dir / f"buffers_{rc[0]}x{rc[1]}.tmp.npz").replace(a.run_dir / f"buffers_{rc[0]}x{rc[1]}.npz")
+
+    # ---------------------------------------------------------------- main loop
+    while True:
+        c = control()
+        if c.get("stop"): checkpoint(True); clear_flag("stop"); say("stop requested: checkpointed, exiting"); return 0
+        if c.get("reload"): checkpoint(True); clear_flag("reload"); say("reload requested: checkpointed, exiting 3"); sys.exit(3)
+        if c.get("pause"): time.sleep(30); continue
+        if "lr" in c: opt_state.hyperparams["learning_rate"] = jnp.float32(a.lr)
+        rc = sizes[st["pos"]]; last = st["pos"] == len(sizes) - 1; olds = sizes[:st["pos"]]
+        t0 = time.time(); rng, r = jax.random.split(rng)
+        traj = games_fn(rc, a.games, a.sims, a.temperature, False)(params, r)
+        S, P, V = trajectory_to_training_examples(traj)
+        wn = np.array(traj.winners); moves = np.array(traj.valid_mask).sum(1)
+        rings[rc].add(S.astype(np.int8), P.astype(np.float16), V); t_play = time.time() - t0
+
+        n_puz = int(round(a.batch * a.share_puzzle)); n_old = int(round(a.batch * a.share_old)) if olds else 0
+        n_cur = a.batch - n_puz - n_old
+        layout = [("cur", rc, n_cur)]
+        for k, o in enumerate(olds):
+            cnt = n_old // len(olds) + (1 if k < n_old % len(olds) else 0)
+            if cnt and rings[o].n: layout.append(("old", o, cnt))
+        for k in range(len(puzzles)):
+            cnt = n_puz // len(puzzles) + (1 if k < n_puz % len(puzzles) else 0)
+            if cnt: layout.append(("puz", (21, 15), cnt))
+        layout = tuple(layout); f = step_fn(layout)
+        kl_prev_c = a.kl_prev * 0.5 ** (st["it"] / a.kl_prev_half) if olds else 0.0
+        prev = st["promoted"] if st["promoted"] is not None else params
+        n_steps = max(1, int(a.reuse * len(V) / n_cur)); t1 = time.time(); acc = []
+        for _ in range(n_steps):
+            subs = []; pi = 0
+            for role, rc_, cnt in layout:
+                if role == "cur": subs.append(rings[rc].sample(nrng, cnt))
+                elif role == "old": subs.append(rings[rc_].sample(nrng, cnt))
+                else:
+                    d = puzzles[pi][1]; pi += 1; idx = nrng.integers(0, len(d[0]), cnt)
+                    subs.append({"states": d[0][idx].astype(np.float32), "policy_targets": d[1][idx].astype(np.float32),
+                                 "value_targets": d[2][idx], "value_weights": d[3][idx]})
+            params, opt_state, m = f(params, opt_state, subs, jnp.float32(kl_prev_c), jnp.float32(a.kl_puzzle), prev, puzzle_ref)
+            acc.append(m)
+        mm = {k: float(np.mean([float(x[k]) for x in acc])) for k in acc[0]}; t_train = time.time() - t1
+        st["it"] += 1; st["total_it"] += 1
+        fr = n_cur / a.batch
+        row = dict(games=len(wn), examples=len(V), mean_moves=float(moves.mean()), p1_win=float((wn == 1).mean()),
+                   draws=float((wn == 0).mean()), cur_policy=mm["cur_policy"] / fr, cur_value=mm["cur_value"] / fr,
+                   old_kl=mm.get("old_kl", float("nan")), puz_kl=mm.get("puz_kl", float("nan")), kl_prev_c=kl_prev_c)
+        say(f"{rc[0]}x{rc[1]} it {st['it']} (total {st['total_it']}) | {len(wn)} games, {len(V)} examples, "
+            f"{row['mean_moves']:.0f} moves/game, P1 {row['p1_win']:.0%} draws {row['draws']:.0%} | {n_steps} steps: policy "
+            f"{row['cur_policy']:.3f} value {row['cur_value']:.3f} puzzle-KL {row['puz_kl']:.3f}"
+            + (f" old-KL {row['old_kl']:.3f} (c {kl_prev_c:.2f})" if olds else "") +
+            f" | play {t_play:.0f}s train {t_train:.0f}s")
+
+        ms = wc = bc = float("nan"); pe = ""; promote = False
+        if st["it"] % a.eval_every == 0 or c.get("promote_now"):
+            rng, r = jax.random.split(rng)
+            ms, w_, l_ = match(params, st["snap"], rc, r)
+            pol = NetPolicy(net_for((21, 15)), params); ch = []
+            for fam in ("win", "back"):
+                res = evaluate(pol, recs, limit_per_diff=a.eval_per_diff, family=fam); tot_ = sum(v["n"] for v in res.values())
+                ch.append(sum(v["chain"] * v["n"] for v in res.values()) / tot_)
+            wc, bc = ch; pe = " ".join(f"{n} {top1(params, (21, 15), d):.1%}" for n, d in puzzle_eval)
+            st["stale"] = st["stale"] + 1 if ms < a.promote_below else 0
+            st["hist"].append({"size": rc, "it": st["it"], "match": ms}); st["snap"] = params
+            say(f"  [eval] vs itself {a.eval_every} iterations ago: {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) | stale "
+                f"{st['stale']}/{a.patience} | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
+            if not last and (c.get("promote_now") or st["it"] >= a.max_iters or
+                             (st["it"] >= a.min_iters and st["stale"] >= a.patience)):
+                promote = True
+            if c.get("promote_now"): clear_flag("promote_now")
+        elif not last and st["it"] >= a.max_iters: promote = True
+        log.writerow([st["total_it"], f"{rc[0]}x{rc[1]}", st["it"], *[round(row[k], 4) for k in
+                     ("games", "examples", "mean_moves", "p1_win", "draws", "cur_policy", "cur_value", "old_kl", "puz_kl",
+                      "kl_prev_c")], round(ms, 4), round(wc, 4), round(bc, 4), pe, round(t_play), round(t_train),
+                      time.strftime("%H:%M:%S")]); lf.flush()
+        (a.run_dir / "status.json").write_text(json.dumps({"size": f"{rc[0]}x{rc[1]}", "it": st["it"],
+            "total_it": st["total_it"], **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in row.items()},
+            "last_match": st["hist"][-1] if st["hist"] else None, "time": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=1))
+        if promote:
+            pickle.dump({"params": params, "size": rc}, open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_final.pkl", "wb"))
+            say(f"  promoted after {rc[0]}x{rc[1]} ({st['it']} iterations)")
+            st.update(pos=st["pos"] + 1, it=0, promoted=params, stale=0)
+        if last and st["it"] % a.milestone_every == 0:
+            pickle.dump({"params": params, "size": rc}, open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_it{st['it']}.pkl", "wb"))
+        checkpoint(save_buffers=promote or st["total_it"] % 10 == 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
