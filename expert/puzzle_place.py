@@ -13,7 +13,7 @@
               (both sides jump the same ball), so a placement is the only defence and the labels are complete. Target: every placement that leaves the
               attacker without a winning chain. Value: unknown -> weight 0.
 
-Each record: (state, {placement square: weight}, value, value_weight, meta).
+Training uses make_attack (threat + forced merged: forced placements when they exist, else all threats; ~3/4 of\nthreat positions have a forced win, and in ~2/3 of those every threat is forced, so the two families mostly overlap)\nand make_block. make_attack returns (state, {placement square: weight}, value, value_weight, meta).
 """
 from __future__ import annotations
 
@@ -93,6 +93,20 @@ def make_forced(base: State, rng: random.Random):
     good = [p for p in tw if unstoppable(s, p)]
     if not good: return None
     return s, {p: 1.0 / len(good) for p in good}, {**meta, "threats": len(tw), "forced": len(good)}
+
+
+def make_attack(base: State, rng: random.Random):
+    """The threat and forced families merged. They come from the same positions, and labelling one position two ways
+    gives contradictory targets (all threats vs only the unstoppable ones). If an unstoppable placement exists, target
+    only those (value +1, weight 1); otherwise target every threat (value unknown, weight 0).
+    Returns (state, targets, value, value_weight, meta)."""
+    r = make_threat(base, rng)
+    if not r: return None
+    s, tw, meta = r
+    good = [p for p in tw if unstoppable(s, p)]
+    meta = {**meta, "threats": len(tw), "forced": len(good)}
+    if good: return s, {p: 1.0 / len(good) for p in good}, 1.0, 1.0, meta
+    return s, tw, 0.0, 0.0, meta
 
 
 def make_block(base: State):
