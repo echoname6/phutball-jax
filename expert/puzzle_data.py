@@ -35,7 +35,11 @@ sys.path.insert(0, str(ROOT))
 from expert.engine import BALL, EMPTY, MAN, State, jump_landings, step, winner_at  # noqa: E402
 
 DATA = ROOT / "expert_data"
-CELLS = [(J, L, nz, cl) for J in (1, 2, 3, 4) for L in (1, 2, 3) for nz in (0, 8) for cl in ("none", "real")]
+# cells: (family, J, L, noise, clutter). "win" = curriculum_puzzles one-/n-move wins (built backwards from the goal, so
+# mostly all-forward); "back" = expert/puzzle_backward.py: a sideways/backward jump is required and a decoy forward jump
+# dead-ends ("always jump toward the goal" fails). From J >= 2 the two families are equally represented.
+CELLS = ([("win", J, L, nz, cl) for J in (1, 2, 3, 4) for L in (1, 2, 3) for nz in (0, 8) for cl in ("none", "real")] +
+         [("back", J, L, nz, cl) for J in (2, 3, 4) for L in (1, 2, 3) for nz in (0, 8) for cl in ("none", "real")])
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -138,7 +142,13 @@ class Generator:
         self.pool = np.load(clutter_pool)["patterns"] if clutter_pool and Path(clutter_pool).exists() else None
 
     def puzzle(self, cell) -> State | None:
-        J, L, nz, cl = cell; self.key, k = self.jax.random.split(self.key); player = self.rng.choice((1, 2))
+        fam, J, L, nz, cl = cell
+        if fam == "back":
+            from expert.puzzle_backward import generate as gen_back
+            pat = self.pool[self.rng.randrange(len(self.pool))] if (cl == "real" and self.pool is not None) else None
+            s = gen_back(self.rng, J, L, noise=nz, clutter=pat)
+            return mirror(s) if (s is not None and self.rng.random() < 0.5) else s
+        self.key, k = self.jax.random.split(self.key); player = self.rng.choice((1, 2))
         kw = dict(min_jump_len=L, max_jump_len=L, add_noise_men=nz > 0, max_noise_men=max(nz, 1))
         js = (self.C.generate_one_move_win_state(k, self.cfg, player=player, **kw)[0] if J == 1 else
               self.C.generate_n_move_win_state(k, self.cfg, num_jumps=J, player=player, **kw)[0])
@@ -196,10 +206,12 @@ def eval_set(per_cell: int, out: Path, seed: int = 12345):
     for cell in CELLS:
         got = 0; tries = 0
         while got < per_cell and tries < per_cell * 4:
-            tries += 1; s = gen.puzzle(cell); comp = best_completions(s)
+            tries += 1; s = gen.puzzle(cell)
+            if s is None: continue
+            comp = best_completions(s)
             if not comp: continue
             d = min(v[0] for v in comp.values())
-            recs.append(dict(board=np.array(s.board, np.int8), ball=s.ball, player=s.player, cell=str(cell), difficulty=d,
+            recs.append(dict(board=np.array(s.board, np.int8), ball=s.ball, player=s.player, cell=str(cell), family=cell[0], difficulty=d,
                              winning_first=np.array(sorted(comp), np.int32)))
             got += 1
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -211,7 +223,9 @@ def eval_set(per_cell: int, out: Path, seed: int = 12345):
 def sample(n_puzzles: int, cells, temp: float, material_w: float, seed: int):
     gen = Generator(seed=seed); ex = []; diffs = []
     for i in range(n_puzzles):
-        s = gen.puzzle(cells[i % len(cells)]); ch = chain_examples(s, temp, material_w)
+        s = gen.puzzle(cells[i % len(cells)])
+        if s is None: continue
+        ch = chain_examples(s, temp, material_w)
         if ch: ex += ch; diffs.append(len(ch))
     return ex, diffs
 
@@ -222,11 +236,13 @@ if __name__ == "__main__":
     ap.add_argument("--per-cell", type=int, default=40); ap.add_argument("--sample", type=int, default=0)
     ap.add_argument("--temp", type=float, default=0.5); ap.add_argument("--material-w", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--out", type=Path, default=DATA / "puzzles.npz")
+    ap.add_argument("--jumps", type=int, default=0, help="only cells with this intended jump count (0 = all)")
     x = ap.parse_args(); t0 = time.time()
     if x.build_clutter: build_clutter(x.build_clutter, DATA / "clutter_pool.npz")
     if x.eval_set: eval_set(x.per_cell, DATA / "puzzle_eval.npz")
     if x.sample:
-        ex, diffs = sample(x.sample, CELLS, x.temp, x.material_w, x.seed); S, P, V = encode(ex)
+        cells = [c for c in CELLS if not x.jumps or c[1] == x.jumps]
+        ex, diffs = sample(x.sample, cells, x.temp, x.material_w, x.seed); S, P, V = encode(ex)
         np.savez_compressed(x.out, states=S, policy_targets=P, value_targets=V)
         from collections import Counter
         print(f"{x.sample} puzzles -> {len(V)} chain-state examples in {time.time()-t0:.0f}s; chain lengths "

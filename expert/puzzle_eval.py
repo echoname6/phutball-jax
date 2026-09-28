@@ -25,7 +25,8 @@ def load_set(path=ROOT / "expert_data" / "puzzle_eval.npz"):
     return list(np.load(path, allow_pickle=True)["recs"])
 
 
-def evaluate(policy, recs, rows=21, cols=15, max_steps=40, limit_per_diff=None):
+def evaluate(policy, recs, rows=21, cols=15, max_steps=40, limit_per_diff=None, family=None):
+    if family: recs = [r for r in recs if r.get("family", "win") == family]
     n = rows * cols; first = defaultdict(lambda: [0, 0]); chain = defaultdict(lambda: [0, 0]); seen = defaultdict(int)
     for r in recs:
         d = int(r["difficulty"]); d = min(d, 5)
@@ -58,4 +59,5 @@ if __name__ == "__main__":
     from expert.oracle import Expert
     which = sys.argv[1] if len(sys.argv) > 1 else "expert"
     pol = {"expert": Expert(), "random": RandomPolicy(0)}[which]
-    report(evaluate(pol, load_set(), limit_per_diff=150), which)
+    for fam in ("win", "back"):
+        report(evaluate(pol, load_set(), limit_per_diff=150, family=fam), f"{which}/{fam}")
