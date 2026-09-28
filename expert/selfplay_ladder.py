@@ -11,10 +11,11 @@ Each iteration, at the current size:
        earlier sizes  their frozen replay rings, plus kl_prev(t) * KL(promoted snapshot || model), halving every
                       --kl-prev-half iterations after a promotion
        puzzles        21x15 proven targets (value only where known) + --kl-puzzle * KL(puzzle model || model)
-Every --eval-every iterations: a match against the snapshot from the previous evaluation (--match-games per colour
-pair, main network side recomputed from the same key the game loop uses), 21x15 puzzle scores, self-play statistics.
-Promotion when the match score stays below --promote-below for --patience evaluations (after --min-iters), or at
---max-iters. The last size never promotes; it keeps milestone checkpoints.
+Every --eval-every iterations (gating, as in AlphaGo Zero): a match of the current network against the BEST network so
+far at this size (--match-games per colour, main side recomputed from the same key the game loop uses); scoring
+>= --promote-below makes the current network the new best, otherwise the eval is stale. After --patience stale evals
+in a row (and --min-iters), the next search phase starts from the best, or the size promotes the best; also at
+--max-iters. The last size never promotes; it keeps milestone checkpoints. Plus 21x15 puzzle scores.
 
 Search: SEARCH gives (simulations, root candidates) phases per size: 32x16 on the small boards; 21x15 starts at 64x16
 and moves to 128x16 when 64 plateaus.
@@ -190,7 +191,6 @@ def main():
     puzzle_eval = [(n, load(a.data_root, p)) for n, p in PUZZLE_EVAL]
     recs = load_set(a.data_root / "expert_data" / "puzzle_eval.npz")
     puzzle_ref = pickle.load(open(a.puzzle_ref, "rb"))["params"]
-    start_params = pickle.load(open(a.init, "rb"))["params"]            # fixed yardstick: the model self-play began from
     rings = {rc: Ring(a.ring, rc) for rc in sizes}
 
     def make_opt(lr):
@@ -209,6 +209,7 @@ def main():
         params = pickle.load(open(a.init, "rb"))["params"]; opt_state = optimizer.init(params)
         st = {"pos": 0, "it": 0, "total_it": 0, "promoted": None, "snap": params, "stale": 0, "hist": [], "phase": 0}
     st.setdefault("phase", 0)
+    if "best" not in st: st["best"], st["best_it"] = st["snap"], st["it"]     # gating: the best network at this size
 
     def search(rc):
         s_, c_ = SEARCH[rc][min(st["phase"], len(SEARCH[rc]) - 1)]
@@ -362,30 +363,28 @@ def main():
         ms = wc = bc = float("nan"); pe = ""; promote = False
         if st["it"] % a.eval_every == 0 or c.get("promote_now"):
             rng, r = jax.random.split(rng)
-            prev_snap = st["snap"]
-            ms, w_, l_ = match(params, prev_snap, rc, r)
-            rng, r = jax.random.split(rng)
-            ys, yw, yl = match(params, start_params, rc, r)                  # vs the starting model (absolute progress)
+            ms, w_, l_ = match(params, st["best"], rc, r)                   # gating: current vs the best so far
             pol = NetPolicy(net_for((21, 15)), params); ch = []
             for fam in ("win", "back"):
                 res = evaluate(pol, recs, limit_per_diff=a.eval_per_diff, family=fam); tot_ = sum(v["n"] for v in res.values())
                 ch.append(sum(v["chain"] * v["n"] for v in res.values()) / tot_)
             wc, bc = ch; pe = " ".join(f"{n} {top1(params, (21, 15), d):.1%}" for n, d in puzzle_eval)
-            st["stale"] = st["stale"] + 1 if ms < a.promote_below else 0
-            st["hist"].append({"size": rc, "it": st["it"], "match": ms, "vs_start": ys}); st["snap"] = params
-            say(f"  [eval] vs itself {a.eval_every} iterations ago: {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) | stale "
-                f"{st['stale']}/{a.patience} | vs the starting model {ys:.1%} ({yw}W {yl}L) | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
+            best_was = st["best_it"]
+            if ms >= a.promote_below: st["best"], st["best_it"], st["stale"] = params, st["it"], 0
+            else: st["stale"] += 1
+            st["hist"].append({"size": rc, "it": st["it"], "match": ms, "best_it": st["best_it"]}); st["snap"] = params
+            say(f"  [eval] vs best (it {best_was}): {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) -> "
+                + (f"NEW BEST (it {st['it']})" if st["best_it"] == st["it"] else f"best stays it {st['best_it']}") +
+                f" | stale {st['stale']}/{a.patience} | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
             plateau = st["it"] >= a.min_iters and st["stale"] >= a.patience
             if plateau and st["phase"] < len(SEARCH[rc]) - 1 and not c.get("promote_now"):
-                st["phase"] += 1; st["stale"] = 0
-                say(f"  plateau: search budget up to {search(rc)[0]} simulations x {search(rc)[1]} candidates")
+                st["phase"] += 1; st["stale"] = 0; params = st["best"]          # continue from the best network
+                say(f"  plateau: continuing from the best (it {st['best_it']}); search budget up to {search(rc)[0]} "
+                    f"simulations x {search(rc)[1]} candidates")
             elif not last and (c.get("promote_now") or st["it"] >= a.max_iters or plateau):
-                promote = True
-                if ms < 0.5:                         # the earlier snapshot beat the current network: promote the stronger
-                    params = prev_snap
-                    say(f"  the snapshot from {a.eval_every} iterations ago won the match ({1 - ms:.1%}): promoting it instead")
+                promote = True; params = st["best"]                              # promote the best, never a regressed one
             if c.get("promote_now"): clear_flag("promote_now")
-        elif not last and st["it"] >= a.max_iters: promote = True
+        elif not last and st["it"] >= a.max_iters: promote = True; params = st["best"]
         log.writerow([st["total_it"], f"{rc[0]}x{rc[1]}", st["it"], *[round(row[k], 4) for k in
                      ("games", "examples", "mean_moves", "p1_win", "draws", "cur_policy", "cur_value", "old_kl", "puz_kl",
                       "kl_prev_c")], round(ms, 4), round(wc, 4), round(bc, 4), pe, round(t_play), round(t_train),
@@ -395,8 +394,8 @@ def main():
             "last_match": st["hist"][-1] if st["hist"] else None, "time": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=1))
         if promote:
             pickle.dump({"params": params, "size": rc}, open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_final.pkl", "wb"))
-            say(f"  promoted after {rc[0]}x{rc[1]} ({st['it']} iterations)")
-            st.update(pos=st["pos"] + 1, it=0, promoted=params, stale=0, phase=0)
+            say(f"  promoted after {rc[0]}x{rc[1]} ({st['it']} iterations): the best network, from iteration {st['best_it']}")
+            st.update(pos=st["pos"] + 1, it=0, promoted=params, stale=0, phase=0, best=params, best_it=0)
         if last and st["it"] % a.milestone_every == 0:
             pickle.dump({"params": params, "size": rc}, open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_it{st['it']}.pkl", "wb"))
         checkpoint(save_buffers=promote or st["total_it"] % 10 == 0)
