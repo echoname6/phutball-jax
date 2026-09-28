@@ -48,7 +48,7 @@ def threat_placements(s: State, temp: float = 0.5):
     """{placement square: weight} over placements that give the side to move a winning chain next (as if moving again)."""
     rows, cols, me = s.rows, s.cols, s.player; best = {}
     for i in range(cols, rows * cols - cols):
-        if s.board[i] != EMPTY: continue
+        if s.board[i] in (BALL, MAN): continue                        # goal rows 1 / R-2 hold zone markers but are placeable
         nb = s.board[:]; nb[i] = MAN; t = State(rows, cols, nb, s.ball, me)
         comp = best_completions(t, cap_nodes=20_000)
         if comp: best[i] = (min(v[0] for v in comp.values()), 0)
@@ -66,7 +66,7 @@ def unstoppable(s: State, place: int) -> bool:
         if not _wins_for(b2, bl2, rows, cols, me, 4000): return False
     landing_sq = {l for p, _ in mine for l in p}                          # placements that could break a chain
     for sq in landing_sq:
-        if not (cols <= sq < rows * cols - cols) or nb[sq] != EMPTY: continue
+        if not (cols <= sq < rows * cols - cols) or nb[sq] in (BALL, MAN): continue
         b3 = nb[:]; b3[sq] = MAN
         if not _wins_for(b3, s.ball, rows, cols, me, 4000): return False
     return True
@@ -108,7 +108,7 @@ def make_block(base: State):
         if not _wins_for(nb, nbl, rows, cols, att, 4000): return None     # a jump defends: not a pure placement puzzle
     good = []
     for i in range(cols, rows * cols - cols):
-        if s.board[i] != EMPTY: continue
+        if s.board[i] in (BALL, MAN): continue                        # goal rows 1 / R-2 hold zone markers but are placeable
         nb = s.board[:]; nb[i] = MAN
         if not _wins_for(nb, s.ball, rows, cols, att, 4000): good.append(i)
     if not good: return None

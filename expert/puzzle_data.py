@@ -126,7 +126,7 @@ def mirror(s: State) -> State:
 def add_clutter(s: State, pattern: np.ndarray, rng: random.Random, max_add: int) -> State:
     """Add up to max_add stones from a real game's stone pattern (placement rows only, empty squares only)."""
     rows, cols = s.rows, s.cols; s = s.copy()
-    cand = [i for i in np.flatnonzero(pattern) if cols <= i < rows * cols - cols and s.board[i] == EMPTY]
+    cand = [i for i in np.flatnonzero(pattern) if cols <= i < rows * cols - cols and s.board[i] not in (BALL, MAN)]
     rng.shuffle(cand)
     for i in cand[:max_add]: s.board[int(i)] = MAN
     return s

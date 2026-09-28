@@ -97,10 +97,10 @@ def generate(rng: random.Random, J: int, L: int, rows=21, cols=15, noise=0, clut
                         for q in sq: b[q[0] * cols + q[1]] = MAN; used.add(q)
                         used.add(land); break
         if noise:
-            free = [i for i in range(cols, rows * cols - cols) if b[i] == EMPTY and divmod(i, cols) not in used]
+            free = [i for i in range(cols, rows * cols - cols) if b[i] not in (BALL, MAN) and divmod(i, cols) not in used]
             for i in rng.sample(free, min(noise, len(free))): b[i] = MAN
         if clutter is not None:
-            cand = [i for i in range(cols, rows * cols - cols) if clutter[i] and b[i] == EMPTY and divmod(i, cols) not in used]
+            cand = [i for i in range(cols, rows * cols - cols) if clutter[i] and b[i] not in (BALL, MAN) and divmod(i, cols) not in used]
             rng.shuffle(cand)
             for i in cand[: rng.randint(4, 24)]: b[i] = MAN
         if needs_non_forward(s) and (not decoys or not (greedy_forward_solves(s, 0) or greedy_forward_solves(s, 1))):
