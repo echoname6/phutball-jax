@@ -7,3 +7,4 @@ checkpoints/
 venv/
 .venv/
 *.egg-info/
+expert_data/
