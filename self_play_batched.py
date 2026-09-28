@@ -571,6 +571,7 @@ def play_games_batched(
     opponent_ratio: float = 0.0,  # Fraction of games vs opponent_params
     mcts_policy_fn=None,  # Custom MCTS policy function (for transformer)
     recurrent_fn=None,  # Pre-created recurrent_fn (for transformer)
+    max_num_considered_actions: int = 32,  # Gumbel root candidates (sequential halving over this many)
 ) -> TrajectoryData:
     """
     Play multiple games in parallel with optional random/league opponents.
@@ -705,6 +706,7 @@ def play_games_batched(
                 params, env_states, step_rng, network, env_config,
                 num_simulations=num_simulations, temperature=effective_temp,
                 recurrent_fn=mcts_recurrent_fn,
+                max_num_considered_actions=max_num_considered_actions,
             )
             # League opponent MCTS (if needed)
             if opponent_params is not None:
@@ -712,6 +714,7 @@ def play_games_batched(
                     opponent_params, env_states, step_rng, network, env_config,
                     num_simulations=num_simulations, temperature=effective_temp,
                     recurrent_fn=mcts_recurrent_fn,
+                    max_num_considered_actions=max_num_considered_actions,
                 )
             else:
                 actions_league, policies_league = actions_net, policies_net
