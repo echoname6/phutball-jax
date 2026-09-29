@@ -15,7 +15,8 @@ Every --eval-every iterations (gating, as in AlphaGo Zero): a match of the curre
 far at this size (--match-games per colour, main side recomputed from the same key the game loop uses); scoring
 >= --promote-below makes the current network the new best, otherwise the eval is stale. After --patience stale evals
 in a row (and --min-iters), the next search phase starts from the best, or the size promotes the best; also at
---max-iters. The last size never promotes; it keeps milestone checkpoints. Plus 21x15 puzzle scores.
+--max-iters. The last size never promotes; it keeps milestone checkpoints, and when its final search phase stalls the run
+saves the best as selfplay_<size>_final.pkl and exits 0 (the notebook loop ends). Plus 21x15 puzzle scores.
 
 Search: SEARCH gives (simulations, root candidates) phases per size: 32x16 on the small boards; 21x15 starts at 64x16
 and moves to 128x16 when 64 plateaus.
@@ -215,6 +216,8 @@ def main():
         s_, c_ = SEARCH[rc][min(st["phase"], len(SEARCH[rc]) - 1)]
         return (a.sims or s_, a.considered or c_)
     ctl_seen = {}
+    if st.get("finished"):
+        say("this run already finished (see selfplay_*_final.pkl); nothing to do"); return 0
 
     def control():
         f = a.run_dir / "control.json"
@@ -381,6 +384,16 @@ def main():
                 st["phase"] += 1; st["stale"] = 0; params = st["best"]          # continue from the best network
                 say(f"  plateau: continuing from the best (it {st['best_it']}); search budget up to {search(rc)[0]} "
                     f"simulations x {search(rc)[1]} candidates")
+            elif last and plateau:                   # the final phase of the final size has stalled: done
+                params = st["best"]
+                pickle.dump({"params": params, "size": rc, "best_it": st["best_it"]},
+                            open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_final.pkl", "wb"))
+                st["finished"] = True; checkpoint(save_buffers=True)
+                (a.run_dir / "status.json").write_text(json.dumps({"finished": True, "size": f"{rc[0]}x{rc[1]}",
+                    "best_it": st["best_it"], "time": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=1))
+                say(f"  FINISHED: {rc[0]}x{rc[1]} stalled at {search(rc)[0]}x{search(rc)[1]}; best network (iteration "
+                    f"{st['best_it']}) saved as selfplay_{rc[0]}x{rc[1]}_final.pkl. Disconnect the runtime to stop billing.")
+                return 0
             elif not last and (c.get("promote_now") or st["it"] >= a.max_iters or plateau):
                 promote = True; params = st["best"]                              # promote the best, never a regressed one
             if c.get("promote_now"): clear_flag("promote_now")
