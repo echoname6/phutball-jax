@@ -373,7 +373,11 @@ def main():
                 ch.append(sum(v["chain"] * v["n"] for v in res.values()) / tot_)
             wc, bc = ch; pe = " ".join(f"{n} {top1(params, (21, 15), d):.1%}" for n, d in puzzle_eval)
             best_was = st["best_it"]
-            if ms >= a.promote_below: st["best"], st["best_it"], st["stale"] = params, st["it"], 0
+            if ms >= a.promote_below:
+                st["best"], st["best_it"], st["stale"] = params, st["it"], 0
+                if last and st["phase"] > 0:            # Elo pool members: every new best after the final size's search switch
+                    pickle.dump({"params": params, "size": rc, "it": st["it"], "search": search(rc)},
+                                open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_best_it{st['it']}.pkl", "wb"))
             else: st["stale"] += 1
             st["hist"].append({"size": rc, "it": st["it"], "match": ms, "best_it": st["best_it"]}); st["snap"] = params
             say(f"  [eval] vs best (it {best_was}): {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) -> "
@@ -382,6 +386,9 @@ def main():
             plateau = st["it"] >= a.min_iters and st["stale"] >= a.patience
             if plateau and st["phase"] < len(SEARCH[rc]) - 1 and not c.get("promote_now"):
                 st["phase"] += 1; st["stale"] = 0; params = st["best"]          # continue from the best network
+                if last:                                 # the Elo reference: the best at the final size's search switch
+                    pickle.dump({"params": params, "size": rc, "it": st["best_it"], "search": search(rc)},
+                                open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_switch_s{search(rc)[0]}_it{st['best_it']}.pkl", "wb"))
                 say(f"  plateau: continuing from the best (it {st['best_it']}); search budget up to {search(rc)[0]} "
                     f"simulations x {search(rc)[1]} candidates")
             elif last and plateau:                   # the final phase of the final size has stalled: done
