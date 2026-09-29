@@ -54,7 +54,7 @@ PUZZLES = [("jumps", "expert_data/pools/J*_*.npz"), ("forced", "expert_data/plac
            ("block", "expert_data/place_pools/block_*.npz"), ("prevent", "expert_data/place_pools/prevent_*.npz")]
 PUZZLE_EVAL = [("forced", "expert_data/place_pools/heldout/forced.npz"), ("block", "expert_data/place_pools/heldout/block.npz"),
                ("prevent", "expert_data/place_pools/heldout/prevent.npz")]
-HOT = ("sims", "considered", "eval_sims", "games", "slots", "batch", "scan", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
+HOT = ("sims", "considered", "eval_sims", "eval_max_turns", "games", "slots", "batch", "scan", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
        "match_games", "promote_below", "patience", "min_iters", "max_iters", "temperature")
 
 
@@ -110,6 +110,8 @@ def main():
     ap.add_argument("--sims", type=int, default=0, help="override the SEARCH schedule (0 = schedule)")
     ap.add_argument("--considered", type=int, default=0, help="override the schedule's root candidates (0 = schedule)")
     ap.add_argument("--eval-sims", type=int, default=0, help="simulations for the gating matches (0 = the self-play search)")
+    ap.add_argument("--eval-max-turns", type=int, default=200, help="gating games past this many turns are draws (a few endless "
+                    "games otherwise hold the whole batched match until the cap)")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--batch", type=int, default=256); ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--reuse", type=float, default=4.0, help="times each new current-size example is trained on")
@@ -153,9 +155,11 @@ def main():
 
     def games_fn(rc, n_games, search, temp, vs_opponent):
         """Jitted batched games at one size (compiled once per setting). search = (simulations, root candidates)."""
-        sims, considered = search; key = (rc, n_games, sims, considered, temp, vs_opponent)
+        sims, considered = search
+        T = min(MAX_TURNS[rc], a.eval_max_turns) if vs_opponent else MAX_TURNS[rc]
+        key = (rc, n_games, sims, considered, temp, vs_opponent, T)
         if key not in fns:
-            cfg = EnvConfig(rows=rc[0], cols=rc[1]); T = MAX_TURNS[rc]
+            cfg = EnvConfig(rows=rc[0], cols=rc[1])
             kw = dict(network=net_for(rc), env_config=cfg, batch_size=n_games, max_turns=T, max_moves=2 * T,
                       temperature=temp, temp_threshold=rc[0], temp_final=0.1 if not vs_opponent else temp,
                       num_simulations=sims, max_num_considered_actions=considered, random_opponent_ratio=0.0, mcts_policy_fn=transformer_mcts_policy,
@@ -382,7 +386,8 @@ def main():
                                 open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_best_it{st['it']}.pkl", "wb"))
             else: st["stale"] += 1
             st["hist"].append({"size": rc, "it": st["it"], "match": ms, "best_it": st["best_it"]}); st["snap"] = params
-            say(f"  [eval{f' at {a.eval_sims} sims' if a.eval_sims else ''}] vs best (it {best_was}): {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) -> "
+            say(f"  [eval{f' at {a.eval_sims} sims' if a.eval_sims else ''}] vs best (it {best_was}): {ms:.1%} ({w_}W {l_}L "
+                f"{2 * a.match_games - w_ - l_}D of {2 * a.match_games}) -> "
                 + (f"NEW BEST (it {st['it']})" if st["best_it"] == st["it"] else f"best stays it {st['best_it']}") +
                 f" | stale {st['stale']}/{a.patience} | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
             plateau = st["it"] >= a.min_iters and st["stale"] >= a.patience
