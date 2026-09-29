@@ -54,7 +54,7 @@ PUZZLES = [("jumps", "expert_data/pools/J*_*.npz"), ("forced", "expert_data/plac
            ("block", "expert_data/place_pools/block_*.npz"), ("prevent", "expert_data/place_pools/prevent_*.npz")]
 PUZZLE_EVAL = [("forced", "expert_data/place_pools/heldout/forced.npz"), ("block", "expert_data/place_pools/heldout/block.npz"),
                ("prevent", "expert_data/place_pools/heldout/prevent.npz")]
-HOT = ("sims", "considered", "games", "slots", "batch", "scan", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
+HOT = ("sims", "considered", "eval_sims", "games", "slots", "batch", "scan", "reuse", "lr", "kl_puzzle", "kl_prev", "kl_prev_half", "share_old", "share_puzzle", "eval_every",
        "match_games", "promote_below", "patience", "min_iters", "max_iters", "temperature")
 
 
@@ -109,6 +109,7 @@ def main():
     ap.add_argument("--scan", type=int, default=25, help="training steps per jitted lax.scan call")
     ap.add_argument("--sims", type=int, default=0, help="override the SEARCH schedule (0 = schedule)")
     ap.add_argument("--considered", type=int, default=0, help="override the schedule's root candidates (0 = schedule)")
+    ap.add_argument("--eval-sims", type=int, default=0, help="simulations for the gating matches (0 = the self-play search)")
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--batch", type=int, default=256); ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--reuse", type=float, default=4.0, help="times each new current-size example is trained on")
@@ -288,7 +289,8 @@ def main():
         n = a.match_games; tot = 0.0; wins = losses = 0
         for k in range(2):
             rng, r = jax.random.split(rng)
-            traj = games_fn(rc, n, search(rc), 0.25, True)(p, r, opp)
+            es = (a.eval_sims, search(rc)[1]) if a.eval_sims else search(rc)
+            traj = games_fn(rc, n, es, 0.25, True)(p, r, opp)
             _, _, side_rng, _ = jax.random.split(r, 4)                     # same split as play_games_batched
             main_p1 = np.array(jax.random.uniform(side_rng, (n,)) < 0.5)
             wn = np.array(traj.winners)
@@ -380,7 +382,7 @@ def main():
                                 open(a.run_dir / f"selfplay_{rc[0]}x{rc[1]}_best_it{st['it']}.pkl", "wb"))
             else: st["stale"] += 1
             st["hist"].append({"size": rc, "it": st["it"], "match": ms, "best_it": st["best_it"]}); st["snap"] = params
-            say(f"  [eval] vs best (it {best_was}): {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) -> "
+            say(f"  [eval{f' at {a.eval_sims} sims' if a.eval_sims else ''}] vs best (it {best_was}): {ms:.1%} ({w_}W {l_}L of {2 * a.match_games}) -> "
                 + (f"NEW BEST (it {st['it']})" if st["best_it"] == st["it"] else f"best stays it {st['best_it']}") +
                 f" | stale {st['stale']}/{a.patience} | puzzles: jump chains win {wc:.1%} back {bc:.1%} | placements top-1 {pe}")
             plateau = st["it"] >= a.min_iters and st["stale"] >= a.patience
