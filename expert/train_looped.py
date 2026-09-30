@@ -74,6 +74,9 @@ def main():
     ap.add_argument("--eval-every", type=int, default=1000); ap.add_argument("--eval-per-depth", type=int, default=25)
     ap.add_argument("--share", default="0.4,0.15,0.45", help="jump puzzles, placement puzzles, teacher-labelled games")
     ap.add_argument("--stop-w", type=float, default=0.1); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--stop-thresholds", default="0.5,0.8,0.95,0.99",
+                    help="adaptive thinking: stop at the first loop whose stop probability exceeds each threshold; one "
+                         "accuracy vs average-compute point per threshold (the looped curve to set against search)")
     ap.add_argument("--replay", type=Path, default=None, help="self-play replay buffer (buffers_21x15.npz): its MCTS visit "
                     "distributions and game results replace the teacher-labelled expert games (distil the SEARCH, not the net)")
     ap.add_argument("--search-sims", default="0,8,32,128", help="baseline: the teacher network with this many Gumbel sims")
@@ -121,7 +124,7 @@ def main():
     recs_std = load_set(a.data_root / "expert_data" / "puzzle_eval.npz")
     recs_deep = list(np.load(a.data_root / "expert_data" / "puzzle_eval_deep.npz", allow_pickle=True)["recs"])
     shares = [float(x) for x in a.share.split(",")]; nb = [int(round(a.batch * s)) for s in shares]; nb[2] = a.batch - nb[0] - nb[1]
-    say(f"jump states {len(jumps[0]):,}, placement puzzles {len(place[0]):,}, game positions {len(games):,} ({"search targets" if a.replay else "teacher-labelled"}) | batch split {nb}")
+    say(f"jump states {len(jumps[0]):,}, placement puzzles {len(place[0]):,}, game positions {len(games):,} ({'search targets' if a.replay else 'teacher-labelled'}) | batch split {nb}")
 
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(a.lr, weight_decay=1e-4))
     ck = a.run_dir / "latest.pkl"
@@ -183,9 +186,12 @@ def main():
                 pol = LoopedPolicy(net, p, T)
                 std = chain_eval(pol, recs_std, a.eval_per_depth); deep = chain_eval(pol, recs_deep, a.eval_per_depth)
                 out[T] = (agree, std, deep)
-            pol = LoopedPolicy(net, p, max(int(x) for x in a.eval_loops.split(",")), stop_at=0.5)
-            deep_adaptive = chain_eval(pol, recs_deep, a.eval_per_depth)
-            used = np.mean(pol.used) if pol.used else float("nan")
+            deep_adaptive = []
+            for th in [float(x) for x in a.stop_thresholds.split(",")]:
+                pol = LoopedPolicy(net, p, max(int(x) for x in a.eval_loops.split(",")), stop_at=th)
+                res = chain_eval(pol, recs_deep, a.eval_per_depth)
+                deep_adaptive.append((th, res, float(np.mean(pol.used)) if pol.used else float("nan")))
+            used = None
         else:
             agree = float((np.array(jax.jit(lambda q, x: net.apply({"params": q}, x, train=False)[0])(p, held.astype(np.float32))).argmax(1) == tl).mean())
             pol = NetPolicy(net, p); out[0] = (agree, chain_eval(pol, recs_std, a.eval_per_depth), chain_eval(pol, recs_deep, a.eval_per_depth))
@@ -196,8 +202,11 @@ def main():
                 f"{'search-target' if a.replay else 'teacher'} top-1 {agree:.1%} | standard "
                 + " ".join(f"{d}j {v:.0%}" for d, v in std.items()) + " | deep " + " ".join(f"{d}j {v:.0%}" for d, v in deep.items()))
         if deep_adaptive is not None:
-            say(f"  [eval step {step}] adaptive (stop > 0.5, up to T={max(out)}) | mean loops {used:.1f} | deep "
-                + " ".join(f"{d}j {v:.0%}" for d, v in deep_adaptive.items()))
+            for th, res, used in deep_adaptive:
+                say(f"  [eval step {step}] adaptive stop > {th} (up to T={max(out)}) | mean loops {used:.1f} (~{2 * used:.0f} blocks/move) | deep "
+                    + " ".join(f"{d}j {v:.0%}" for d, v in res.items()))
+                with open(a.run_dir / "evals.csv", "a", newline="") as f:
+                    csv.writer(f).writerow([step, f"adaptive{th}", round(used, 2)] + [f"deep{d}:{v:.3f}" for d, v in res.items()])
         with open(a.run_dir / "evals.csv", "a", newline="") as f:
             w = csv.writer(f)
             for T, (agree, std, deep) in out.items():
