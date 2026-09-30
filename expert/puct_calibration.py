@@ -2,7 +2,8 @@
 phutball-frontend/public/alphaZeroWorker.js) against the tournament's Gumbel search, with the same network.
 
 Plays --games games per colour of PUCT-N vs Gumbel-S x --considered for each S in --gumbel-sims, on the Python engine
-(games past --max-turns are draws). The Elo gap from each score, 400 log10(s / (1 - s)), places "network + browser
+(games past --max-turns are draws), under the round robin's conditions: the empty board, the Gumbel side sampling at
+temperature 0.25 (PUCT is greedy, as in the browser). Each match reports its distinct games. The Elo gap from each score, 400 log10(s / (1 - s)), places "network + browser
 search" on the tournament scale (which rates networks at 32 x 16), and with it any human results against the browser.
 
   python -m expert.puct_calibration --params selfplay_21x15_best_it100.pkl --out puct_calibration.json
@@ -74,19 +75,25 @@ class PUCT:
 
 
 class Gumbel:
-    def __init__(self, net, params, net_policy, sims, considered, rows=21, cols=15):
+    """The tournament's player: Gumbel search without root noise, the move sampled from the visit-based policy at
+    `temperature` (0.25 as in expert/elo_tournament.py; 0 = greedy)."""
+    def __init__(self, net, params, net_policy, sims, considered, rows=21, cols=15, temperature=0.25, seed=0):
         import jax
         from phutball_env_jax import EnvConfig
         from self_play_batched import make_transformer_recurrent_fn, transformer_mcts_policy
         cfg = EnvConfig(rows=rows, cols=cols); rf = make_transformer_recurrent_fn(net, cfg)
-        self.jax, self.np = jax, net_policy; self.k = jax.random.PRNGKey(0)
+        self.jax, self.np, self.t = jax, net_policy, temperature; self.k = jax.random.PRNGKey(seed)
+        self.rs = np.random.default_rng(seed)
         self.run = jax.jit(lambda st, r: transformer_mcts_policy({"network_params": params}, st, r, net, cfg, num_simulations=sims,
                                                                  temperature=1.0, max_num_considered_actions=considered,
                                                                  recurrent_fn=rf, dirichlet_fraction=0.0, gumbel_scale=0.0)[1])
 
     def action(self, s):
         st = self.jax.tree_util.tree_map(lambda x: x[None], self.np._jax_state(s)); self.k, r = self.jax.random.split(self.k)
-        return int(np.array(self.run(st, r))[0].argmax())
+        w = np.array(self.run(st, r), np.float64)[0]
+        if self.t <= 0: return int(w.argmax())
+        z = np.log(w + 1e-12) / self.t; q = np.exp(z - z.max()); q /= q.sum()
+        return int(self.rs.choice(len(q), p=q))
 
 
 def main():
@@ -97,8 +104,10 @@ def main():
     ap.add_argument("--opponent", action="append", default=[], help="name=path: play PUCT (with --params) against these "
                     "networks at Gumbel --gumbel-sims (first value) and write the games as tournament extra results")
     ap.add_argument("--name", default="it100-puct400", help="player name for PUCT in --opponent mode")
-    ap.add_argument("--max-turns", type=int, default=360); ap.add_argument("--openings", type=int, default=2,
-                    help="random centre placements before play, so repeated games differ (both players are deterministic)")
+    ap.add_argument("--max-turns", type=int, default=360); ap.add_argument("--openings", type=int, default=0,
+                    help="random centre placements before play (default 0: the empty board, as in the round robin and the browser)")
+    ap.add_argument("--temperature", type=float, default=0.25, help="Gumbel side's move sampling (the round robin's)")
+    ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     import jax
     if not hasattr(jax.core, "get_opaque_trace_state"):
@@ -116,10 +125,10 @@ def main():
         sims = int(a.gumbel_sims.split(",")[0])
         for spec in a.opponent:
             name, path = spec.split("=", 1); d2 = pickle.load(open(path, "rb")); p2 = d2.get("params", d2)
-            matchups.append((name, Gumbel(net, p2, NetPolicy(net, p2), sims, a.considered), sims))
+            matchups.append((name, Gumbel(net, p2, NetPolicy(net, p2), sims, a.considered, temperature=a.temperature, seed=a.seed), sims))
     else:
         for sims in [int(x) for x in a.gumbel_sims.split(",")]:
-            matchups.append((f"gumbel{sims}", Gumbel(net, params, npol, sims, a.considered), sims))
+            matchups.append((f"gumbel{sims}", Gumbel(net, params, npol, sims, a.considered, temperature=a.temperature, seed=a.seed), sims))
     games_out = []
     for label, gum, sims in matchups:
         sc = 0.0; w = l = 0; t0 = time.time(); seqs = set()
