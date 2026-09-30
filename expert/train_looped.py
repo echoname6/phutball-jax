@@ -198,13 +198,13 @@ def main():
             pol = NetPolicy(net, p); out[0] = (agree, chain_eval(pol, recs_std, a.eval_per_depth), chain_eval(pol, recs_deep, a.eval_per_depth))
             deep_adaptive, used = None, None
         for T, (agree, std, deep) in out.items():
-            blk = f"~{2 * T} blocks/move" if a.model == "looped" else f"~{a.layers} blocks/move"
+            blk = f"~{a.blocks * T} blocks/move" if a.model == "looped" else f"~{a.layers} blocks/move"
             say(f"  [eval step {step}] {'T=' + str(T) if a.model == 'looped' else 'fixed'} ({blk}) | "
                 f"{'search-target' if a.replay else 'teacher'} top-1 {agree:.1%} | standard "
                 + " ".join(f"{d}j {v:.0%}" for d, v in std.items()) + " | deep " + " ".join(f"{d}j {v:.0%}" for d, v in deep.items()))
         if deep_adaptive is not None:
             for th, res, used in deep_adaptive:
-                say(f"  [eval step {step}] adaptive stop > {th} (up to T={max(out)}) | mean loops {used:.1f} (~{2 * used:.0f} blocks/move) | deep "
+                say(f"  [eval step {step}] adaptive stop > {th} (up to T={max(out)}) | mean loops {used:.1f} (~{a.blocks * used:.0f} blocks/move) | deep "
                     + " ".join(f"{d}j {v:.0%}" for d, v in res.items()))
                 with open(a.run_dir / "evals.csv", "a", newline="") as f:
                     csv.writer(f).writerow([step, f"adaptive{th}", round(used, 2)] + [f"deep{d}:{v:.3f}" for d, v in res.items()])
