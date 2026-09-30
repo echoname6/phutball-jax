@@ -94,6 +94,9 @@ def main():
     ap.add_argument("--params", type=Path, required=True); ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--playouts", type=int, default=400); ap.add_argument("--gumbel-sims", default="32,64,128")
     ap.add_argument("--considered", type=int, default=16); ap.add_argument("--games", type=int, default=10, help="per colour")
+    ap.add_argument("--opponent", action="append", default=[], help="name=path: play PUCT (with --params) against these "
+                    "networks at Gumbel --gumbel-sims (first value) and write the games as tournament extra results")
+    ap.add_argument("--name", default="it100-puct400", help="player name for PUCT in --opponent mode")
     ap.add_argument("--max-turns", type=int, default=360); ap.add_argument("--openings", type=int, default=2,
                     help="random centre placements before play, so repeated games differ (both players are deterministic)")
     a = ap.parse_args()
@@ -108,23 +111,38 @@ def main():
     net = create_transformer_network(rows=21, cols=15, d_model=128, n_layers=6, n_heads=4, ffn_dim=256, pos_encoding="goal_distance")
     d = pickle.load(open(a.params, "rb")); params = d.get("params", d); npol = NetPolicy(net, params)
     puct = PUCT(npol, a.playouts); out = {}
-    for sims in [int(x) for x in a.gumbel_sims.split(",")]:
-        gum = Gumbel(net, params, npol, sims, a.considered); sc = 0.0; w = l = 0; t0 = time.time()
+    matchups = []                                       # (label, gumbel player)
+    if a.opponent:
+        sims = int(a.gumbel_sims.split(",")[0])
+        for spec in a.opponent:
+            name, path = spec.split("=", 1); d2 = pickle.load(open(path, "rb")); p2 = d2.get("params", d2)
+            matchups.append((name, Gumbel(net, p2, NetPolicy(net, p2), sims, a.considered), sims))
+    else:
+        for sims in [int(x) for x in a.gumbel_sims.split(",")]:
+            matchups.append((f"gumbel{sims}", Gumbel(net, params, npol, sims, a.considered), sims))
+    games_out = []
+    for label, gum, sims in matchups:
+        sc = 0.0; w = l = 0; t0 = time.time(); seqs = set()
         for g in range(2 * a.games):
             puct_side = 1 if g % 2 == 0 else 2; rng = random.Random(g // 2)
             s = new_game(21, 15)
             for _ in range(a.openings):
                 s = step(s, rng.choice([x for x in legal_actions(s) if x < 315 and 6 * 15 <= x < 15 * 15]))
+            moves = []
             while not s.winner and s.turns < a.max_turns:
-                s = step(s, (puct if s.player == puct_side else gum).action(s))
+                mv = (puct if s.player == puct_side else gum).action(s); moves.append(mv); s = step(s, mv)
+            seqs.add((puct_side,) + tuple(moves))
             r = 0.5 if not s.winner else (1.0 if s.winner == puct_side else 0.0); sc += r; w += r == 1.0; l += r == 0.0
-            print(f"  PUCT-{a.playouts} vs Gumbel-{sims}x{a.considered}, game {g + 1}: {'win' if r == 1 else 'loss' if r == 0 else 'draw'} "
+            games_out.append([a.name, label, r])
+            print(f"  PUCT-{a.playouts} vs {label} (Gumbel-{sims}x{a.considered}), game {g + 1}: {'win' if r == 1 else 'loss' if r == 0 else 'draw'} "
                   f"as P{puct_side} ({s.turns} turns) | {(time.time() - t0) / 60:.1f} min", flush=True)
         s_ = min(max(sc / (2 * a.games), 0.5 / (2 * a.games)), 1 - 0.5 / (2 * a.games))
         gap = 400 * math.log10(s_ / (1 - s_))
-        out[f"gumbel{sims}"] = {"score": sc / (2 * a.games), "wins": w, "losses": l, "elo_gap_puct_minus_gumbel": round(gap)}
-        print(f"PUCT-{a.playouts} vs Gumbel-{sims}x{a.considered}: {sc / (2 * a.games):.1%} ({w}W {l}L) -> PUCT is {gap:+.0f} Elo", flush=True)
-    a.out.write_text(json.dumps(out, indent=1))
+        out[label] = {"score": sc / (2 * a.games), "wins": w, "losses": l, "distinct_games": len(seqs),
+                      "elo_gap_puct_minus_opponent": round(gap)}
+        print(f"PUCT-{a.playouts} vs {label} (Gumbel-{sims}x{a.considered}): {sc / (2 * a.games):.1%} ({w}W {l}L) | "
+              f"{len(seqs)} distinct games of {2 * a.games} -> PUCT is {gap:+.0f} Elo", flush=True)
+    a.out.write_text(json.dumps(games_out if a.opponent else out, indent=1))
 
 
 if __name__ == "__main__":
