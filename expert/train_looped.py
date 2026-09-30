@@ -70,10 +70,13 @@ def main():
     ap.add_argument("--steps", type=int, default=6000); ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--width", type=int, default=128)
     ap.add_argument("--blocks", type=int, default=2, help="looped: blocks per loop"); ap.add_argument("--layers", type=int, default=6, help="fixed: layers")
-    ap.add_argument("--loops-train", default="2,4,6,8"); ap.add_argument("--eval-loops", default="1,2,4,8,12,16")
+    ap.add_argument("--loops-train", default="2,4,6,8"); ap.add_argument("--eval-loops", default="1,2,4,8,16,32")
     ap.add_argument("--eval-every", type=int, default=1000); ap.add_argument("--eval-per-depth", type=int, default=25)
     ap.add_argument("--share", default="0.4,0.15,0.45", help="jump puzzles, placement puzzles, teacher-labelled games")
     ap.add_argument("--stop-w", type=float, default=0.1); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--replay", type=Path, default=None, help="self-play replay buffer (buffers_21x15.npz): its MCTS visit "
+                    "distributions and game results replace the teacher-labelled expert games (distil the SEARCH, not the net)")
+    ap.add_argument("--search-sims", default="0,8,32,128", help="baseline: the teacher network with this many Gumbel sims")
     a = ap.parse_args(); a.run_dir.mkdir(parents=True, exist_ok=True)
     logf = open(a.run_dir / "train.log", "a")
 
@@ -107,12 +110,18 @@ def main():
     jumps = load(a.data_root, "expert_data/pools/J*_*.npz")
     place = [load(a.data_root, f"expert_data/place_pools/{k}_*.npz") for k in ("forced", "block", "prevent")]
     place = [np.concatenate(x) for x in zip(*place)]
-    games = load(a.data_root, "expert_data/games/chunk_[0-8].npz", stride=2)[0]
-    held = load(a.data_root, "expert_data/games/chunk_9.npz", stride=8)[0]
+    if a.replay:                                       # search targets: MCTS visit distributions + game results
+        z = np.load(a.replay); n_rep = len(z["V"]); cut = int(n_rep * 0.97)
+        rep_S, rep_P, rep_V = z["S"].astype(np.int8), z["P"].astype(np.float16), z["V"].astype(np.float32)
+        games = rep_S[:cut]; held = rep_S[cut:][::4]; held_target = rep_P[cut:][::4].astype(np.float32).argmax(1)
+        say(f"replay: {n_rep:,} positions with 128-sim search targets ({len(games):,} train, {len(held):,} held out)")
+    else:
+        games = load(a.data_root, "expert_data/games/chunk_[0-8].npz", stride=2)[0]
+        held = load(a.data_root, "expert_data/games/chunk_9.npz", stride=8)[0]; held_target = None
     recs_std = load_set(a.data_root / "expert_data" / "puzzle_eval.npz")
     recs_deep = list(np.load(a.data_root / "expert_data" / "puzzle_eval_deep.npz", allow_pickle=True)["recs"])
     shares = [float(x) for x in a.share.split(",")]; nb = [int(round(a.batch * s)) for s in shares]; nb[2] = a.batch - nb[0] - nb[1]
-    say(f"jump states {len(jumps[0]):,}, placement puzzles {len(place[0]):,}, teacher positions {len(games):,} | batch split {nb}")
+    say(f"jump states {len(jumps[0]):,}, placement puzzles {len(place[0]):,}, game positions {len(games):,} ({"search targets" if a.replay else "teacher-labelled"}) | batch split {nb}")
 
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(a.lr, weight_decay=1e-4))
     ck = a.run_dir / "latest.pkl"
@@ -152,8 +161,11 @@ def main():
 
     def batch():
         i = rng.integers(0, len(jumps[0]), nb[0]); j = rng.integers(0, len(place[0]), nb[1]); k = rng.integers(0, len(games), nb[2])
-        gx = games[k].astype(np.float32); tl, tv = teach(gx)
-        tP = np.array(jax.nn.softmax(tl), np.float32)
+        if a.replay:
+            tP = rep_P[k].astype(np.float32); tv = rep_V[k]
+        else:
+            gx = games[k].astype(np.float32); tl, tv = teach(gx)
+            tP = np.array(jax.nn.softmax(tl), np.float32)
         x = np.concatenate([jumps[0][i], place[0][j], games[k]]).astype(np.float32)
         P = np.concatenate([jumps[1][i].astype(np.float32), place[1][j].astype(np.float32), tP])
         V = np.concatenate([jumps[2][i], place[2][j], np.array(tv, np.float32)])
@@ -162,7 +174,7 @@ def main():
 
     def evaluate(p, step):
         out = {}
-        tl = np.array(teach(held.astype(np.float32))[0]).argmax(1)
+        tl = held_target if held_target is not None else np.array(teach(held.astype(np.float32))[0]).argmax(1)
         if a.model == "looped":
             fwd = {}
             for T in [int(x) for x in a.eval_loops.split(",")]:
@@ -179,7 +191,9 @@ def main():
             pol = NetPolicy(net, p); out[0] = (agree, chain_eval(pol, recs_std, a.eval_per_depth), chain_eval(pol, recs_deep, a.eval_per_depth))
             deep_adaptive, used = None, None
         for T, (agree, std, deep) in out.items():
-            say(f"  [eval step {step}] {'T=' + str(T) if a.model == 'looped' else 'fixed'} | teacher top-1 {agree:.1%} | standard "
+            blk = f"~{2 * T} blocks/move" if a.model == "looped" else f"~{a.layers} blocks/move"
+            say(f"  [eval step {step}] {'T=' + str(T) if a.model == 'looped' else 'fixed'} ({blk}) | "
+                f"{'search-target' if a.replay else 'teacher'} top-1 {agree:.1%} | standard "
                 + " ".join(f"{d}j {v:.0%}" for d, v in std.items()) + " | deep " + " ".join(f"{d}j {v:.0%}" for d, v in deep.items()))
         if deep_adaptive is not None:
             say(f"  [eval step {step}] adaptive (stop > 0.5, up to T={max(out)}) | mean loops {used:.1f} | deep "
@@ -189,6 +203,33 @@ def main():
             for T, (agree, std, deep) in out.items():
                 w.writerow([step, T, round(agree, 4)] + [f"std{d}:{v:.3f}" for d, v in std.items()] + [f"deep{d}:{v:.3f}" for d, v in deep.items()])
 
+    def search_baseline():
+        """The teacher network with N Gumbel simulations (16 root candidates), greedy on the visit distribution."""
+        from phutball_env_jax import EnvConfig
+        from self_play_batched import make_transformer_recurrent_fn, transformer_mcts_policy
+        cfg = EnvConfig(rows=R, cols=C); rf = make_transformer_recurrent_fn(teacher_net, cfg); helper = NetPolicy(teacher_net, tp)
+        f = a.run_dir / "search_baseline.csv"
+        if f.exists(): say("search baseline: see search_baseline.csv"); return
+        rows_out = []
+        for n_sims in [int(x) for x in a.search_sims.split(",")]:
+            if n_sims == 0: pol = helper
+            else:
+                run = jax.jit(lambda st, r, n=n_sims: transformer_mcts_policy({"network_params": tp}, st, r, teacher_net, cfg,
+                              num_simulations=n, temperature=1.0, max_num_considered_actions=16, recurrent_fn=rf)[1])
+                class SearchPolicy:
+                    def __init__(self): self.k = jax.random.PRNGKey(0)
+                    def action(self, s):
+                        st = jax.tree_util.tree_map(lambda x: x[None], helper._jax_state(s)); self.k, r = jax.random.split(self.k)
+                        return int(np.array(run(st, r))[0].argmax())
+                pol = SearchPolicy()
+            std = chain_eval(pol, recs_std, a.eval_per_depth); deep = chain_eval(pol, recs_deep, a.eval_per_depth)
+            blocks = 6 * (n_sims + 1)
+            say(f"  [search baseline] teacher + {n_sims} sims (~{blocks} blocks/move) | standard "
+                + " ".join(f"{d}j {v:.0%}" for d, v in std.items()) + " | deep " + " ".join(f"{d}j {v:.0%}" for d, v in deep.items()))
+            rows_out.append([n_sims, blocks] + [f"std{d}:{v:.3f}" for d, v in std.items()] + [f"deep{d}:{v:.3f}" for d, v in deep.items()])
+        with open(f, "w", newline="") as fh: csv.writer(fh).writerows(rows_out)
+
+    if a.model == "looped": search_baseline()
     t0 = time.time(); acc = []; step = step0
     while step < a.steps:
         T = int(rng.choice(loops_train)) if a.model == "looped" else 0
