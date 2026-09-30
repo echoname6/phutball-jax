@@ -139,7 +139,8 @@ time). Expected: about 1.5-2 A100 hours.
 - `elo_colab.ipynb` runs it in three steps: round robin -> `elo/elo_rr.json`; PUCT-400 vs every player in parallel ->
   `elo/puct_vs_<player>.json`; refit with `--from-results` plus the PUCT games and HUMAN -> `elo/elo.json`.
 - Checks built in: every match line reports distinct games out of games played (a tiny CPU test already showed
-  duplicates at temperature 0.25; raise `--temperature` if the real run shows many). Note the ratings are at 32x16:
+  duplicates at temperature 0.25; prefer `--temperature 1.0 --open-moves 20` (sample the opening only, greedy after; notebook `TEMP`/`OPEN_MOVES`) over
+  raising the temperature for the whole game, which weakens every player). Note the ratings are at 32x16:
   checkpoint order can differ at other search budgets (it100 won its gates at 128 sims).
 - Frontend fixes are now committed locally in `~/Projects/phutball` on `tui-puzzles` (not pushed): `fbd5ca9` (App crash
   fix only, for main/dev) and `728ea4a` (worker fixes + value-head line).

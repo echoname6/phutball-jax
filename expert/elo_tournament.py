@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--out", type=Path, required=True); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=0.25, help="move sampling temperature (game variety; see the "
                     "distinct-games count in each match line)")
+    ap.add_argument("--open-moves", type=int, default=0, help="if > 0: sample at --temperature only for the first N moves "
+                    "(micro-actions) of each game, greedy after (varied openings, full-strength tactics)")
     ap.add_argument("--from-results", type=Path, default=None, help="refit from a previous --out file's games instead of "
                     "playing the round robin (add --extra-results / --human on top)")
     a = ap.parse_args()
@@ -73,7 +75,8 @@ def main():
     rf = make_transformer_recurrent_fn(net, cfg)
     policy = partial(transformer_mcts_policy, dirichlet_fraction=0.0, gumbel_scale=0.0)      # evaluation: no root noise
     kw = dict(network=net, env_config=cfg, batch_size=a.games, max_turns=a.max_turns, max_moves=2 * a.max_turns,
-              temperature=a.temperature, temp_threshold=R, temp_final=a.temperature, num_simulations=a.sims,
+              temperature=a.temperature, temp_threshold=a.open_moves if a.open_moves > 0 else R,
+              temp_final=0.0 if a.open_moves > 0 else a.temperature, num_simulations=a.sims,
               max_num_considered_actions=a.considered, random_opponent_ratio=0.0, mcts_policy_fn=policy, recurrent_fn=rf)
     play = jax.jit(lambda p, r, o: play_games_batched({"network_params": p}, r, opponent_params={"network_params": o},
                                                       opponent_ratio=1.0, **kw))

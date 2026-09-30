@@ -77,21 +77,21 @@ class PUCT:
 class Gumbel:
     """The tournament's player: Gumbel search without root noise, the move sampled from the visit-based policy at
     `temperature` (0.25 as in expert/elo_tournament.py; 0 = greedy)."""
-    def __init__(self, net, params, net_policy, sims, considered, rows=21, cols=15, temperature=0.25, seed=0):
+    def __init__(self, net, params, net_policy, sims, considered, rows=21, cols=15, temperature=0.25, seed=0, open_moves=0):
         import jax
         from phutball_env_jax import EnvConfig
         from self_play_batched import make_transformer_recurrent_fn, transformer_mcts_policy
         cfg = EnvConfig(rows=rows, cols=cols); rf = make_transformer_recurrent_fn(net, cfg)
-        self.jax, self.np, self.t = jax, net_policy, temperature; self.k = jax.random.PRNGKey(seed)
+        self.jax, self.np, self.t, self.open = jax, net_policy, temperature, open_moves; self.k = jax.random.PRNGKey(seed)
         self.rs = np.random.default_rng(seed)
         self.run = jax.jit(lambda st, r: transformer_mcts_policy({"network_params": params}, st, r, net, cfg, num_simulations=sims,
                                                                  temperature=1.0, max_num_considered_actions=considered,
                                                                  recurrent_fn=rf, dirichlet_fraction=0.0, gumbel_scale=0.0)[1])
 
-    def action(self, s):
+    def action(self, s, move_idx=0):
         st = self.jax.tree_util.tree_map(lambda x: x[None], self.np._jax_state(s)); self.k, r = self.jax.random.split(self.k)
         w = np.array(self.run(st, r), np.float64)[0]
-        if self.t <= 0: return int(w.argmax())
+        if self.t <= 0 or (self.open > 0 and move_idx >= self.open): return int(w.argmax())
         z = np.log(w + 1e-12) / self.t; q = np.exp(z - z.max()); q /= q.sum()
         return int(self.rs.choice(len(q), p=q))
 
@@ -108,6 +108,8 @@ def main():
                     help="random centre placements before play (default 0: the empty board, as in the round robin and the browser)")
     ap.add_argument("--temperature", type=float, default=0.25, help="Gumbel side's move sampling (the round robin's)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--open-moves", type=int, default=0, help="if > 0: the Gumbel side samples only for the first N moves "
+                    "(micro-actions) of the game, greedy after (as elo_tournament --open-moves)")
     a = ap.parse_args()
     import jax
     if not hasattr(jax.core, "get_opaque_trace_state"):
@@ -125,10 +127,12 @@ def main():
         sims = int(a.gumbel_sims.split(",")[0])
         for spec in a.opponent:
             name, path = spec.split("=", 1); d2 = pickle.load(open(path, "rb")); p2 = d2.get("params", d2)
-            matchups.append((name, Gumbel(net, p2, NetPolicy(net, p2), sims, a.considered, temperature=a.temperature, seed=a.seed), sims))
+            matchups.append((name, Gumbel(net, p2, NetPolicy(net, p2), sims, a.considered, temperature=a.temperature,
+                                          seed=a.seed, open_moves=a.open_moves), sims))
     else:
         for sims in [int(x) for x in a.gumbel_sims.split(",")]:
-            matchups.append((f"gumbel{sims}", Gumbel(net, params, npol, sims, a.considered, temperature=a.temperature, seed=a.seed), sims))
+            matchups.append((f"gumbel{sims}", Gumbel(net, params, npol, sims, a.considered, temperature=a.temperature,
+                                                    seed=a.seed, open_moves=a.open_moves), sims))
     games_out = []
     for label, gum, sims in matchups:
         sc = 0.0; w = l = 0; t0 = time.time(); seqs = set()
@@ -139,7 +143,7 @@ def main():
                 s = step(s, rng.choice([x for x in legal_actions(s) if x < 315 and 6 * 15 <= x < 15 * 15]))
             moves = []
             while not s.winner and s.turns < a.max_turns:
-                mv = (puct if s.player == puct_side else gum).action(s); moves.append(mv); s = step(s, mv)
+                mv = puct.action(s) if s.player == puct_side else gum.action(s, len(moves)); moves.append(mv); s = step(s, mv)
             seqs.add((puct_side,) + tuple(moves))
             r = 0.5 if not s.winner else (1.0 if s.winner == puct_side else 0.0); sc += r; w += r == 1.0; l += r == 0.0
             games_out.append([a.name, label, r])
