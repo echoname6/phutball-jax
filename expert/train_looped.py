@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--replay", type=Path, default=None, help="self-play replay buffer (buffers_21x15.npz): its MCTS visit "
                     "distributions and game results replace the teacher-labelled expert games (distil the SEARCH, not the net)")
     ap.add_argument("--search-sims", default="0,8,32,128", help="baseline: the teacher network with this many Gumbel sims")
+    ap.add_argument("--baseline-only", action="store_true", help="measure the search baseline, then exit")
     a = ap.parse_args(); a.run_dir.mkdir(parents=True, exist_ok=True)
     logf = open(a.run_dir / "train.log", "a")
 
@@ -217,14 +218,15 @@ def main():
         from phutball_env_jax import EnvConfig
         from self_play_batched import make_transformer_recurrent_fn, transformer_mcts_policy
         cfg = EnvConfig(rows=R, cols=C); rf = make_transformer_recurrent_fn(teacher_net, cfg); helper = NetPolicy(teacher_net, tp)
-        f = a.run_dir / "search_baseline.csv"
+        f = a.run_dir / "search_baseline_nonoise.csv"
         if f.exists(): say("search baseline: see search_baseline.csv"); return
         rows_out = []
         for n_sims in [int(x) for x in a.search_sims.split(",")]:
             if n_sims == 0: pol = helper
             else:
                 run = jax.jit(lambda st, r, n=n_sims: transformer_mcts_policy({"network_params": tp}, st, r, teacher_net, cfg,
-                              num_simulations=n, temperature=1.0, max_num_considered_actions=16, recurrent_fn=rf)[1])
+                              num_simulations=n, temperature=1.0, max_num_considered_actions=16, recurrent_fn=rf,
+                              dirichlet_fraction=0.0, gumbel_scale=0.0)[1])      # evaluation: no root exploration noise
                 class SearchPolicy:
                     def __init__(self): self.k = jax.random.PRNGKey(0)
                     def action(self, s):
@@ -233,12 +235,13 @@ def main():
                 pol = SearchPolicy()
             std = chain_eval(pol, recs_std, a.eval_per_depth); deep = chain_eval(pol, recs_deep, a.eval_per_depth)
             blocks = 6 * (n_sims + 1)
-            say(f"  [search baseline] teacher + {n_sims} sims (~{blocks} blocks/move) | standard "
+            say(f"  [search baseline, no root noise] teacher + {n_sims} sims (~{blocks} blocks/move) | standard "
                 + " ".join(f"{d}j {v:.0%}" for d, v in std.items()) + " | deep " + " ".join(f"{d}j {v:.0%}" for d, v in deep.items()))
             rows_out.append([n_sims, blocks] + [f"std{d}:{v:.3f}" for d, v in std.items()] + [f"deep{d}:{v:.3f}" for d, v in deep.items()])
         with open(f, "w", newline="") as fh: csv.writer(fh).writerows(rows_out)
 
     if a.model == "looped" and a.search_sims.strip(): search_baseline()      # --search-sims "" skips it (measured once)
+    if a.baseline_only: say("baseline only: done"); return
     t0 = time.time(); acc = []; step = step0
     while step < a.steps:
         T = int(rng.choice(loops_train)) if a.model == "looped" else 0

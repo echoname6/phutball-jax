@@ -381,9 +381,11 @@ def transformer_mcts_policy(
     dirichlet_fraction: float = 0.25,
     max_num_considered_actions: int = 32,
     recurrent_fn=None,
+    gumbel_scale: float = 1.0,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Get MCTS-improved policy for a batch of states using Transformer (no batch_stats).
+    For evaluation pass dirichlet_fraction=0.0 and gumbel_scale=0.0 (no root exploration noise).
 
     Returns:
         actions: (batch,) selected actions
@@ -449,7 +451,7 @@ def transformer_mcts_policy(
         recurrent_fn=recurrent_fn,
         num_simulations=num_simulations,
         max_num_considered_actions=max_num_considered_actions,
-        gumbel_scale=1.0,
+        gumbel_scale=gumbel_scale,
     )
 
     mcts_policy = policy_output.action_weights
