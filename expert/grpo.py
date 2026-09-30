@@ -10,7 +10,7 @@ player (+1 / -1), and whether the slot was still playing.
 
 Update (make_update): per group, RLOO advantage A_i = r_i - mean_{j != i} r_j. Every move of rollout i gets weight
 A_i * side (zero-sum: the opponent's moves get the negated advantage), so both sides' moves are trained. Loss =
-policy gradient (moves sampled from informative groups only) + value MSE on the rollout results + kl_final *
+PPO-clipped policy gradient (ratio to the rollout-time policy) (moves sampled from informative groups only) + value MSE on the rollout results + kl_final *
 KL(anchor || model) on rollout states + puz_w * (puzzle CE + kl_puz * KL(puzzle model || model)).
 """
 from __future__ import annotations
@@ -80,7 +80,7 @@ def rloo(reward, G):
     return (r - (tot - r) / (G - 1)).reshape(-1)
 
 
-def make_update(net, optimizer, K: int, M: int):
+def make_update(net, optimizer, K: int, M: int, clip_eps: float = 0.2):
     """Returns build(G) -> jitted update: K optimizer steps (one lax.scan) on one rollout batch with groups of G,
     each step M policy-gradient moves (from informative groups) + M value moves + one puzzle minibatch."""
     import jax
@@ -94,6 +94,7 @@ def make_update(net, optimizer, K: int, M: int):
         @jax.jit
         def update(p, o, anchor, pref, recs, reward, rng, puz, kl_final, kl_puz, puz_w):
             H, S = recs["act"].shape
+            p_old = jax.lax.stop_gradient(p)                       # the policy the rollouts were collected under
             adv = rloo(reward, G)
             obs = recs["obs"].reshape((H * S,) + recs["obs"].shape[2:])
             act = recs["act"].reshape(-1); side = recs["side"].reshape(-1); active = recs["active"].reshape(-1)
@@ -107,7 +108,12 @@ def make_update(net, optimizer, K: int, M: int):
                 x = obs[ipg].astype(jnp.float32)
                 logits, _ = net.apply({"params": p}, x, train=True); logp = jax.nn.log_softmax(logits)
                 lp_a = jnp.take_along_axis(logp, act[ipg][:, None], 1)[:, 0]
-                pg = -jnp.mean(w[ipg] * lp_a)
+                # PPO-style clipped surrogate against the rollout-time policy: many steps on one batch cannot move
+                # the policy far (plain REINFORCE for 50 steps collapsed it: KL to the anchor 0.56 after 150 steps)
+                ol = jax.lax.stop_gradient(net.apply({"params": p_old}, x, train=False)[0])
+                lp_old = jnp.take_along_axis(jax.nn.log_softmax(ol), act[ipg][:, None], 1)[:, 0]
+                ratio = jnp.exp(lp_a - lp_old); adv = w[ipg]
+                pg = -jnp.mean(jnp.minimum(ratio * adv, jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv))
                 al = jax.lax.stop_gradient(net.apply({"params": anchor}, x, train=False)[0]); klf = kl(al, logp)
                 _, v = net.apply({"params": p}, obs[iv].astype(jnp.float32), train=True)
                 val = jnp.mean(jnp.square(v - vt[iv]))
@@ -119,7 +125,9 @@ def make_update(net, optimizer, K: int, M: int):
                 klp = kl(prl, plp)
                 ent = -jnp.mean(jnp.sum(jnp.exp(logp) * logp, -1))
                 tot = pg + val + kl_final * klf + puz_w * (pce + pval + kl_puz * klp)
-                return tot, {"pg": pg, "value": val, "kl_final": klf, "puzzle_ce": pce, "puzzle_kl": klp, "entropy": ent}
+                clipped = jnp.mean((jnp.abs(ratio - 1.0) > clip_eps).astype(jnp.float32))
+                return tot, {"pg": pg, "value": val, "kl_final": klf, "puzzle_ce": pce, "puzzle_kl": klp, "entropy": ent,
+                             "clipped": clipped}
 
             def one(carry, xs):
                 p, o = carry; r, pb = xs

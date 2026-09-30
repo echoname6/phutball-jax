@@ -57,7 +57,7 @@ def main():
     ap.add_argument("--width", type=int, default=128); ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--members", type=int, default=4); ap.add_argument("--slots", type=int, default=1024)
     ap.add_argument("--horizon", type=int, default=80); ap.add_argument("--updates", type=int, default=3)
-    ap.add_argument("--steps", type=int, default=50, help="optimizer steps per rollout batch")
+    ap.add_argument("--steps", type=int, default=16, help="optimizer steps per rollout batch")
     ap.add_argument("--moves", type=int, default=256, help="policy-gradient (and value) moves per step")
     ap.add_argument("--puzzles", type=int, default=64, help="puzzle positions per step")
     ap.add_argument("--kl-puz", type=float, default=0.5)
@@ -106,7 +106,7 @@ def main():
         init = pickle.load(open(a.init, "rb"))["params"]
         members = []
         for i in range(a.members):
-            g = {"lr": 1e-4 * rng_py.choice((0.5, 1.0, 2.0)), "tau": rng_py.choice((0.8, 1.0, 1.2)),
+            g = {"lr": 2e-5 * rng_py.choice((0.5, 1.0, 2.0)), "tau": rng_py.choice((0.8, 1.0, 1.2)),
                  "sims": SIMS[i % len(SIMS)], "G": GS[i % len(GS)], "kl_final": rng_py.choice((0.1, 0.2, 0.4)),
                  "puz_w": rng_py.choice((0.1, 0.2, 0.3)), "depth": rng_py.choice((0, 10, 20))}
             members.append({"id": i, "params": init, "opt": optimizer.init(init), "genes": g, "fit": [], "lineage": [i]})
@@ -198,6 +198,9 @@ def main():
         say(f"=== round {R_} | anchor #{S_['anchor_k']} | start pool {len(pool_mv):,} positions (moves in game: median "
             f"{int(np.median(pool_mv))}, max {int(pool_mv.max())})")
         for mem in S_["members"]:
+            c = control()                                   # also checked between members, not only between rounds
+            if c.get("stop"): save(); clear_flag("stop"); say("stop requested: saved, exiting"); return 0
+            if c.get("reload"): save(); clear_flag("reload"); say("reload requested: saved, exiting 3"); sys.exit(3)
             g = mem["genes"]; t0 = time.time(); G = g["G"]; B = a.slots // G
             mem["opt"].hyperparams["learning_rate"] = jnp.float32(g["lr"])
             roll, upd = rollout_fn(G, g["sims"]), update_fn(G); stats_acc = []; fin_acc = []
@@ -216,7 +219,7 @@ def main():
             mem["fit"].append(fit); mem["last"] = (fit, w, l)
             say(f"  member {mem['id']} (lineage {'>'.join(map(str, mem['lineage'][-4:]))}) | lr {g['lr']:.1e} tau {g['tau']:.2f} "
                 f"search {g['sims']}x8 G {G} kl {g['kl_final']:.2f} puz {g['puz_w']:.2f} depth {g['depth']} | pg {ms['pg']:+.3f} "
-                f"value {ms['value']:.3f} kl-anchor {ms['kl_final']:.3f} entropy {ms['entropy']:.2f} | informative groups "
+                f"value {ms['value']:.3f} kl-anchor {ms['kl_final']:.3f} entropy {ms['entropy']:.2f} clipped {ms['clipped']:.0%} | informative groups "
                 f"{ms['informative_groups']:.0%}, finished {fin:.0%} | vs anchor #{S_['anchor_k']}: {fit:.1%} ({w}W {l}L "
                 f"{2 * a.eval_games - w - l}D) | {time.time() - t0:.0f}s")
             log.writerow([R_, mem["id"], ">".join(map(str, mem["lineage"])), g["lr"], g["tau"], g["sims"], G, g["kl_final"],
