@@ -238,7 +238,7 @@ def main():
             rows_out.append([n_sims, blocks] + [f"std{d}:{v:.3f}" for d, v in std.items()] + [f"deep{d}:{v:.3f}" for d, v in deep.items()])
         with open(f, "w", newline="") as fh: csv.writer(fh).writerows(rows_out)
 
-    if a.model == "looped": search_baseline()
+    if a.model == "looped" and a.search_sims.strip(): search_baseline()      # --search-sims "" skips it (measured once)
     t0 = time.time(); acc = []; step = step0
     while step < a.steps:
         T = int(rng.choice(loops_train)) if a.model == "looped" else 0
