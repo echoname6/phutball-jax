@@ -130,16 +130,19 @@ time). Expected: about 1.5-2 A100 hours.
 ## Grounding the owner's play
 
 - Plan: 10 games against the self-play final in the browser at 400 playouts, 5 as P1 and 5 as P2 (P1 wins about 55% in
-  self-play, so the colours must be balanced). Ten games give a rough placement (about +/-200 Elo).
-- Problem: the browser search (PUCT-400) differs from the tournament's (Gumbel 32x16), so a result against the browser
-  opponent is not directly on the tournament scale.
-- Fix: `expert/puct_calibration.py` (last cell of `elo_colab.ipynb`) plays the same network with PUCT-400 against
-  Gumbel 32/64/128x16, 10 games each (one process per budget, about 45-60 min), and converts each score to an Elo gap
-  (about +/-150 with 10 games). Output: `phutball/elo/puct_vs_gumbel{32,64,128}.json`.
-- To finish: rating(final with PUCT-400) = rating(it100 at 32x16) + gap(PUCT-400 vs Gumbel-32); then the owner's record
-  goes in the notebook's `HUMAN` list (`"you:W-L-D vs it100"`) and the tournament fit is rerun. The `--human` option
-  treats those games as games against it100 at 32x16, so apply the calibration gap to the owner's rating afterwards
-  (or add a separate "it100-puct400" player).
+  self-play). About +/-200 Elo from 10 games. The browser bot is deterministic (greedy PUCT), so a winning line can be
+  replayed: count repeated games once, or vary the opening.
+- The browser opponent is rated as its own player, "it100-puct400": `expert/puct_calibration.py --opponent` plays the
+  final with PUCT-400 against every round-robin player at Gumbel 32x16 (5 games per colour each, random 2-stone openings
+  so repeated games differ), and those games merge into the fit (`--extra-results`). The owner's games go in as
+  `--human "you:W-L-D vs it100-puct400"`, so no separate calibration gap is needed.
+- `elo_colab.ipynb` runs it in three steps: round robin -> `elo/elo_rr.json`; PUCT-400 vs every player in parallel ->
+  `elo/puct_vs_<player>.json`; refit with `--from-results` plus the PUCT games and HUMAN -> `elo/elo.json`.
+- Checks built in: every match line reports distinct games out of games played (a tiny CPU test already showed
+  duplicates at temperature 0.25; raise `--temperature` if the real run shows many). Note the ratings are at 32x16:
+  checkpoint order can differ at other search budgets (it100 won its gates at 128 sims).
+- Frontend fixes are now committed locally in `~/Projects/phutball` on `tui-puzzles` (not pushed): `fbd5ca9` (App crash
+  fix only, for main/dev) and `728ea4a` (worker fixes + value-head line).
 
 ## Open ideas, not started
 
