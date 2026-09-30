@@ -36,7 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 SIMS = [8, 16, 32]; GS = [8, 16]
 BOUNDS = {"lr": (1e-6, 1e-3), "tau": (0.3, 2.0), "kl_final": (0.01, 2.0), "puz_w": (0.02, 1.0), "depth": (0, 60)}
-HOT = ("updates", "eval_games", "horizon", "ratchet")
+HOT = ("updates", "eval_games", "horizon", "ratchet", "eval_max_turns")
 
 
 def perturb(genes, rng):
@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--kl-puz", type=float, default=0.5)
     ap.add_argument("--pool-chunks", type=int, default=4); ap.add_argument("--pool-sims", type=int, default=16)
     ap.add_argument("--eval-games", type=int, default=64); ap.add_argument("--eval-sims", type=int, default=64)
+    ap.add_argument("--eval-max-turns", type=int, default=360, help="fitness games past this many turns are draws")
     ap.add_argument("--ratchet", type=float, default=0.6); ap.add_argument("--rounds", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args(); a.run_dir.mkdir(parents=True, exist_ok=True)
@@ -141,9 +142,9 @@ def main():
 
     match_fns = {}
     def match(p, opp, rng):
-        n = a.eval_games; key = n
+        n = a.eval_games; Te = min(T, a.eval_max_turns); key = (n, Te)
         if key not in match_fns:
-            kw = dict(network=net, env_config=cfg, batch_size=n, max_turns=T, max_moves=2 * T, temperature=0.25,
+            kw = dict(network=net, env_config=cfg, batch_size=n, max_turns=Te, max_moves=2 * Te, temperature=0.25,
                       temp_threshold=a.rows, temp_final=0.25, num_simulations=a.eval_sims, max_num_considered_actions=16,
                       random_opponent_ratio=0.0, mcts_policy_fn=transformer_mcts_policy,
                       recurrent_fn=make_transformer_recurrent_fn(net, cfg))
@@ -216,7 +217,8 @@ def main():
             say(f"  member {mem['id']} (lineage {'>'.join(map(str, mem['lineage'][-4:]))}) | lr {g['lr']:.1e} tau {g['tau']:.2f} "
                 f"search {g['sims']}x8 G {G} kl {g['kl_final']:.2f} puz {g['puz_w']:.2f} depth {g['depth']} | pg {ms['pg']:+.3f} "
                 f"value {ms['value']:.3f} kl-anchor {ms['kl_final']:.3f} entropy {ms['entropy']:.2f} | informative groups "
-                f"{ms['informative_groups']:.0%}, finished {fin:.0%} | vs anchor #{S_['anchor_k']}: {fit:.1%} ({w}W {l}L) | {time.time() - t0:.0f}s")
+                f"{ms['informative_groups']:.0%}, finished {fin:.0%} | vs anchor #{S_['anchor_k']}: {fit:.1%} ({w}W {l}L "
+                f"{2 * a.eval_games - w - l}D) | {time.time() - t0:.0f}s")
             log.writerow([R_, mem["id"], ">".join(map(str, mem["lineage"])), g["lr"], g["tau"], g["sims"], G, g["kl_final"],
                           g["puz_w"], g["depth"], round(ms["pg"], 4), round(ms["value"], 4), round(ms["kl_final"], 4),
                           round(ms["puzzle_ce"], 4), round(ms["entropy"], 3), round(ms["informative_groups"], 3), round(fin, 3),
