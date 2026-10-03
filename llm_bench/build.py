@@ -7,6 +7,11 @@
           win remains). Answer: a winning jump sequence (checked by replay) or NO WIN.
   forced  Unstoppable threat (expert/puzzle_place.make_forced): every placement after which the side to move wins next
           turn whatever the opponent does. The answer set is complete (all placements are checked).
+  block   Pure-placement block (make_block): the opponent threatens a winning jump chain and no defending jump exists;
+          every placement that leaves them no winning chain (complete).
+  prevent Denial (make_prevent): stop an unstoppable threat one turn early, by a placement (complete set) or a jump
+          sequence (checked by replay + the engine: the attacker must have neither a winning chain nor an unstoppable
+          placement afterwards).
 
 Fresh puzzles use seed --seed (training pools used 0-3). Output: llm_bench/data/bench.jsonl, one item per line.
 
@@ -28,7 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from expert.engine import State  # noqa: E402
 from expert.puzzle_data import CELLS, Generator  # noqa: E402
-from expert.puzzle_place import CAP_DROPS, CapHit, make_forced, make_threat  # noqa: E402
+from expert.puzzle_place import CAP_DROPS, CapHit, make_block, make_forced, make_prevent, make_threat  # noqa: E402
 from llm_bench.text import prompt, sq  # noqa: E402
 
 
@@ -41,6 +46,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--per-difficulty", type=int, default=25, help="win positives per shortest-win length 1..4")
     ap.add_argument("--negatives", type=int, default=100); ap.add_argument("--forced", type=int, default=100)
+    ap.add_argument("--block", type=int, default=100); ap.add_argument("--prevent", type=int, default=100)
     ap.add_argument("--seed", type=int, default=9001); ap.add_argument("--out", type=Path, default=ROOT / "llm_bench/data/bench.jsonl")
     a = ap.parse_args(); t0 = time.time(); rng = random.Random(a.seed); items = []
 
@@ -54,8 +60,8 @@ def main():
                               {"difficulty": d, "family": str(r["family"]), "source": "puzzle_eval"}, len(items)))
     n_pos = len(items)
 
-    gen = Generator(seed=a.seed); cells = [c for c in CELLS if c[1] <= 3]; tries = 0; neg = forced = 0
-    while neg < a.negatives or forced < a.forced:
+    gen = Generator(seed=a.seed); cells = [c for c in CELLS if c[1] <= 3]; tries = 0; neg = forced = block = prevent = 0
+    while neg < a.negatives or forced < a.forced or block < a.block or prevent < a.prevent:
         base = gen.puzzle(cells[tries % len(cells)]); tries += 1
         if base is None: continue
         if neg < a.negatives:
@@ -68,6 +74,23 @@ def main():
                 items.append(item("win", s, {"win": False}, {"source": "near-miss threat", **{k: int(v) for k, v in meta.items()}}, len(items)))
                 neg += 1
                 continue
+        if block < a.block:
+            r = make_block(base)
+            if r:
+                s, tw, meta = r
+                items.append(item("block", s, {"placements": sorted(sq(p, s.cols) for p in tw)},
+                                  {"source": "make_block", **{k: int(v) for k, v in meta.items()}}, len(items)))
+                block += 1
+                continue
+        if prevent < a.prevent and tries % 2 == 0:
+            r = make_prevent(base, rng)
+            if r:
+                s, pl, jl, meta = r
+                items.append(item("prevent", s, {"placements": sorted(sq(p, s.cols) for p in pl),
+                                                 "saving_first_jumps": sorted(sq(l, s.cols) for l in jl)},
+                                  {"source": "make_prevent", **{k: int(v) for k, v in meta.items()}}, len(items)))
+                prevent += 1
+                continue
         if forced < a.forced:
             r = make_forced(base, rng)
             if r:
@@ -78,10 +101,12 @@ def main():
     a.out.parent.mkdir(parents=True, exist_ok=True)
     with open(a.out, "w") as f:
         for it in items: f.write(json.dumps(it) + "\n")
-    c = Counter((it["task"], it["answers"].get("win", "forced")) for it in items)
-    print(f"{len(items)} items ({n_pos} win positives, {neg} near-miss negatives, {forced} forced) from {tries} bases in "
+    c = Counter((it["task"], it["answers"]["win"]) if it["task"] == "win" else it["task"] for it in items)
+    print(f"{len(items)} items ({n_pos} win positives, {neg} near-miss negatives, {forced} forced, {block} block, {prevent} prevent) from {tries} bases in "
           f"{time.time() - t0:.0f}s; {dict(c)}; dropped for a search cap: {CAP_DROPS[0]} -> {a.out}")
-    print("median forced answer-set size:", float(np.median([len(it["answers"]["placements"]) for it in items if it["task"] == "forced"] or [0])))
+    for t in ("forced", "block", "prevent"):
+        sizes = [len(it["answers"]["placements"]) for it in items if it["task"] == t]
+        if sizes: print(f"median {t} correct-placement count: {float(np.median(sizes))}")
 
 
 if __name__ == "__main__":

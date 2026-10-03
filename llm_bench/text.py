@@ -72,6 +72,14 @@ PROMPTS = {
     "win": ("{pos}\n\nQuestion: can Player {p} win THIS turn by jumping? If yes, give one complete winning sequence of "
             "jumps as its landing squares, in order. If no sequence of jumps wins this turn, say so.\n"
             "End your reply with one line, exactly in one of these forms:\nANSWER: JUMP <square> <square> ...\nANSWER: NO WIN"),
+    "block": ("{pos}\n\nQuestion: it is Player {p}'s turn. Player {o} threatens to win on their next turn by jumping, and "
+              "Player {p} has no jump that defends. Find a placement for Player {p} after which Player {o} has no winning "
+              "sequence of jumps.\nEnd your reply with one line, exactly:\nANSWER: PLACE <square>"),
+    "prevent": ("{pos}\n\nQuestion: it is Player {p}'s turn. If Player {p} does nothing useful, Player {o} can place a man "
+                "that creates an unstoppable threat (a win next turn whatever Player {p} does). Find a move for Player {p} after "
+                "which Player {o} has neither a winning sequence of jumps nor such an unstoppable placement. The move may be a "
+                "placement, or a sequence of jumps (the turn ends where your sequence stops).\nEnd your reply with one line, "
+                "exactly in one of these forms:\nANSWER: PLACE <square>\nANSWER: JUMP <square> <square> ..."),
     "forced": ("{pos}\n\nQuestion: Player {p} cannot win this turn. Find a placement after which Player {p} is guaranteed to "
                "win on their next turn, whatever the opponent does in between (the opponent may place a man anywhere or "
                "jump the ball).\nEnd your reply with one line, exactly:\nANSWER: PLACE <square>"),
@@ -79,7 +87,7 @@ PROMPTS = {
 
 
 def prompt(task: str, s: State) -> str:
-    return PROMPTS[task].format(pos=position_text(s), p=s.player)
+    return PROMPTS[task].format(pos=position_text(s), p=s.player, o=3 - s.player)
 
 
 ANS_RE = re.compile(r"ANSWER:\s*(.+)", re.IGNORECASE)
@@ -96,6 +104,22 @@ def parse_answer(reply: str):
     if body.startswith("jump"): return "jump", toks
     if body.startswith("place") and toks: return "place", toks[0]
     return None, None
+
+
+def replay_jumps(s: State, squares: list[str]):
+    """Replay a turn of jumps that may stop anywhere. Returns (board, ball, winner_or_0, error)."""
+    rows, cols = s.rows, s.cols; board, ball = s.board[:], s.ball
+    for k, t in enumerate(squares):
+        land = parse_sq(t, rows, cols)
+        if land is None: return None, None, 0, f"bad square {t!r}"
+        jl = dict(jump_landings(board, ball, rows, cols))
+        if land not in jl: return None, None, 0, f"illegal jump {k + 1} to {t}"
+        board[ball] = 0
+        for j in jl[land]: board[j] = 0
+        board[land] = BALL; ball = land
+        w = winner_at(rows, land // cols)
+        if w: return board, ball, w, None
+    return board, ball, 0, None
 
 
 def check_win_sequence(s: State, squares: list[str]):

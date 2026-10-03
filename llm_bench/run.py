@@ -12,7 +12,8 @@ API provider. Chat mode for instruct/thinking models; --completions for base mod
   python -m llm_bench.run --base-url http://localhost:8000/v1 --model Qwen/Qwen3.5-9B-Base --completions
 
 Scoring: win positives: correct if the reply's jump sequence wins when replayed (any winning sequence counts);
-win negatives: correct if NO WIN; forced: correct if the placement is one of the (complete) unstoppable placements.
+win negatives: correct if NO WIN; forced / block: correct if the placement is in the (complete) answer set; prevent: a
+placement in the complete set, or a jump sequence after which the engine finds no attacker win or unstoppable placement.
 Results: llm_bench/results/<name>.jsonl (every reply) and a summary printed and saved as <name>.summary.json.
 """
 from __future__ import annotations
@@ -32,7 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from expert.engine import BALL, MAN, State, jump_landings  # noqa: E402
-from llm_bench.text import check_win_sequence, parse_answer, sq  # noqa: E402
+from llm_bench.text import check_win_sequence, parse_answer, replay_jumps, sq  # noqa: E402
 
 
 def call(a, prompt_text: str) -> dict:
@@ -87,9 +88,20 @@ def score(it: dict, reply: str) -> dict:
             ok, why = check_win_sequence(s, val)
             return {"correct": False, "outcome": "claimed a win (BUG: engine says none)" if ok else f"claimed a win: {why}"}
         return {"correct": False, "outcome": "wrong answer type"}
+    if it["task"] == "prevent" and kind == "jump" and val:
+        from expert.puzzle_place import CapHit, attacker_threatens
+        board, ball, w, err = replay_jumps(s, val)
+        if err: return {"correct": False, "outcome": err}
+        if w: return {"correct": w == s.player, "outcome": "jumps into a goal: " + ("wins" if w == s.player else "loses")}
+        try:
+            saved = not attacker_threatens(State(s.rows, s.cols, board, ball, 3 - s.player))
+        except CapHit:
+            return {"correct": False, "outcome": "unverifiable (search cap)"}
+        return {"correct": saved, "outcome": "saving jump sequence" if saved else "jump sequence does not stop the threat"}
     if kind != "place": return {"correct": False, "outcome": "wrong answer type"}
     ok = val in it["answers"]["placements"]
-    return {"correct": ok, "outcome": "unstoppable" if ok else "not unstoppable"}
+    good = {"forced": "unstoppable", "block": "blocks", "prevent": "saving placement"}[it["task"]]
+    return {"correct": ok, "outcome": good if ok else "not " + good}
 
 
 def main():
@@ -101,7 +113,7 @@ def main():
                     help="Qwen thinking switch (true/false); omitted = the server's default")
     ap.add_argument("--max-tokens", type=int, default=4096); ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--timeout", type=float, default=600); ap.add_argument("--concurrency", type=int, default=8)
-    ap.add_argument("--limit", type=int, default=0); ap.add_argument("--tasks", default="win,forced")
+    ap.add_argument("--limit", type=int, default=0); ap.add_argument("--tasks", default="win,forced,block,prevent")
     ap.add_argument("--baseline", choices=["nowin", "random"], default=None, help="no model: a scoring sanity check")
     ap.add_argument("--name", default=None); ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -130,8 +142,9 @@ def main():
         if row["task"] == "win":
             key = f"win: {'positive, ' + str(row['meta']['difficulty']) + '-jump' if row['answers']['win'] else 'near-miss negative'}"
         else:
-            key = "forced placement"
-        groups[key].append(row); groups["win (all)" if row["task"] == "win" else "forced (all)"].append(row)
+            key = f"{row['task']} placement"
+        groups[key].append(row)
+        if row["task"] == "win": groups["win (all)"].append(row)
     summary = {}
     print(f"\n{name}: {len(rows)} items in {time.time() - t0:.0f}s")
     for key in sorted(groups):
