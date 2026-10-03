@@ -8,3 +8,4 @@ venv/
 .venv/
 *.egg-info/
 expert_data/
+llm_bench/results/
