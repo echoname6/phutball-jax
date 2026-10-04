@@ -53,6 +53,23 @@ def build_config(GRPOConfig, want: dict):
     return GRPOConfig(**cfg)
 
 
+def find_llm(obj, depth: int = 0, seen=None):
+    """The vllm.LLM engine TRL created for colocate mode (attribute names change between TRL releases)."""
+    import vllm
+    seen = seen if seen is not None else set()
+    if id(obj) in seen or depth > 3: return None
+    seen.add(id(obj))
+    if isinstance(obj, vllm.LLM): return obj
+    for v in (vars(obj).values() if hasattr(obj, "__dict__") else []):
+        if isinstance(v, (str, int, float, bool, bytes)) or v is None: continue
+        try:
+            r = find_llm(v, depth + 1, seen)
+        except Exception:                                               # noqa: BLE001
+            r = None
+        if r is not None: return r
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen3.5-9B")
@@ -61,12 +78,14 @@ def main():
     ap.add_argument("--cap", type=int, default=6144, help="max completion (thinking + answer) tokens")
     ap.add_argument("--prompts", type=int, default=4, help="puzzles per optimizer step")
     ap.add_argument("--gens", type=int, default=8, help="samples per puzzle (the GRPO group)")
-    ap.add_argument("--micro", type=int, default=2, help="completions per forward/backward pass")
+    ap.add_argument("--micro", type=int, default=1, help="completions per forward/backward pass (vLLM stays resident when forcing)")
     ap.add_argument("--lr", type=float, default=2e-5); ap.add_argument("--rank", type=int, default=32)
     ap.add_argument("--hours", type=float, default=2.5, help="stop (and save) after this much training time")
     ap.add_argument("--max-steps", type=int, default=1000); ap.add_argument("--save-every", type=int, default=5)
     ap.add_argument("--vllm-mem", type=float, default=0.35); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--mix", default="", help="subtask keep-probabilities, e.g. prevent=0.5,block=0.7")
+    ap.add_argument("--force-credit", type=float, default=0.75,
+                    help="credit for a correct budget-forced answer on a cut-off rollout (0: off)")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -93,7 +112,8 @@ def main():
         num_generations=a.gens, max_prompt_length=1536, max_completion_length=a.cap,
         temperature=1.0, top_p=1.0, beta=0.0, loss_type="dr_grpo", scale_rewards=False,
         mask_truncated_completions=False,                               # truncation is penalised, not hidden
-        use_vllm=True, vllm_mode="colocate", vllm_gpu_memory_utilization=a.vllm_mem, vllm_enable_sleep_mode=True,
+        use_vllm=True, vllm_mode="colocate", vllm_gpu_memory_utilization=a.vllm_mem,
+        vllm_enable_sleep_mode=not a.force_credit,                      # forcing needs the engine awake at reward time
         vllm_max_model_length=1536 + a.cap + 64,
         gradient_checkpointing=True, max_steps=a.max_steps, save_steps=a.save_every, save_total_limit=2,
         chat_template_kwargs={"enable_thinking": True}, model_init_kwargs={"torch_dtype": torch.bfloat16},
@@ -105,7 +125,7 @@ def main():
     except TypeError:
         lora = LoraConfig(**lora_kw)
 
-    reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"))
+    reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit)
 
     class TimeLimit(transformers.TrainerCallback):
         def __init__(self): self.t0 = time.time()
@@ -120,6 +140,19 @@ def main():
 
     trainer = GRPOTrainer(model=a.model, reward_funcs=[reward], args=cfg, train_dataset=data, peft_config=lora,
                           callbacks=[TimeLimit()])
+    if a.force_credit:
+        llm = find_llm(trainer)
+        tok = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
+        tok = getattr(tok, "tokenizer", tok)                            # a processor wraps the tokenizer
+        if llm is None or tok is None:
+            print("WARNING: no vLLM engine / tokenizer found: budget forcing OFF", flush=True); reward.force_credit = 0
+        else:
+            from vllm import SamplingParams
+            sp = SamplingParams(max_tokens=12, temperature=0.0)
+            reward.forcer = lambda raws: [o.outputs[0].text for o in llm.generate(raws, sp, use_tqdm=False)]
+            reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                                   enable_thinking=True)
+            print("budget forcing ON (vLLM engine found)", flush=True)
     ckpts = sorted(a.out.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1]))
     trainer.train(resume_from_checkpoint=str(ckpts[-1]) if ckpts else None)
     trainer.save_model(str(a.out / "final"))
