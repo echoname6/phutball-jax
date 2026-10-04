@@ -166,6 +166,13 @@ def salvage(a, items_by_id: dict):
     summarize(rows, a.salvage + "-forced", "forced_correct", "forced_outcome", time.time())
 
 
+def wilson(k: int, n: int, z: float = 1.96):
+    """95% Wilson score interval for k successes in n."""
+    if n == 0: return 0.0, 0.0
+    p = k / n; d = 1 + z * z / n; c = (p + z * z / (2 * n)) / d; h = z * (p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5 / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+
 def truncated(r) -> bool:
     """The reply hit the token cap (finish_reason "length"; older result files: unparsed at the cap)."""
     if r.get("finish_reason"): return r["finish_reason"] == "length"
@@ -189,7 +196,8 @@ def summarize(rows, name, ck="correct", ok="outcome", t0=None):
         for r in g: outc[r[ok]] += 1
         summary[key] = {"n": len(g), "accuracy": round(acc, 3), "truncated": round(trunc, 3), "outcomes": dict(outc)}
         top = dict(sorted(outc.items(), key=lambda kv: -kv[1])[:4])
-        print(f"  {key:28s} n={len(g):4d}  accuracy {acc:6.1%}  truncated {trunc:6.1%}   {top}")
+        lo, hi = wilson(sum(r[ck] for r in g), len(g)); summary[key]["ci95"] = [round(lo, 3), round(hi, 3)]
+        print(f"  {key:28s} n={len(g):4d}  accuracy {acc:6.1%} [{lo:5.1%}-{hi:5.1%}]  truncated {trunc:6.1%}   {top}")
     toks = [r.get("usage", {}).get("completion_tokens", 0) for r in rows]
     summary["mean_completion_tokens"] = round(sum(toks) / max(len(toks), 1), 1)
     (ROOT / "llm_bench/results" / f"{name}.summary.json").write_text(json.dumps(summary, indent=1))
