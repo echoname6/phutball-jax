@@ -86,6 +86,10 @@ def main():
     ap.add_argument("--mix", default="", help="subtask keep-probabilities, e.g. prevent=0.5,block=0.7")
     ap.add_argument("--force-credit", type=float, default=0.75,
                     help="credit for a correct budget-forced answer on a cut-off rollout (0: off)")
+    ap.add_argument("--force-engine", choices=["hf", "vllm"], default="hf",
+                    help="hf: the training model completes the forced answer (vLLM can sleep: less memory); "
+                         "vllm: the colocated engine (needs it resident: OOM at 6k tokens on one A100)")
+    ap.add_argument("--force-batch", type=int, default=2)
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -113,7 +117,7 @@ def main():
         temperature=1.0, top_p=1.0, beta=0.0, loss_type="dr_grpo", scale_rewards=False,
         mask_truncated_completions=False,                               # truncation is penalised, not hidden
         use_vllm=True, vllm_mode="colocate", vllm_gpu_memory_utilization=a.vllm_mem,
-        vllm_enable_sleep_mode=not a.force_credit,                      # forcing needs the engine awake at reward time
+        vllm_enable_sleep_mode=not (a.force_credit and a.force_engine == "vllm"),   # vLLM forcing needs it awake
         vllm_max_model_length=1536 + a.cap + 64,
         gradient_checkpointing=True, max_steps=a.max_steps, save_steps=a.save_every, save_total_limit=2,
         chat_template_kwargs={"enable_thinking": True}, model_init_kwargs={"torch_dtype": torch.bfloat16},
@@ -141,10 +145,34 @@ def main():
     trainer = GRPOTrainer(model=a.model, reward_funcs=[reward], args=cfg, train_dataset=data, peft_config=lora,
                           callbacks=[TimeLimit()])
     if a.force_credit:
-        llm = find_llm(trainer)
         tok = getattr(trainer, "processing_class", None) or getattr(trainer, "tokenizer", None)
         tok = getattr(tok, "tokenizer", tok)                            # a processor wraps the tokenizer
-        if llm is None or tok is None:
+        llm = find_llm(trainer) if a.force_engine == "vllm" else None
+        if a.force_engine == "hf" and tok is not None:
+            model = trainer.model
+
+            def hf_force(raws):
+                """Greedy 12-token completions from the current policy (LoRA on), left-padded small batches."""
+                outs, was_training, side = [], model.training, tok.padding_side
+                model.eval(); tok.padding_side = "left"
+                pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+                try:
+                    with torch.no_grad():
+                        for i in range(0, len(raws), a.force_batch):
+                            enc = tok(raws[i:i + a.force_batch], return_tensors="pt", padding=True,
+                                      add_special_tokens=False).to(model.device)
+                            g = model.generate(**enc, max_new_tokens=12, do_sample=False, use_cache=True, pad_token_id=pad)
+                            outs += tok.batch_decode(g[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                finally:
+                    tok.padding_side = side
+                    if was_training: model.train()
+                    torch.cuda.empty_cache()
+                return outs
+            reward.forcer = hf_force
+            reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
+                                                                   enable_thinking=True)
+            print("budget forcing ON (training model, vLLM sleeps between generations)", flush=True)
+        elif llm is None or tok is None:
             print("WARNING: no vLLM engine / tokenizer found: budget forcing OFF", flush=True); reward.force_credit = 0
         else:
             from vllm import SamplingParams
