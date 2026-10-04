@@ -25,11 +25,20 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-def load_puzzles(path: Path, seed: int, mix: dict | None):
+STAGES = {                       # curriculum stages: (subtask keep-probabilities, max win length J)
+    "wins_short": ({"win_pos": 1.0, "win_neg": 0.35, "forced": 0, "block": 0, "prevent": 0}, 2),
+    "wins":       ({"win_pos": 1.0, "win_neg": 0.5, "forced": 0, "block": 0, "prevent": 0}, 4),
+    "wins_place": ({"win_pos": 1.0, "win_neg": 0.5, "forced": 1.0, "block": 1.0, "prevent": 0}, 4),
+    "full":       ({}, 4),
+}
+
+
+def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4):
     from expert.engine import State
     from llm_bench.text import prompt
     rows = [json.loads(l) for l in open(path)]
     rng = random.Random(seed); rng.shuffle(rows)
+    rows = [r for r in rows if r["subtask"] != "win_pos" or int(r["item"]["meta"].get("J", 1)) <= max_j]
     if mix:                                                             # optional subtask weights, e.g. prevent=0.5
         rows = [r for r in rows if rng.random() < mix.get(r["subtask"], 1.0)]
     out = []
@@ -92,6 +101,12 @@ def main():
     ap.add_argument("--force-batch", type=int, default=2)
     ap.add_argument("--force-budgets", default="1",
                     help="fractions of the cap at which a cut-off rollout is forced, e.g. 0.25,0.5,1 (anytime credit)")
+    ap.add_argument("--stage", choices=sorted(STAGES), default=None, help="curriculum stage (sets the puzzle mix)")
+    ap.add_argument("--init-adapter", type=Path, default=None, help="start from this LoRA adapter (the previous stage)")
+    ap.add_argument("--advance-correct", type=float, default=0.0,
+                    help="stop the stage once the finished-and-correct share over the last --advance-window "
+                         "generation batches reaches this (0: run for --hours)")
+    ap.add_argument("--advance-window", type=int, default=5)
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -107,7 +122,9 @@ def main():
     print("torch", torch.__version__, "transformers", transformers.__version__, "trl", trl.__version__, flush=True)
 
     mix = dict((k, float(v)) for k, v in (p.split("=") for p in a.mix.split(",") if p)) if a.mix else None
-    data = Dataset.from_list(load_puzzles(a.puzzles, a.seed, mix))
+    max_j = 4
+    if a.stage: mix, max_j = STAGES[a.stage]
+    data = Dataset.from_list(load_puzzles(a.puzzles, a.seed, mix, max_j))
     print(f"{len(data)} puzzles", flush=True)
 
     per_step = a.prompts * a.gens
@@ -143,7 +160,16 @@ def main():
                   flush=True)
             with open(a.out / "steps.log", "a") as f:
                 f.write(json.dumps({"step": state.global_step, "elapsed_s": round(el), "reward": reward.history[-1:]}) + "\n")
-            if el > a.hours * 3600: control.should_training_stop = True; control.should_save = True
+            done = None
+            if el > a.hours * 3600: done = "time"
+            st = reward.stats[-a.advance_window:]
+            if a.advance_correct and len(st) >= a.advance_window and \
+                    sum(x["correct"] for x in st) / len(st) >= a.advance_correct:
+                done = "advanced"
+            if done:
+                control.should_training_stop = True; control.should_save = True
+                (a.out / "stage_done.json").write_text(json.dumps(
+                    {"reason": done, "steps": state.global_step, "elapsed_s": round(el), "last": st}))
 
     trainer = GRPOTrainer(model=a.model, reward_funcs=[reward], args=cfg, train_dataset=data, peft_config=lora,
                           callbacks=[TimeLimit()])
@@ -186,6 +212,12 @@ def main():
             reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                                                    enable_thinking=True)
             print("budget forcing ON (vLLM engine found)", flush=True)
+    if a.init_adapter:                                                  # continue the previous stage's LoRA
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+        res = set_peft_model_state_dict(trainer.model, load_file(str(a.init_adapter / "adapter_model.safetensors")))
+        miss = [k for k in getattr(res, "missing_keys", []) if "lora_" in k]
+        print(f"loaded adapter {a.init_adapter} (missing LoRA keys: {len(miss)})", flush=True)
     ckpts = sorted(a.out.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[1]))
     trainer.train(resume_from_checkpoint=str(ckpts[-1]) if ckpts else None)
     trainer.save_model(str(a.out / "final"))

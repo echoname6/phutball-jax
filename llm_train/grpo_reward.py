@@ -68,7 +68,7 @@ class PhutballReward:
         self.cap, self.log_path, self.eff, self.trunc, self.force_credit = cap, log_path, eff, trunc, force_credit
         self.budgets = tuple(sorted(budgets))
         self.decode = None              # callable(token ids) -> text; needed for budgets < 1
-        self.calls = 0; self.history = []
+        self.calls = 0; self.history = []; self.stats = []
         self.forcer = None              # callable(list[str] raw prompts) -> list[str] continuations; set by the trainer script
         self.template = None            # callable(prompt messages) -> chat-templated prompt text (generation prompt included)
 
@@ -137,3 +137,6 @@ class PhutballReward:
                 f"wordlike {sum(r['wordlike'] for r in rows) / n:.2f} | " +
                 " ".join(f"{k} {sum(r['correct'] for r in v)}/{len(v)}" for k, v in sorted(by.items())))
         print(line, flush=True); self.history.append(line)
+        self.stats.append({"correct": sum(r["correct"] for r in rows) / n, "trunc": sum(r["trunc"] for r in rows) / n,
+                           "forced": sum(r.get("forced_correct", False) for r in rows) / n,
+                           "len": sum(r["len"] for r in rows) / n})
