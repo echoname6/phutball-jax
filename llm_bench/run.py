@@ -79,6 +79,12 @@ def baseline_reply(kind: str, it: dict, rng: random.Random) -> str:
     return f"ANSWER: PLACE {sq(rng.choice(empty), s.cols)}"
 
 
+def answer_part(reply: str, thinking) -> str:
+    """With thinking on, only the text after </think> is the answer (an ANSWER: line inside the thinking does not count)."""
+    if not thinking: return reply
+    return reply.rsplit("</think>", 1)[1] if "</think>" in (reply or "") else ""
+
+
 def score(it: dict, reply: str) -> dict:
     s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
     kind, val = parse_answer(reply)
@@ -116,14 +122,28 @@ FORCE = {True: "\n\nTime is up. I must commit to my best answer now.\n</think>\n
 def salvage(a, items_by_id: dict):
     """Budget forcing for replies that hit the token cap: re-send prompt + the truncated reply + "time is up" +
     "ANSWER:" as a raw completion and let the model finish the answer line (30 tokens). Scores the replies already
-    paid for, as "best answer within the token budget". Reads and rewrites llm_bench/results/<name>.jsonl."""
-    if not a.completions:
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(a.model)
+    paid for, as "best answer within the token budget". Reads and rewrites llm_bench/results/<name>.jsonl.
+    --truncate-at N: simulate a smaller budget from a long run: every reply longer than N tokens is cut at N and
+    budget-forced (shorter replies keep their score); written to <name>-at<N>.jsonl, the source file is untouched.
+    Only items selected by --tasks / --per-group / --limit are scored."""
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(a.model)
     path = ROOT / "llm_bench/results" / f"{a.salvage}.jsonl"
     rows = [json.loads(l) for l in open(path)]
-    todo = [r for r in rows if r["outcome"] == "unparsed" and r.get("reply")]
+    rows = [r for r in rows if r["id"] in items_by_id]
     think = bool(a.thinking)
+    if a.truncate_at:
+        for r in rows:
+            body = (r.get("reasoning") or "") + r["reply"]
+            ids = tok(body, add_special_tokens=False)["input_ids"]
+            if len(ids) > a.truncate_at:
+                r["reasoning"] = None; r["reply"] = tok.decode(ids[:a.truncate_at]); r["outcome"] = "unparsed"
+                r["correct"] = False; r["finish_reason"] = "length"
+                r.setdefault("usage", {})["completion_tokens"] = a.truncate_at
+        todo = [r for r in rows if r["outcome"] == "unparsed"]
+        path = path.with_name(f"{a.salvage}-at{a.truncate_at}.jsonl"); a.salvage = f"{a.salvage}-at{a.truncate_at}"
+    else:
+        todo = [r for r in rows if r["outcome"] == "unparsed" and r.get("reply")]
 
     def one(r):
         if a.completions: head = items_by_id[r["id"]]["prompt"] + "\n\nReply:\n"
@@ -187,12 +207,21 @@ def main():
     ap.add_argument("--limit", type=int, default=0); ap.add_argument("--tasks", default="win,forced,block,prevent")
     ap.add_argument("--baseline", choices=["nowin", "random", "adjacent"], default=None, help="no model: a scoring sanity check")
     ap.add_argument("--name", default=None); ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--per-group", type=int, default=0, help="the first N items of each group (task, win difficulty; 4N win negatives)")
+    ap.add_argument("--truncate-at", type=int, default=0, help="with --salvage: simulate this token budget")
     ap.add_argument("--salvage", default=None, help="results name: budget-force an answer from replies that hit the cap "
                                                      "(needs --model and --thinking as in the original run)")
     a = ap.parse_args()
     items = [json.loads(l) for l in open(a.bench)]
     if a.salvage: return salvage(a, {it["id"]: it for it in items})
     items = [it for it in items if it["task"] in a.tasks.split(",")]
+    if a.per_group:
+        taken = defaultdict(int); sel = []
+        for it in items:
+            g = it["task"] + (str(it["answers"]["win"]) + str(it["meta"].get("difficulty", "")) if it["task"] == "win" else "")
+            cap = a.per_group * (4 if g == "winFalse" else 1)       # keep win positives : negatives at 1 : 1
+            if taken[g] < cap: taken[g] += 1; sel.append(it)
+        items = sel
     if a.limit: items = items[:a.limit]
     name = a.name or (f"baseline-{a.baseline}" if a.baseline else re.sub(r"[^A-Za-z0-9._-]", "_", a.model or "model")
                       + ("" if a.thinking is None else f"-think{int(a.thinking)}") + ("-completions" if a.completions else ""))
@@ -201,7 +230,8 @@ def main():
 
     def run_one(it):
         r = {"reply": baseline_reply(a.baseline, it, rng)} if a.baseline else call(a, it["prompt"])
-        return it, r, score(it, r["reply"])
+        ans = r["reply"] if r.get("reasoning") else answer_part(r["reply"], a.thinking)   # server already split it
+        return it, r, score(it, ans)
 
     rows = []
     with cf.ThreadPoolExecutor(max_workers=1 if a.baseline else a.concurrency) as ex:
