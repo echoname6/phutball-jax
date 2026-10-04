@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+from collections import defaultdict
 import json
 import random
 import sys
@@ -26,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 
 STAGES = {                       # curriculum stages: (subtask keep-probabilities, max win length J)
-    "wins_short": ({"win_pos": 1.0, "win_neg": 0.35, "forced": 0, "block": 0, "prevent": 0}, 2),
+    "wins_short": ({"win_pos": 1.0, "win_neg": 0.2, "forced": 0, "block": 0, "prevent": 0}, 2),
     "wins":       ({"win_pos": 1.0, "win_neg": 0.5, "forced": 0, "block": 0, "prevent": 0}, 4),
     "wins_place": ({"win_pos": 1.0, "win_neg": 0.5, "forced": 1.0, "block": 1.0, "prevent": 0}, 4),
     "full":       ({}, 4),
@@ -172,9 +173,13 @@ def main():
             done = None
             if el > a.hours * 3600: done = "time"
             st = reward.stats[-a.advance_window:]
-            if a.advance_correct and len(st) >= a.advance_window and \
-                    sum(x["correct"] for x in st) / len(st) >= a.advance_correct:
-                done = "advanced"
+            if a.advance_correct and len(st) >= a.advance_window:
+                pooled = defaultdict(lambda: [0, 0])                    # per subtask over the window
+                for x in st:
+                    for k, (c, n) in x.get("per", {}).items(): pooled[k][0] += c; pooled[k][1] += n
+                rates = {k: c / n for k, (c, n) in pooled.items() if n}
+                if rates and min(rates.values()) >= a.advance_correct:   # every subtask, not the pooled mean
+                    done = "advanced"
             if done:
                 control.should_training_stop = True; control.should_save = True
                 (a.out / "stage_done.json").write_text(json.dumps(

@@ -86,7 +86,8 @@ class PhutballReward:
             think, ans = split(t)
             trunc = L >= self.cap - 1 and not re.search(r"ANSWER:", ans)
             sc = score(it, ans) if ans else {"correct": False, "outcome": "truncated" if trunc else "no answer after </think>"}
-            rows.append({"i": i, "key": json.dumps(prompts[i]) if not isinstance(prompts[i], str) else prompts[i],
+            nowin = it["task"] == "win" and bool(re.search(r"ANSWER:\s*NO\s*WIN", ans, re.I))
+            rows.append({"nowin": nowin, "i": i, "key": json.dumps(prompts[i]) if not isinstance(prompts[i], str) else prompts[i],
                          "id": it.get("id"), "task": it["task"], "subtask": subtask[i] if subtask else it["task"],
                          "len": L, "trunc": trunc, "correct": bool(sc["correct"]), "outcome": sc["outcome"],
                          **legibility(think)})
@@ -116,7 +117,9 @@ class PhutballReward:
             ok = [r for r in g if r["correct"]]
             m = sum(r["len"] for r in ok) / len(ok) if len(ok) >= 2 else None
             for r in g:
-                bonus = self.eff * max(-1.0, min(1.0, (m - r["len"]) / m)) if (m and r["correct"]) else 0.0
+                # no length bonus for a correct NO WIN: proving there is no win needs the full search, and rewarding
+                # short NO WINs taught "stop early and say NO WIN" (stage-1 probe: wins 6/24 vs no-wins 29/40)
+                bonus = self.eff * max(-1.0, min(1.0, (m - r["len"]) / m)) if (m and r["correct"] and not r["nowin"]) else 0.0
                 r["reward"] = (float(r["correct"]) + bonus - self.trunc * r["trunc"]
                                + self.force_credit * r.get("forced_score", float(r.get("forced_correct", False))))
         self.summary(rows)
@@ -137,6 +140,8 @@ class PhutballReward:
                 f"wordlike {sum(r['wordlike'] for r in rows) / n:.2f} | " +
                 " ".join(f"{k} {sum(r['correct'] for r in v)}/{len(v)}" for k, v in sorted(by.items())))
         print(line, flush=True); self.history.append(line)
-        self.stats.append({"correct": sum(r["correct"] for r in rows) / n, "trunc": sum(r["trunc"] for r in rows) / n,
+        per = defaultdict(lambda: [0, 0])
+        for r in rows: per[r["subtask"]][0] += r["correct"]; per[r["subtask"]][1] += 1
+        self.stats.append({"per": {k: tuple(v) for k, v in per.items()}, "correct": sum(r["correct"] for r in rows) / n, "trunc": sum(r["trunc"] for r in rows) / n,
                            "forced": sum(r.get("forced_correct", False) for r in rows) / n,
                            "len": sum(r["len"] for r in rows) / n})
