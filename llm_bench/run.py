@@ -217,10 +217,15 @@ def main():
     ap.add_argument("--name", default=None); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--per-group", type=int, default=0, help="the first N items of each group (task, win difficulty; 4N win negatives)")
     ap.add_argument("--truncate-at", type=int, default=0, help="with --salvage: simulate this token budget")
+    ap.add_argument("--budget-hint", type=int, default=0, help="append the training-time thinking-budget sentence")
     ap.add_argument("--salvage", default=None, help="results name: budget-force an answer from replies that hit the cap "
                                                      "(needs --model and --thinking as in the original run)")
     a = ap.parse_args()
     items = [json.loads(l) for l in open(a.bench)]
+    if a.budget_hint:                                        # same wording as llm_train.grpo_pilot.BUDGET_HINT
+        for it in items:
+            it["prompt"] += (f"\n\nYou have a thinking budget of about {a.budget_hint:,} tokens. When you have checked "
+                             "your answer, stop thinking and give it.")
     if a.salvage: return salvage(a, {it["id"]: it for it in items})
     items = [it for it in items if it["task"] in a.tasks.split(",")]
     if a.per_group:

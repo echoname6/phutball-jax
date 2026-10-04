@@ -33,7 +33,11 @@ STAGES = {                       # curriculum stages: (subtask keep-probabilitie
 }
 
 
-def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4):
+BUDGET_HINT = ("\n\nYou have a thinking budget of about {n:,} tokens. When you have checked your answer, stop thinking "
+               "and give it.")
+
+
+def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4, hint: int = 0):
     from expert.engine import State
     from llm_bench.text import prompt
     rows = [json.loads(l) for l in open(path)]
@@ -44,7 +48,8 @@ def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4):
     out = []
     for r in rows:
         it = r["item"]; s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
-        out.append({"prompt": [{"role": "user", "content": prompt(it["task"], s)}], "item": json.dumps(it),
+        text = prompt(it["task"], s) + (BUDGET_HINT.format(n=hint) if hint else "")
+        out.append({"prompt": [{"role": "user", "content": text}], "item": json.dumps(it),
                     "task": it["task"], "subtask": r["subtask"]})
     return out
 
@@ -107,6 +112,9 @@ def main():
                     help="stop the stage once the finished-and-correct share over the last --advance-window "
                          "generation batches reaches this (0: run for --hours)")
     ap.add_argument("--advance-window", type=int, default=5)
+    ap.add_argument("--budget-hint", type=int, default=0,
+                    help="append 'You have a thinking budget of about N tokens ...' to every prompt (0: off); "
+                         "evaluate with the same hint (llm_bench.run --budget-hint)")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -124,7 +132,8 @@ def main():
     mix = dict((k, float(v)) for k, v in (p.split("=") for p in a.mix.split(",") if p)) if a.mix else None
     max_j = 4
     if a.stage: mix, max_j = STAGES[a.stage]
-    data = Dataset.from_list(load_puzzles(a.puzzles, a.seed, mix, max_j))
+    data = Dataset.from_list(load_puzzles(a.puzzles, a.seed, mix, max_j, a.budget_hint))
+    if a.budget_hint: print("budget hint:", BUDGET_HINT.format(n=a.budget_hint).strip(), flush=True)
     print(f"{len(data)} puzzles", flush=True)
 
     per_step = a.prompts * a.gens
