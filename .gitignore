@@ -9,3 +9,4 @@ venv/
 *.egg-info/
 expert_data/
 llm_bench/results/
+llm_train/data/
