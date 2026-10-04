@@ -25,13 +25,25 @@ def main():
     ap.add_argument("--data", type=Path, required=True); ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--epochs", type=float, default=1.0); ap.add_argument("--lr", type=float, default=5e-5)
     ap.add_argument("--rank", type=int, default=32); ap.add_argument("--accum", type=int, default=8)
+    ap.add_argument("--max-neg-ratio", type=float, default=0.6,
+                    help="keep at most this many no-win examples per win example (the first warm start had 173 no-win "
+                         "vs 146 win and started RL leaning to NO WIN: wins 5/16 vs no-wins 12/16 before any update)")
+    ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     import torch
     from datasets import Dataset
     from peft import LoraConfig
     from trl import SFTConfig, SFTTrainer
 
+    import random
     rows = [json.loads(l) for l in open(a.data)]
+    neg = [r for r in rows if r.get("subtask") == "win_neg"]; pos = [r for r in rows if r.get("subtask") == "win_pos"]
+    keep = int(a.max_neg_ratio * len(pos))
+    if len(neg) > keep:
+        random.Random(a.seed).shuffle(neg)
+        rows = [r for r in rows if r.get("subtask") != "win_neg"] + neg[:keep]
+    from collections import Counter
+    print("examples by subtask:", dict(Counter(r.get("subtask") for r in rows)), flush=True)
     data = Dataset.from_list([{"prompt": r["prompt"], "completion": r["completion"]} for r in rows])
     print(f"{len(data)} examples", flush=True)
     cfg = build_config(SFTConfig, dict(
