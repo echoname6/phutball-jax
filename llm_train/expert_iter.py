@@ -93,7 +93,7 @@ def main():
     jobs = []                                                                  # (puzzle i, approach or None, prompt)
     if a.arm == "strategic":
         asks = llm.generate([tmpl(APPROACH_ASK.format(puzzle=t, k=a.k), think=False) for t in texts],
-                            SamplingParams(temperature=1.0, top_p=0.95, max_tokens=500, seed=a.seed), lora_request=lora)
+                            SamplingParams(temperature=1.0, top_p=0.95, max_tokens=500), lora_request=lora)
         n_short = 0
         for i, o in enumerate(asks):
             apps = parse_approaches(o.outputs[0].text, a.k)
@@ -106,7 +106,9 @@ def main():
             json.dumps({"id": picked[i]["id"], "text": o.outputs[0].text}) + "\n" for i, o in enumerate(asks)))
     else:
         jobs = [(i, None, heads[i]) for i in range(len(picked)) for _ in range(a.k)]
-    sp = SamplingParams(temperature=a.temperature, top_p=0.95, max_tokens=a.max_think, seed=a.seed)
+    # no per-request seed: identical prompts (the iid arm's k samples) would get identical outputs; the engine seed
+    # (LLM(seed=...)) keeps the run reproducible
+    sp = SamplingParams(temperature=a.temperature, top_p=0.95, max_tokens=a.max_think)
     gen = llm.generate([p for _, _, p in jobs], sp, lora_request=lora)
     print(f"{len(gen)} samples in {time.time() - t0:.0f}s", flush=True)
 
