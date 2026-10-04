@@ -39,16 +39,26 @@ from expert.engine import BALL, MAN, State, jump_landings  # noqa: E402
 from llm_bench.text import check_win_sequence, parse_answer, replay_jumps, sq  # noqa: E402
 
 
+def sampling_extra(a) -> dict:
+    """top_p / top_k / seed when set (vLLM accepts top_k in the OpenAI-compatible body)."""
+    out = {}
+    if a.top_p is not None: out["top_p"] = a.top_p
+    if a.top_k is not None: out["top_k"] = a.top_k
+    if a.temperature > 0: out["seed"] = a.seed
+    return out
+
+
 def call(a, prompt_text: str, raw: str | None = None) -> dict:
     headers = {"Content-Type": "application/json"}
     key = os.environ.get(a.api_key_env)
     if key: headers["Authorization"] = f"Bearer {key}"
     if a.completions:
         body = {"model": a.model, "prompt": raw if raw is not None else prompt_text + "\n\nReply:\n", "max_tokens": a.max_tokens, "temperature": a.temperature}
+        if raw is None: body.update(sampling_extra(a))
         url = a.base_url.rstrip("/") + "/completions"
     else:
         body = {"model": a.model, "messages": [{"role": "user", "content": prompt_text}], "max_tokens": a.max_tokens,
-                "temperature": a.temperature}
+                "temperature": a.temperature, **sampling_extra(a)}
         if a.thinking is not None:                           # Qwen-style switch (vLLM / SGLang chat_template_kwargs)
             body["chat_template_kwargs"] = {"enable_thinking": a.thinking}
         url = a.base_url.rstrip("/") + "/chat/completions"
@@ -151,7 +161,7 @@ def salvage(a, items_by_id: dict):
                                              add_generation_prompt=True, enable_thinking=think)
         body = (r.get("reasoning") or "") + r["reply"]
         tail = FORCE[think and "</think>" not in body] + "ANSWER:"
-        b = argparse.Namespace(**{**vars(a), "completions": True, "max_tokens": 30})
+        b = argparse.Namespace(**{**vars(a), "completions": True, "max_tokens": 30, "temperature": 0.0})   # forced answer: greedy
         out = call(b, None, raw=head + body + tail)
         return r, "ANSWER:" + out["reply"].split("\n")[0]
 
@@ -210,7 +220,10 @@ def main():
     ap.add_argument("--api-key-env", default="OPENAI_API_KEY"); ap.add_argument("--completions", action="store_true")
     ap.add_argument("--thinking", type=lambda v: v.lower() in ("1", "true", "yes", "on"), default=None,
                     help="Qwen thinking switch (true/false); omitted = the server's default")
-    ap.add_argument("--max-tokens", type=int, default=4096); ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--max-tokens", type=int, default=4096); ap.add_argument("--temperature", type=float, default=0.0,
+                    help="0 = greedy. Do NOT use greedy with thinking on (Qwen: endless repetition); use --qwen-thinking-sampling")
+    ap.add_argument("--top-p", type=float, default=None); ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--qwen-thinking-sampling", action="store_true", help="temperature 0.6, top-p 0.95, top-k 20 (Qwen's recommendation)")
     ap.add_argument("--timeout", type=float, default=600); ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0); ap.add_argument("--tasks", default="win,forced,block,prevent")
     ap.add_argument("--baseline", choices=["nowin", "random", "adjacent"], default=None, help="no model: a scoring sanity check")
@@ -222,6 +235,7 @@ def main():
     ap.add_argument("--salvage", default=None, help="results name: budget-force an answer from replies that hit the cap "
                                                      "(needs --model and --thinking as in the original run)")
     a = ap.parse_args()
+    if a.qwen_thinking_sampling: a.temperature, a.top_p, a.top_k = 0.6, 0.95, 20
     items = [json.loads(l) for l in open(a.bench)]
     if a.budget_hint:                                        # same wording as llm_train.grpo_pilot.BUDGET_HINT
         for it in items:
