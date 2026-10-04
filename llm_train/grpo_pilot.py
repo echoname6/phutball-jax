@@ -90,6 +90,8 @@ def main():
                     help="hf: the training model completes the forced answer (vLLM can sleep: less memory); "
                          "vllm: the colocated engine (needs it resident: OOM at 6k tokens on one A100)")
     ap.add_argument("--force-batch", type=int, default=2)
+    ap.add_argument("--force-budgets", default="1",
+                    help="fractions of the cap at which a cut-off rollout is forced, e.g. 0.25,0.5,1 (anytime credit)")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -129,7 +131,8 @@ def main():
     except TypeError:
         lora = LoraConfig(**lora_kw)
 
-    reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit)
+    reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit,
+                            budgets=tuple(float(x) for x in a.force_budgets.split(",")))
 
     class TimeLimit(transformers.TrainerCallback):
         def __init__(self): self.t0 = time.time()
@@ -169,6 +172,7 @@ def main():
                     torch.cuda.empty_cache()
                 return outs
             reward.forcer = hf_force
+            reward.decode = lambda ids: tok.decode(ids, skip_special_tokens=False)
             reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                                                    enable_thinking=True)
             print("budget forcing ON (training model, vLLM sleeps between generations)", flush=True)
@@ -178,6 +182,7 @@ def main():
             from vllm import SamplingParams
             sp = SamplingParams(max_tokens=12, temperature=0.0)
             reward.forcer = lambda raws: [o.outputs[0].text for o in llm.generate(raws, sp, use_tqdm=False)]
+            reward.decode = lambda ids: tok.decode(ids, skip_special_tokens=False)
             reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,
                                                                    enable_thinking=True)
             print("budget forcing ON (vLLM engine found)", flush=True)

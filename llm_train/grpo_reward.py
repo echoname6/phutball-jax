@@ -7,6 +7,10 @@
          budget forcing: the cut-off thinking + "Time is up ... </think> ANSWER:" is completed by the same vLLM engine
          (12 tokens, greedy), so a cut-off search that was heading to the right answer still beats one that was not.
          Order: finished correct (1) > cut off, forced correct (0.25) > finished wrong (0) > cut off, forced wrong (-0.5).
+  --force-budgets 0.25,0.5,1 ("anytime" credit): the cut-off thinking is forced at several prefixes (fractions of the
+         cap) and the credit is FORCE_CREDIT * (share of those prefixes whose forced answer verifies), so reaching the
+         right answer earlier (and staying there) earns more even while no sample in the group finishes; this keeps
+         a within-group pressure toward efficient search when the truncation penalty is the same for every sample.
 Length pressure is relative to each position's difficulty (a hard position whose correct samples are all long is
 not pushed to be short). No language, format or
 readability term: the thinking may drift into any token code that keeps the answers verified.
@@ -60,8 +64,10 @@ class PhutballReward:
     __name__ = "phutball"
 
     def __init__(self, cap: int, log_path: str | None = None, eff: float = EFF, trunc: float = TRUNC,
-                 force_credit: float = FORCE_CREDIT):
+                 force_credit: float = FORCE_CREDIT, budgets: tuple = (1.0,)):
         self.cap, self.log_path, self.eff, self.trunc, self.force_credit = cap, log_path, eff, trunc, force_credit
+        self.budgets = tuple(sorted(budgets))
+        self.decode = None              # callable(token ids) -> text; needed for budgets < 1
         self.calls = 0; self.history = []
         self.forcer = None              # callable(list[str] raw prompts) -> list[str] continuations; set by the trainer script
         self.template = None            # callable(prompt messages) -> chat-templated prompt text (generation prompt included)
@@ -87,10 +93,21 @@ class PhutballReward:
         cut = [r["i"] for r in rows if r["trunc"]]
         if cut and self.forcer and self.force_credit:
             try:
-                forced = self.force([prompts[i] for i in cut], [split(texts[i])[0] for i in cut])
-                for i, ans in zip(cut, forced):
-                    sc = score(json.loads(item[i]) if isinstance(item[i], str) else item[i], ans)
-                    rows[i]["forced"] = ans; rows[i]["forced_correct"] = bool(sc["correct"])
+                jobs = []                                               # (sample index, budget fraction, thinking prefix)
+                for i in cut:
+                    for b in self.budgets:
+                        if b >= 1.0 or self.decode is None or completion_ids is None:
+                            jobs.append((i, 1.0, split(texts[i])[0]))
+                        else:
+                            jobs.append((i, b, split(self.decode(list(completion_ids[i])[: int(b * self.cap)]))[0]))
+                forced = self.force([prompts[i] for i, _, _ in jobs], [t for _, _, t in jobs])
+                hits = defaultdict(list)
+                for (i, b, _), ans in zip(jobs, forced):
+                    ok = bool(score(json.loads(item[i]) if isinstance(item[i], str) else item[i], ans)["correct"])
+                    hits[i].append(ok)
+                    if b >= 1.0: rows[i]["forced"] = ans; rows[i]["forced_correct"] = ok
+                for i, h in hits.items():
+                    rows[i]["forced_score"] = sum(h) / len(h); rows[i]["forced_hits"] = h
             except Exception as e:                                   # noqa: BLE001  (never kill a training step)
                 print("budget forcing failed:", repr(e)[:300], flush=True)
         groups = defaultdict(list)
@@ -101,7 +118,7 @@ class PhutballReward:
             for r in g:
                 bonus = self.eff * max(-1.0, min(1.0, (m - r["len"]) / m)) if (m and r["correct"]) else 0.0
                 r["reward"] = (float(r["correct"]) + bonus - self.trunc * r["trunc"]
-                               + self.force_credit * r.get("forced_correct", False))
+                               + self.force_credit * r.get("forced_score", float(r.get("forced_correct", False))))
         self.summary(rows)
         if self.log_path:
             with open(self.log_path, "a") as f:
