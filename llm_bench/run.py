@@ -207,7 +207,14 @@ def summarize(rows, name, ck="correct", ok="outcome", t0=None):
         summary[key] = {"n": len(g), "accuracy": round(acc, 3), "truncated": round(trunc, 3), "outcomes": dict(outc)}
         top = dict(sorted(outc.items(), key=lambda kv: -kv[1])[:4])
         lo, hi = wilson(sum(r[ck] for r in g), len(g)); summary[key]["ci95"] = [round(lo, 3), round(hi, 3)]
-        print(f"  {key:28s} n={len(g):4d}  accuracy {acc:6.1%} [{lo:5.1%}-{hi:5.1%}]  truncated {trunc:6.1%}   {top}")
+        ids = defaultdict(list)
+        for r in g: ids[r["id"]].append(r[ck])
+        kmax = max(len(v) for v in ids.values())
+        if kmax > 1:
+            pk = sum(any(v) for v in ids.values()) / len(ids); summary[key][f"pass@{kmax}"] = round(pk, 3)
+            plo, phi = wilson(sum(any(v) for v in ids.values()), len(ids)); summary[key][f"pass@{kmax}_ci95"] = [round(plo, 3), round(phi, 3)]
+        pk = next((f"  pass@{k_.split('@')[1]} {v:6.1%}" for k_, v in summary[key].items() if k_.startswith("pass@") and not k_.endswith("ci95")), "")
+        print(f"  {key:28s} n={len(g):4d}  accuracy {acc:6.1%} [{lo:5.1%}-{hi:5.1%}]{pk}  truncated {trunc:6.1%}   {top}")
     toks = [r.get("usage", {}).get("completion_tokens", 0) for r in rows]
     summary["mean_completion_tokens"] = round(sum(toks) / max(len(toks), 1), 1)
     (ROOT / "llm_bench/results" / f"{name}.summary.json").write_text(json.dumps(summary, indent=1))
@@ -230,6 +237,7 @@ def main():
     ap.add_argument("--name", default=None); ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--per-group", type=int, default=0, help="the first N items of each group (task, win difficulty; 4N win negatives)")
     ap.add_argument("--truncate-at", type=int, default=0, help="with --salvage: simulate this token budget")
+    ap.add_argument("--samples", type=int, default=1, help="samples per item (use with sampling): reports pass@1 and pass@K")
     ap.add_argument("--budget-hint", type=int, default=0, help="append the training-time thinking-budget sentence")
     ap.add_argument("--tokenizer", default=None, help="tokenizer for --salvage (default: --model; needed when --model is a LoRA name)")
     ap.add_argument("--salvage", default=None, help="results name: budget-force an answer from replies that hit the cap "
@@ -251,20 +259,24 @@ def main():
             if taken[g] < cap: taken[g] += 1; sel.append(it)
         items = sel
     if a.limit: items = items[:a.limit]
+    if a.samples > 1 and not a.salvage:                     # K samples per item: accuracy = pass@1, plus pass@K
+        items = [{**it, "_sample": k} for it in items for k in range(a.samples)]
     name = a.name or (f"baseline-{a.baseline}" if a.baseline else re.sub(r"[^A-Za-z0-9._-]", "_", a.model or "model")
                       + ("" if a.thinking is None else f"-think{int(a.thinking)}") + ("-completions" if a.completions else ""))
     out_dir = ROOT / "llm_bench/results"; out_dir.mkdir(parents=True, exist_ok=True)
     rng = random.Random(a.seed); t0 = time.time()
 
     def run_one(it):
-        r = {"reply": baseline_reply(a.baseline, it, rng)} if a.baseline else call(a, it["prompt"])
+        b = argparse.Namespace(**{**vars(a), "seed": a.seed + 1009 * it.get("_sample", 0)})    # distinct seed per sample
+        r = {"reply": baseline_reply(a.baseline, it, rng)} if a.baseline else call(b, it["prompt"])
         ans = r["reply"] if r.get("reasoning") else answer_part(r["reply"], a.thinking)   # server already split it
         return it, r, score(it, ans)
 
     rows = []
     with cf.ThreadPoolExecutor(max_workers=1 if a.baseline else a.concurrency) as ex:
         for k, (it, r, sc) in enumerate(ex.map(run_one, items)):
-            rows.append({"id": it["id"], "task": it["task"], "meta": it["meta"], "answers": it["answers"], **r, **sc})
+            rows.append({"id": it["id"], "sample": it.get("_sample", 0), "task": it["task"], "meta": it["meta"],
+                         "answers": it["answers"], **r, **sc})
             if (k + 1) % 20 == 0: print(f"  {k + 1}/{len(items)} | {time.time() - t0:.0f}s", flush=True)
     with open(out_dir / f"{name}.jsonl", "w") as f:
         for row in rows: f.write(json.dumps(row) + "\n")
