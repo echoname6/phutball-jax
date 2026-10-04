@@ -47,6 +47,12 @@ def main():
         curve.append(c)
         print(f"{ks[i]:>4d}-{ks[min(i + W, len(ks)) - 1]:<4d} {c['correct']:7.1%} {c['trunc']:6.1%} {c['forced_ok']:9.1%} {c['anytime']:8.2f} {c['len']:6.0f} {c['len_ok']:8.0f} "
               f"{c['wordlike']:9.2f} {c['nonascii']:9.3f} {c['compress']:9.1f}  " + " ".join(f"{k} {sum(v) / len(v):.0%}" for k, v in sorted(sub.items())))
+    print("\nhow each subtask ends (all batches; top outcomes):")
+    by = defaultdict(lambda: defaultdict(int))
+    for r in rows: by[r["subtask"]][r["outcome"] if not r["trunc"] else "cut off"] += 1
+    for sub, oc in sorted(by.items()):
+        n = sum(oc.values())
+        print(f"  {sub:8s} n={n:5d}  " + "; ".join(f"{k} {v / n:.0%}" for k, v in sorted(oc.items(), key=lambda kv: -kv[1])[:5]))
     for label, pool in (("EARLY", ks[:W]), ("LATE", ks[-W:])):
         ok = sorted((r for k in pool for r in calls[k] if r["correct"]), key=lambda r: r["len"])
         for r in ok[len(ok) // 2: len(ok) // 2 + a.examples]:

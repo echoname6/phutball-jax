@@ -127,7 +127,7 @@ def salvage(a, items_by_id: dict):
     budget-forced (shorter replies keep their score); written to <name>-at<N>.jsonl, the source file is untouched.
     Only items selected by --tasks / --per-group / --limit are scored."""
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(a.model)
+    tok = AutoTokenizer.from_pretrained(a.tokenizer or a.model)
     path = ROOT / "llm_bench/results" / f"{a.salvage}.jsonl"
     rows = [json.loads(l) for l in open(path)]
     rows = [r for r in rows if r["id"] in items_by_id]
@@ -218,6 +218,7 @@ def main():
     ap.add_argument("--per-group", type=int, default=0, help="the first N items of each group (task, win difficulty; 4N win negatives)")
     ap.add_argument("--truncate-at", type=int, default=0, help="with --salvage: simulate this token budget")
     ap.add_argument("--budget-hint", type=int, default=0, help="append the training-time thinking-budget sentence")
+    ap.add_argument("--tokenizer", default=None, help="tokenizer for --salvage (default: --model; needed when --model is a LoRA name)")
     ap.add_argument("--salvage", default=None, help="results name: budget-force an answer from replies that hit the cap "
                                                      "(needs --model and --thinking as in the original run)")
     a = ap.parse_args()
