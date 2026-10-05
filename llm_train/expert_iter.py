@@ -63,6 +63,8 @@ def main():
     ap.add_argument("--mix", default="win_pos=0.4,win_neg=0.2,block=0.2,forced=0.2")
     ap.add_argument("--max-think", type=int, default=6144); ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--max-neg-ratio", type=float, default=0.6); ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--select", choices=["random", "shortest"], default="random",
+                    help="which verified solutions to keep per puzzle (random: natural finishes first, no length preference)")
     a = ap.parse_args(); t0 = time.time(); rng = random.Random(a.seed); a.out.mkdir(parents=True, exist_ok=True)
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
@@ -123,7 +125,7 @@ def main():
             ans_line = ans.strip().split("\n")[-1] if ans.strip() else ""
             if score(picked[i]["item"], ans)["correct"]:
                 if appr and LEAK.search(th): stats["dropped: refers to its instruction"] += 1; continue
-                cand[i].append((len(out.token_ids), th.rstrip("\n"), ans_line, appr)); stats["kept: finished"] += 1
+                cand[i].append((len(out.token_ids), th.rstrip("\n"), ans_line, appr, True)); stats["kept: finished"] += 1
             else:
                 stats["finished wrong"] += 1
             continue
@@ -143,16 +145,23 @@ def main():
             if all(g[d][0] for d in cs[kk:]):
                 ok, pre, ans = g[c]
                 if appr and LEAK.search(pre): stats["dropped: refers to its instruction"] += 1; break
-                cand[i].append((c, pre, ans, appr)); stats["kept: stable cut"] += 1
+                cand[i].append((c, pre, ans, appr, False)); stats["kept: stable cut"] += 1
                 break
 
-    # select up to --keep per puzzle, shortest first; strategic: from different strategies
+    # select up to --keep per puzzle. random (default): natural finishes first, in random order, then stable cuts in
+    # random order. shortest: the round-1 rule, which taught a length prior (r1 iid: forced 2-jump wins 74% -> 42%,
+    # stopping early and saying NO WIN on harder wins). strategic: from different strategies.
     chosen = []
     for i, cs in cand.items():
         seen_appr = set(); got = 0
-        for L, th, ans, appr in sorted(cs, key=lambda x: x[0]):
+        if a.select == "shortest":
+            order = sorted(cs, key=lambda x: x[0])
+        else:
+            nat = [x for x in cs if x[4]]; cut = [x for x in cs if not x[4]]; rng.shuffle(nat); rng.shuffle(cut)
+            order = nat + cut
+        for L, th, ans, appr, natural in order:
             if a.arm == "strategic" and appr is not None and appr in seen_appr: continue
-            seen_appr.add(appr); chosen.append((i, L, th, ans, appr)); got += 1
+            seen_appr.add(appr); chosen.append((i, L, th, ans, appr, natural)); got += 1
             if got >= a.keep: break
     pos = [x for x in chosen if picked[x[0]]["subtask"] == "win_pos"]
     neg = [x for x in chosen if picked[x[0]]["subtask"] == "win_neg"]
@@ -160,13 +169,14 @@ def main():
     if len(neg) > cap:
         rng.shuffle(neg); drop = set(map(id, neg[cap:])); chosen = [x for x in chosen if id(x) not in drop]
     with open(a.out / "sft.jsonl", "w") as f:
-        for i, L, th, ans, appr in chosen:
+        for i, L, th, ans, appr, natural in chosen:
             f.write(json.dumps({"prompt": heads[i], "completion": th + STOP + ans.strip() + tok.eos_token,
                                 "id": picked[i]["id"], "subtask": picked[i]["subtask"], "think_tokens": L,
-                                "approach": appr}) + "\n")
+                                "approach": appr, "natural": natural}) + "\n")
     solved = Counter(picked[i]["subtask"] for i in cand)
     total = Counter(r["subtask"] for r in picked)
-    summary = {"arm": a.arm, "k": a.k, "puzzles": len(picked), "examples": len(chosen),
+    summary = {"arm": a.arm, "select": a.select, "natural_share": round(sum(x[5] for x in chosen) / max(len(chosen), 1), 3),
+               "k": a.k, "puzzles": len(picked), "examples": len(chosen),
                "examples_by_subtask": dict(Counter(picked[x[0]]["subtask"] for x in chosen)),
                "puzzles_with_a_verified_solution": {s: f"{solved[s]}/{total[s]}" for s in total},
                "distinct_strategies_kept": len({x[4] for x in chosen if x[4]}),
