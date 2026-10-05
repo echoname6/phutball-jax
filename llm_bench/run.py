@@ -48,7 +48,38 @@ def sampling_extra(a) -> dict:
     return out
 
 
+CC_SYSTEM = "You are solving a board-game puzzle. Reason carefully, then give your final answer in the requested format."
+
+
+def call_claude_code(a, prompt_text: str) -> dict:
+    """Headless Claude Code (`claude -p`), billed to the Claude subscription: no tools, no MCP servers, a neutral
+    system prompt, run in an empty directory, so the model sees exactly the benchmark text. Reports output tokens
+    (thinking included), the stop reason and Claude Code's API-equivalent cost estimate."""
+    import subprocess
+    import tempfile
+    cmd = ["claude", "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+           "--system-prompt", CC_SYSTEM, "--model", a.model]
+    if a.effort: cmd += ["--effort", a.effort]
+    err = None
+    for attempt in range(3):
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                pr = subprocess.run(cmd, input=prompt_text, capture_output=True, text=True, timeout=a.timeout, cwd=d)
+            out = json.loads(pr.stdout)
+            if out.get("is_error"): raise RuntimeError(str(out.get("result"))[:300])
+            u = out.get("usage", {})
+            return {"reply": out.get("result") or "", "finish_reason": "length" if out.get("stop_reason") == "max_tokens" else "stop",
+                    "usage": {"completion_tokens": u.get("output_tokens", 0),
+                              "thinking_tokens": (u.get("output_tokens_details") or {}).get("thinking_tokens", 0),
+                              "prompt_tokens": u.get("input_tokens", 0)},
+                    "cost_usd": out.get("total_cost_usd", 0.0), "model_used": list(out.get("modelUsage", {}))}
+        except Exception as e:                               # noqa: BLE001
+            err = repr(e)[:300]; time.sleep(5 * (attempt + 1))
+    return {"reply": "", "error": err}
+
+
 def call(a, prompt_text: str, raw: str | None = None) -> dict:
+    if getattr(a, "claude_code", False) and raw is None: return call_claude_code(a, prompt_text)
     headers = {"Content-Type": "application/json"}
     key = os.environ.get(a.api_key_env)
     if key: headers["Authorization"] = f"Bearer {key}"
@@ -217,6 +248,14 @@ def summarize(rows, name, ck="correct", ok="outcome", t0=None):
         print(f"  {key:28s} n={len(g):4d}  accuracy {acc:6.1%} [{lo:5.1%}-{hi:5.1%}]{pk}  truncated {trunc:6.1%}   {top}")
     toks = [r.get("usage", {}).get("completion_tokens", 0) for r in rows]
     summary["mean_completion_tokens"] = round(sum(toks) / max(len(toks), 1), 1)
+    costs = [r.get("cost_usd") for r in rows if r.get("cost_usd") is not None]
+    if costs:
+        n_ok = sum(r[ck] for r in rows)
+        summary["cost_usd_total"] = round(sum(costs), 4)
+        summary["cost_usd_per_correct"] = round(sum(costs) / n_ok, 4) if n_ok else None
+        print(f"  cost (API-equivalent): ${sum(costs):.2f} total, "
+              + (f"${sum(costs) / n_ok:.3f} per correct answer" if n_ok else "no correct answers") +
+              f"; mean output tokens {summary['mean_completion_tokens']:.0f}")
     (ROOT / "llm_bench/results" / f"{name}.summary.json").write_text(json.dumps(summary, indent=1))
 
 
@@ -230,6 +269,9 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=4096); ap.add_argument("--temperature", type=float, default=0.0,
                     help="0 = greedy. Do NOT use greedy with thinking on (Qwen: endless repetition); use --qwen-thinking-sampling")
     ap.add_argument("--top-p", type=float, default=None); ap.add_argument("--top-k", type=int, default=None)
+    ap.add_argument("--claude-code", action="store_true",
+                    help="query Claude through headless Claude Code (subscription; --model e.g. opus, sonnet, haiku or a full id)")
+    ap.add_argument("--effort", default=None, help="Claude Code effort level (low, medium, high, xhigh, max)")
     ap.add_argument("--qwen-thinking-sampling", action="store_true", help="temperature 0.6, top-p 0.95, top-k 20 (Qwen's recommendation)")
     ap.add_argument("--timeout", type=float, default=600); ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0); ap.add_argument("--tasks", default="win,forced,block,prevent")
