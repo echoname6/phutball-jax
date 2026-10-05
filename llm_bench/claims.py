@@ -41,6 +41,7 @@ NEG = re.compile(r"\b(not|no|can't|cannot|can not|isn't|aren't|doesn't|don't|nev
 PLACE = re.compile(r"\b(plac\w*|put|puts|putting|add\w*|drop\w*)\b", re.I)
 CLAUSE = re.compile(r"[^.;?\n]+")
 ASSUME = re.compile(r"\b(assum\w*|suppose|pretend|hypothetical\w*|what if)\b", re.I)
+HEDGE = re.compile(r"\b(maybe|perhaps|might|possibly|probably|unless|example|e\.g|for instance|say)\b", re.I)
 NEED = re.compile(r"\b(needs?|needed|requir\w*|must|have to|has to)\b", re.I)      # "we need men at X": a requirement
 REMOVED = re.compile(r"\b(remov\w*|jumped|captured|gone|taken)\b", re.I)
 MOVED = re.compile(r"->|→|\bjump|\blands?\b|\blanding\b", re.I)
@@ -57,7 +58,7 @@ JUMP_PATTERNS = [
 ]
 BALL_RE = re.compile(rf"\bball(?:\s*\(@\))?\s+(?:(?:is|sits|starts|stands|lies)\s+(?:at|on|in)|(?:location|position|square)\s*:)\s*{SQ}", re.I)
 MAN_RE = re.compile(rf"\b(?:there(?:'s| is| are)\s+(?:a\s+)?)?(?:man|men|piece|pieces|stone|stones)\s+(?:at|on|in)\s+{LIST}", re.I)
-EMPTY_RE = re.compile(rf"{LIST}\s+(?:is|are)\s+(?:empty|vacant|free|unoccupied)", re.I)
+EMPTY_RE = re.compile(rf"{LIST}\s+(is|are)\s+(?:empty|vacant|free|unoccupied)", re.I)
 NOJUMP_RE = re.compile(rf"(?:from\s+{SQ}\s*[:,]?\s*no\s+(?:legal\s+)?jumps?|ball\s+has\s+no\s+(?:legal\s+)?jumps?)", re.I)
 WIN_RE = re.compile(rf"(?:winning\s+(?:sequence|chain|line)\s*(?:is)?\s*:?\s*|(?:sequence|chain)\s*:?\s*)((?:{SQS}[\s,>→-]*){{1,12}})\s*(?:wins|is a win|reaches|lands in (?:my|the) goal)?", re.I)
 WIN_RE2 = re.compile(rf"((?:{SQS}[\s,>→-]+){{0,11}}{SQS})\s+(?:wins|is a win|reaches the goal|lands in (?:my|the) goal)", re.I)
@@ -90,11 +91,14 @@ def extract(trace: str) -> list[dict]:
                             "pos": base + j.start(), "hyp": bool(hyp)})
         if not MOVED.search(trace[: base]) and not re.search(r"\b(now|after|then)\b", cl, re.I):   # the setup, not a line of play
             for j in BALL_RE.finditer(cl): out.append({"kind": "ball", "args": (j.group(1),), "text": j.group(0), "pos": base + j.start()})
-        if not hyp:
+        line = trace[trace.rfind("\n", 0, base) + 1: (trace.find("\n", base) + 1 or len(trace) + 1) - 1]
+        if not hyp and not HEDGE.search(line):                          # "maybe I missed a man at ...", "Example: ..."
             for j in MAN_RE.finditer(cl):
                 out.append({"kind": "man", "args": tuple(re.findall(SQ, j.group(1), re.I)), "text": j.group(0), "pos": base + j.start()})
             for j in ([] if REMOVED.search(cl) else EMPTY_RE.finditer(cl)):
-                out.append({"kind": "empty", "args": tuple(re.findall(SQ, j.group(1), re.I)), "text": j.group(0), "pos": base + j.start()})
+                xs = re.findall(SQ, j.group(1), re.I)
+                if j.group(2).lower() == "is": xs = xs[-1:]                # "men at j7, k7, l7 is empty": only l7
+                out.append({"kind": "empty", "args": tuple(xs), "text": j.group(0), "pos": base + j.start()})
         for j in ROW_RE.finditer(cl): out.append({"kind": "row", "args": (j.group(1), int(j.group(2))), "text": j.group(0), "pos": base + j.start()})
     for m in NOJUMP_RE.finditer(trace):                     # negated by nature: matched over the whole trace
         out.append({"kind": "nojump", "args": (m.group(1),), "text": m.group(0), "pos": m.start()})
@@ -178,11 +182,55 @@ def check(item: dict, trace: str) -> dict:
         elif k == "row":
             x = P(a[0])
             if x is not None and x // C != a[1]: why = f"{a[0]} is in row {x // C}"
-        res.append({**{k_: v for k_, v in c.items() if k_ != "hyp"}, "true": why is None, "why": why})
+        res.append({**{k_: v for k_, v in c.items() if k_ != "hyp"}, "hyp_jump": bool(c.get("hyp")), "true": why is None, "why": why})
     false = [r for r in res if not r["true"]]
+    contra = contradictions(res, trace, R, C, placed)
+    slips = {id(x) for pair in contra for x in pair[:2] if not x["true"]}
     return {"claims": len(res), "false": len(false), "by_kind": dict(Counter(r["kind"] for r in res)),
-            "false_claims": [{"kind": r["kind"], "text": r["text"], "why": r["why"]} for r in false],
-            "first_false_at": round(false[0]["pos"] / max(len(trace), 1), 3) if false else None}
+            "false_claims": [{"kind": r["kind"], "text": r["text"], "why": r["why"],
+                              "type": "slip" if id(r) in slips else "persistent"} for r in false],
+            "first_false_at": round(false[0]["pos"] / max(len(trace), 1), 3) if false else None,
+            "contradictions": len(contra),
+            "contradiction_pairs": [{"what": w, "first": a["text"], "then": b["text"]} for a, b, w in contra],
+            "slips": len(slips), "persistent": len(false) - len(slips)}
+
+
+def contradictions(res: list[dict], trace: str, R: int, C: int, placed: set) -> list[tuple]:
+    """Pairs of the trace's own statements about the starting position that cannot both hold, whatever the board:
+    a man at X vs X empty (unless the trace ever jumps / removes X - it often restarts from the original board - or
+    places a man there; hedged and example clauses are not claims), two starting
+    ball squares, two rows for one square. Judged against each other, not against the board."""
+    P = lambda t: parse_sq(t, R, C)
+    gone = []                                                             # (pos, square) where a man leaves the board
+    for c in res:
+        if c["kind"] == "jump": gone += [(c["pos"], P(t)) for t in c["args"][1]]
+    for cl in CLAUSE.finditer(trace):
+        if REMOVED.search(cl.group(0)): gone += [(cl.start(), x) for x in squares(cl.group(0), R, C)]
+    ever_gone = {x for _, x in gone}                                      # statements about these depend on when
+    occ = []                                                              # (pos, square, "man"/"empty", claim)
+    for c in res:
+        if c["kind"] == "man": occ += [(c["pos"], P(t), "man", c) for t in c["args"]]
+        elif c["kind"] == "empty": occ += [(c["pos"], P(t), "empty", c) for t in c["args"]]
+        elif c["kind"] == "jump" and not c.get("hyp_jump"): occ += [(c["pos"], P(t), "man", c) for t in c["args"][1]]
+    out, seen = [], set()
+    for i, (p1, x1, s1, c1) in enumerate(occ):
+        for p2, x2, s2, c2 in occ[i + 1:]:
+            if x1 != x2 or s1 == s2 or x1 is None or (x1, "occ") in seen: continue
+            if x1 in ever_gone: continue        # jumped / removed somewhere: traces restart from the original board
+            if x1 in placed: continue                                     # a man the trace puts there itself
+            a, b = (c1, c2) if p1 <= p2 else (c2, c1)
+            out.append((a, b, f"{sq(x1, C)}: man and empty")); seen.add((x1, "occ"))
+    balls = [c for c in res if c["kind"] == "ball"]
+    for c in balls[1:]:
+        if c["args"][0].lower() != balls[0]["args"][0].lower():
+            out.append((balls[0], c, "two starting squares for the ball")); break
+    rows = defaultdict(list)
+    for c in res:
+        if c["kind"] == "row": rows[c["args"][0].lower()].append(c)
+    for x, cs in rows.items():
+        if len({c["args"][1] for c in cs}) > 1:
+            b = next(c for c in cs if c["args"][1] != cs[0]["args"][1]); out.append((cs[0], b, f"{x}: two rows"))
+    return out
 
 
 def trace_of(row: dict) -> str:
@@ -218,14 +266,18 @@ def main():
         for key in (group(r), "all", "answer correct" if r.get("correct") else "answer wrong"):
             g = agg[key]; g["traces"] += 1; g["claims"] += res["claims"]; g["false"] += res["false"]
             g["with a false claim"] += res["false"] > 0; g["with a claim"] += res["claims"] > 0
+            g["with a contradiction"] += res["contradictions"] > 0; g["slips"] += res["slips"]; g["persistent"] += res["persistent"]
         if res["false"] and shown < a.show:
             shown += 1; print(f"{r['id']} ({'correct' if r.get('correct') else 'wrong'} answer):")
-            for fc in res["false_claims"][:3]: print(f"   [{fc['kind']}] \"{fc['text'][:90]}\" -> {fc['why']}")
-    print(f"\n{'group':28s} {'traces':>7s} {'claims/trace':>13s} {'false share':>12s} {'traces with a false claim':>26s}")
+            for fc in res["false_claims"][:3]: print(f"   [{fc['kind']}, {fc['type']}] \"{fc['text'][:90]}\" -> {fc['why']}")
+            for cp in res["contradiction_pairs"][:2]: print(f"   [contradiction] {cp['what']}: \"{cp['first'][:60]}\" vs \"{cp['then'][:60]}\"")
+    print(f"\n{'group':28s} {'traces':>7s} {'claims/trace':>13s} {'false share':>12s} {'with a false claim':>19s} "
+          f"{'self-contradicting':>19s} {'false: slips/persistent':>24s}")
     for k in sorted(agg, key=lambda k: (k in ("all", "answer correct", "answer wrong"), k)):
         g = agg[k]
         print(f"{k:28s} {g['traces']:7d} {g['claims'] / g['traces']:13.1f} {g['false'] / max(g['claims'], 1):12.1%} "
-              f"{g['with a false claim'] / g['traces']:26.1%}")
+              f"{g['with a false claim'] / g['traces']:19.1%} {g['with a contradiction'] / g['traces']:19.1%} "
+              f"{g['slips']:>13d} / {g['persistent']:<9d}")
     if a.out:
         with open(a.out, "w") as f:
             for p in per: f.write(json.dumps(p) + "\n")
