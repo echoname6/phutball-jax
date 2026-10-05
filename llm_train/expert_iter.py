@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--select", choices=["random", "shortest"], default="random",
                     help="which verified solutions to keep per puzzle (random: natural finishes first, no length preference)")
     ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"])
+    ap.add_argument("--pool", type=Path, default=None, help="curriculum pool (.jsonl or .jsonl.gz)")
+    ap.add_argument("--ids", type=Path, default=None, help="JSON list of pool ids to sample (from llm_train.curriculum)")
     a = ap.parse_args(); t0 = time.time(); rng = random.Random(a.seed); a.out.mkdir(parents=True, exist_ok=True)
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
@@ -73,11 +75,16 @@ def main():
     from llm_bench.run import score
     from llm_bench.text import prompt
 
-    rows = [json.loads(l) for l in open(a.puzzles)]; rng.shuffle(rows)        # same seed in both arms: same puzzles
-    share = {k_: float(v) for k_, v in (p.split("=") for p in a.mix.split(","))}
-    picked = []
-    for sub, f in share.items():
-        picked += [r for r in rows if r["subtask"] == sub][: int(round(f * a.n))]
+    if a.ids:                                                                 # curriculum: the scheduler chose the puzzles
+        from llm_train.curriculum import load_pool
+        by_id = {r["id"]: r for r in load_pool(a.pool)}
+        picked = [by_id[i] for i in json.loads(Path(a.ids).read_text())]
+    else:
+        rows = [json.loads(l) for l in open(a.puzzles)]; rng.shuffle(rows)    # same seed in both arms: same puzzles
+        share = {k_: float(v) for k_, v in (p.split("=") for p in a.mix.split(","))}
+        picked = []
+        for sub, f in share.items():
+            picked += [r for r in rows if r["subtask"] == sub][: int(round(f * a.n))]
     texts = []
     for r in picked:
         it = r["item"]; s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
@@ -119,6 +126,8 @@ def main():
     # the sample was generated under, so the cut is judged in its own context)
     cand = defaultdict(list)                                                  # i -> [(think_tokens, think, answer, approach)]
     stats = Counter(); force_jobs = []                                        # (sample index, cut, prefix)
+    per = defaultdict(Counter)                                                # puzzle -> outcome counts (for the scheduler)
+    for i, _, _ in jobs: per[i]["samples"] += 1
     for si, ((i, appr, p), o) in enumerate(zip(jobs, gen)):
         out = o.outputs[0]; text = out.text
         if "</think>" in text:
@@ -127,10 +136,11 @@ def main():
             if score(picked[i]["item"], ans)["correct"]:
                 if appr and LEAK.search(th): stats["dropped: refers to its instruction"] += 1; continue
                 cand[i].append((len(out.token_ids), th.rstrip("\n"), ans_line, appr, True)); stats["kept: finished"] += 1
+                per[i]["verified"] += 1; per[i]["finished_correct"] += 1
             else:
-                stats["finished wrong"] += 1
+                stats["finished wrong"] += 1; per[i]["finished_wrong"] += 1
             continue
-        stats["cut off"] += 1
+        stats["cut off"] += 1; per[i]["cut_off"] += 1
         for c in CUTS:
             if c <= len(out.token_ids): force_jobs.append((si, c, snap(tok.decode(out.token_ids[:c]))))
     forced = llm.generate([jobs[si][2] + pre + STOP + "ANSWER:" for si, _, pre in force_jobs],
@@ -146,7 +156,7 @@ def main():
             if all(g[d][0] for d in cs[kk:]):
                 ok, pre, ans = g[c]
                 if appr and LEAK.search(pre): stats["dropped: refers to its instruction"] += 1; break
-                cand[i].append((c, pre, ans, appr, False)); stats["kept: stable cut"] += 1
+                cand[i].append((c, pre, ans, appr, False)); stats["kept: stable cut"] += 1; per[i]["verified"] += 1
                 break
 
     # select up to --keep per puzzle. random (default): natural finishes first, in random order, then stable cuts in
@@ -174,6 +184,12 @@ def main():
             f.write(json.dumps({"prompt": heads[i], "completion": th + STOP + ans.strip() + tok.eos_token,
                                 "id": picked[i]["id"], "subtask": picked[i]["subtask"], "think_tokens": L,
                                 "approach": appr, "natural": natural}) + "\n")
+    with open(a.out / "outcomes.jsonl", "w") as f:                            # one line per puzzle, for the scheduler
+        for i, r in enumerate(picked):
+            c = per[i]
+            f.write(json.dumps({"id": r["id"], "subtask": r["subtask"], "samples": c["samples"], "verified": c["verified"],
+                                "finished_correct": c["finished_correct"], "finished_wrong": c["finished_wrong"],
+                                "cut_off": c["cut_off"]}) + "\n")
     solved = Counter(picked[i]["subtask"] for i in cand)
     total = Counter(r["subtask"] for r in picked)
     summary = {"arm": a.arm, "select": a.select, "natural_share": round(sum(x[5] for x in chosen) / max(len(chosen), 1), 3),
