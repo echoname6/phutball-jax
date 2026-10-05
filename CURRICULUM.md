@@ -118,3 +118,22 @@ the men list.
 - Is the reasoning faithful? Claims inside the thinking ("jump h10 to h8 over h9") can be checked by the engine;
   a claim checker would measure whether correct answers rest on true statements.
 - Does training install intuition or only tidier search? Evaluate with thinking capped at 256 tokens.
+
+## v2 results and the per-puzzle v3 (2026-10-05)
+
+v2 (this document's scheduler, rounds 1-9 from the self-stop warm start; full evals n = 100 per task): finished
+accuracy on wins 38.2% (r1) -> 42.9% (r5) with truncation 54% -> 51%, while budget-forced accuracy stayed flat (84.5%
+-> 83.0%): the model knows the answer ~83% of the time and finishes ~43%. Promoted: r1, r2, r6. Problems found:
+- per-puzzle parole never fired (300 of 15,512 puzzles a round: a puzzle comes up once in ~50 rounds), so allocation
+  ran on bucket averages;
+- stable-cut credit made the no-win bucket read 0.92-0.96 and starved it to 3 puzzles a round, while finished accuracy
+  on near-miss negatives was 40-67%; r8 (truncation 22%, best finished wins 57%) said NO WIN on more real wins;
+- the 25-item gate is noise-dominated (r3 and r8 had the lowest truncation and were rejected);
+- sft_stop trains a fresh LoRA from the base model on one round's ~400 examples, so nothing accumulated except
+  through better generator data.
+
+v3 (`llm_train/curriculum_pp.py`, `curriculum_pp_colab.ipynb`): per-puzzle success rates from 8 samples, finished
+answers only; round 1 screens 1,600 puzzles; 8/8 mastered (no more sampling or new training), 0/8 paroled with 10%
+spot checks as the only way back; a bank of each puzzle's latest verified examples, replayed 1:1 with each round's new
+examples (at most 1,000) so the from-base retrain accumulates. Starts from v2's r6. The gate is unchanged (still the
+weak point).
