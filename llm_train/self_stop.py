@@ -49,6 +49,7 @@ def main():
                     help="share of --n per subtask (prevent left out: one-rule shortcut)")
     ap.add_argument("--max-think", type=int, default=max(CUTS))
     ap.add_argument("--temperature", type=float, default=0.6); ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"])
     a = ap.parse_args(); t0 = time.time(); rng = random.Random(a.seed)
     from vllm import LLM, SamplingParams
     from expert.engine import State
@@ -67,7 +68,7 @@ def main():
     heads = []
     for r in picked:
         it = r["item"]; s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
-        heads.append(tok.apply_chat_template([{"role": "user", "content": prompt(it["task"], s)}], tokenize=False,
+        heads.append(tok.apply_chat_template([{"role": "user", "content": prompt(it["task"], s, a.prompt_format)}], tokenize=False,
                                              add_generation_prompt=True, enable_thinking=True))
     gen = llm.generate(heads, SamplingParams(temperature=a.temperature, top_p=0.95, top_k=20, max_tokens=a.max_think,
                                              seed=a.seed))

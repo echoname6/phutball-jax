@@ -281,12 +281,18 @@ def main():
     ap.add_argument("--truncate-at", type=int, default=0, help="with --salvage: simulate this token budget")
     ap.add_argument("--samples", type=int, default=1, help="samples per item (use with sampling): reports pass@1 and pass@K")
     ap.add_argument("--budget-hint", type=int, default=0, help="append the training-time thinking-budget sentence")
+    ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"],
+                    help="ascii: board only (all results before 2026-10-05); ascii+men: board plus the list of men's squares")
     ap.add_argument("--tokenizer", default=None, help="tokenizer for --salvage (default: --model; needed when --model is a LoRA name)")
     ap.add_argument("--salvage", default=None, help="results name: budget-force an answer from replies that hit the cap "
                                                      "(needs --model and --thinking as in the original run)")
     a = ap.parse_args()
     if a.qwen_thinking_sampling: a.temperature, a.top_p, a.top_k = 0.6, 0.95, 20
     items = [json.loads(l) for l in open(a.bench)]
+    if a.prompt_format != "ascii":                           # rebuild prompts from the stored positions
+        from llm_bench.text import prompt as build_prompt
+        for it in items:
+            it["prompt"] = build_prompt(it["task"], State(it["rows"], it["cols"], it["board"], it["ball"], it["player"]), a.prompt_format)
     if a.budget_hint:                                        # same wording as llm_train.grpo_pilot.BUDGET_HINT
         for it in items:
             it["prompt"] += (f"\n\nYou have a thinking budget of about {a.budget_hint:,} tokens. When you have checked "

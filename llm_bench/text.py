@@ -63,9 +63,20 @@ def rules(s: State) -> str:
     return RULES.format(rows=s.rows, cols=s.cols, lastc=COLS[s.cols - 1], g2a=s.rows - 2, g2b=s.rows - 1)
 
 
-def position_text(s: State) -> str:
+FORMATS = ("ascii", "ascii+men")   # prompt formats: v1 board only (all results before 2026-10-05); v2 adds the men list
+
+
+def men_text(s: State) -> str:
+    """Every man's square in reading order (row by row from the top, then left to right)."""
+    men = [sq(i, s.cols) for i, v in enumerate(s.board) if v == MAN and i != s.ball]
+    return f"Men ({len(men)}): " + (", ".join(men) if men else "none") + "."
+
+
+def position_text(s: State, fmt: str = "ascii") -> str:
+    assert fmt in FORMATS, fmt
+    men = f"{men_text(s)}\n" if fmt == "ascii+men" else ""
     return (f"{rules(s)}\n\nPosition (Player {s.player} to move; the ball is at {sq(s.ball, s.cols)}):\n\n{render(s)}\n\n"
-            f"{first_jumps_text(s)}")
+            f"{men}{first_jumps_text(s)}")
 
 
 PROMPTS = {
@@ -86,8 +97,8 @@ PROMPTS = {
 }
 
 
-def prompt(task: str, s: State) -> str:
-    return PROMPTS[task].format(pos=position_text(s), p=s.player, o=3 - s.player)
+def prompt(task: str, s: State, fmt: str = "ascii") -> str:
+    return PROMPTS[task].format(pos=position_text(s, fmt), p=s.player, o=3 - s.player)
 
 
 ANS_RE = re.compile(r"ANSWER:\s*(.+)", re.IGNORECASE)

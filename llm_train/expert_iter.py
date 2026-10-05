@@ -65,6 +65,7 @@ def main():
     ap.add_argument("--max-neg-ratio", type=float, default=0.6); ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--select", choices=["random", "shortest"], default="random",
                     help="which verified solutions to keep per puzzle (random: natural finishes first, no length preference)")
+    ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"])
     a = ap.parse_args(); t0 = time.time(); rng = random.Random(a.seed); a.out.mkdir(parents=True, exist_ok=True)
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
@@ -80,7 +81,7 @@ def main():
     texts = []
     for r in picked:
         it = r["item"]; s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
-        texts.append(prompt(it["task"], s))
+        texts.append(prompt(it["task"], s, a.prompt_format))
     print(f"{len(picked)} puzzles: {dict(Counter(r['subtask'] for r in picked))}; arm {a.arm}, k={a.k}", flush=True)
 
     llm = LLM(a.model, max_model_len=a.max_think + 2048, gpu_memory_utilization=0.90, enable_prefix_caching=True,
