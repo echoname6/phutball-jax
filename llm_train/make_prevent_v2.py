@@ -49,7 +49,7 @@ def neighbours(s) -> list[int]:
 
 
 def worker(args):
-    wid, seed, quota, deadline, strict = args
+    wid, seed, quota, deadline, strict, part = args
     import numpy as np
     from expert.engine import BALL, EMPTY, MAN, State
     from expert.puzzle_place import CapHit, make_prevent
@@ -78,8 +78,10 @@ def worker(args):
                 "player": int(s.player), "answers": {"placements": sorted(sq(p, C) for p in pl),
                                                      "saving_first_jumps": sorted(sq(l, C) for l in jl)},
                 "meta": {**{k: int(v) for k, v in meta.items()}, "source": "expert games, no escape hatch" + (" (strict)" if strict else "")}}
-        out.append({"id": pid, "task": "prevent", "subtask": "prevent", "item": item, "bucket": "prevent"})
-        stats["kept"] += 1
+        row = {"id": pid, "task": "prevent", "subtask": "prevent", "item": item, "bucket": "prevent"}
+        out.append(row); stats["kept"] += 1
+        with open(part, "a") as f: f.write(json.dumps(row) + "\n")         # saved as found: a crash loses nothing
+        if stats["kept"] % 10 == 0: print(f"worker {wid}: {stats['kept']} kept, {dict(stats)}", flush=True)
     return out, stats
 
 
@@ -92,7 +94,8 @@ def main():
     a = ap.parse_args(); t0 = time.time()
     quota = -(-a.n // a.workers); deadline = t0 + a.minutes * 60
     with mp.get_context("spawn").Pool(a.workers) as pool:
-        res = pool.map(worker, [(w, a.seed + w, quota, deadline, a.strict) for w in range(a.workers)])
+        res = pool.map(worker, [(w, a.seed + w, quota, deadline, a.strict, f"{a.out}.part{w}.jsonl")
+                                for w in range(a.workers)])
     from llm_train.build_traces import key_of
     seen, rows = set(), []
     for out, _ in res:
