@@ -235,13 +235,14 @@ def check(item: dict, trace: str, extractor: str = "map") -> dict:
             ok, reason = wins()
             if not ok and any(wins(p)[0] for p in placed if s0.board[p] not in (MAN, BALL)): ok = True   # after a placement it proposes
             if not ok: why = f"not a win ({reason})"
-        elif k == "coord":                               # true under ANY convention: traces switch conventions
+        elif k == "coord":                               # any allowed convention: traces mix them (claim_map.COORD_CONVENTIONS)
+            from llm_bench.claim_map import COORD_CONVENTIONS
             r, cc = divmod(P(a[0]), C)
-            valid = {(cc + cb, r + rb) for cb in (0, 1) for rb in (-1, 0, 1)} | {(r + rb, cc + cb) for cb in (0, 1) for rb in (-1, 0, 1)}
-            if (a[1], a[2]) not in valid: why = f"({a[1]}, {a[2]}) fits no coordinate convention for {a[0]} (column {cc}, row {r})"
+            if (a[1], a[2]) not in {f(r, cc) for _, _, f in COORD_CONVENTIONS}:
+                why = f"({a[1]}, {a[2]}) fits no allowed coordinate convention for {a[0]} (column {cc}, row {r})"
         elif k == "colrow":
             r, cc = divmod(P(a[0]), C)
-            if a[1] not in (cc, cc + 1) or a[2] != r: why = f"{a[0]} is column {cc} (0-based), row {r}"
+            if a[1] not in (cc, cc + 1) or a[2] not in (r, r - 1): why = f"{a[0]} is column {cc} (0-based), row {r}"
         elif k == "adjacent":
             (r1, c1), (r2, c2) = divmod(P(a[0]), C), divmod(P(a[1]), C)
             if max(abs(r1 - r2), abs(c1 - c2)) != 1: why = f"{a[0]} and {a[1]} are not adjacent"

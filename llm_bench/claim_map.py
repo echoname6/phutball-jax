@@ -14,8 +14,8 @@ Checks (args come from the clause: its squares in order, list slots expanded, an
   empty     each square is empty (squares the trace ever jumps/removes are skipped: traces restart from the original
             board); "last": only the last square of the clause
   row       the square is in row N;  rowlist: every square is in row N (the clause's first number)
-  coord     the square's (x, y) numbers fit SOME convention (column/row order, 0- or 1-based columns, rows as labelled or shifted by one): traces switch
-            conventions mid-way, so only numbers that fit none (a misread square) count as false
+  coord     the square's (x, y) numbers fit one of COORD_CONVENTIONS (the web app's, the training notation's rational
+            readings, and readings the traces use); traces may mix them, so only numbers that fit none count as false
   colrow    "(col N, row M)": named, so only the base (0/1) is inferred
   adjacent  the two squares are king-adjacent
   dirlist   the listed squares step one square at a time in the named direction
@@ -27,6 +27,23 @@ from __future__ import annotations
 
 VERSION = 1
 SOURCES = "v2 evals: untrained, warmstart, g0-g10, r1, r5 (2026-10-05)"
+
+# Coordinate conventions a trace may write a square's numbers in (each claim must fit one; a trace may mix them).
+# Frozen in v1 from three sources: the web app's own coordinates, the rational numeric readings of the training notation
+# (column letter a-o + row label 0-20), and readings the eval traces actually use (counted over 132,326 coordinate
+# claims in the v2 evals; a reading is admitted when it is the only fit for >= 0.5% of claims). 1.0% of claims fit
+# no candidate at all. Each entry: (name, source, square (row r, col c) -> (x, y)).
+R_, C_ = 21, 15
+COORD_CONVENTIONS = [
+    ("(row, col), 0-based: the web app's matrix coordinates", "web", lambda r, c: (r, c)),
+    ("player 2's rotated matrix view", "web", lambda r, c: (R_ - 1 - r, C_ - 1 - c)),
+    ("(row, col), 1-based sequential labels", "web", lambda r, c: (r + 1, c + 1)),
+    ("(col, row): column index 0-based, row label", "training", lambda r, c: (c, r)),        # 38.4% of claims fit
+    ("(col, row): column index 1-based, row label", "training", lambda r, c: (c + 1, r)),    # 20.3%
+    ("(row, col): row label, column index 1-based", "training", lambda r, c: (r, c + 1)),    # 8.8% (0-based: the web's, 30.1%)
+    ("(col, row - 1): row labels read as 1-based", "observed", lambda r, c: (c, r - 1)),     # only fit for 4,912 claims
+    ("(row - 1, col): row labels read as 1-based", "observed", lambda r, c: (r - 1, c)),     # only fit for 1,432 claims
+]
 
 DIRS = {"up": (-1, 0), "north": (-1, 0), "down": (1, 0), "south": (1, 0), "left": (0, -1), "west": (0, -1),
         "right": (0, 1), "east": (0, 1), "nw": (-1, -1), "ne": (-1, 1), "sw": (1, -1), "se": (1, 1),
