@@ -226,8 +226,9 @@ def truncated(r) -> bool:
 def summarize(rows, name, ck="correct", ok="outcome", t0=None):
     groups = defaultdict(list)
     for row in rows:
-        if row["task"] == "win":
-            key = f"win: {'positive, ' + str(row['meta']['difficulty']) + '-jump' if row['answers']['win'] else 'near-miss negative'}"
+        if row["task"] == "win":                             # backward-trap wins (the curriculum validation set) apart
+            kind = "backward-trap, " if row["meta"].get("family") == "back" else "positive, "
+            key = f"win: {kind + str(row['meta']['difficulty']) + '-jump' if row['answers']['win'] else 'near-miss negative'}"
         else:
             key = f"{row['task']} placement"
         groups[key].append(row)
