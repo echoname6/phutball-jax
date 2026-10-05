@@ -35,6 +35,7 @@ from llm_bench.text import check_win_sequence, parse_sq, sq  # noqa: E402
 
 SQ = r"\b([a-o](?:1\d|20|\d))\b"
 SQS = SQ[:-2].replace("(", "(?:", 1) + r"\b"                               # non-capturing version
+SQ_STRIP = re.compile(r"\b[a-o](?:1\d|20|\d)\b", re.I)                   # squares out, before reading numbers
 LIST = rf"({SQS}(?:\s*(?:,|and|&|\+)\s*{SQS})*)"
 NEG = re.compile(r"\b(not|no|can't|cannot|can not|isn't|aren't|doesn't|don't|never|illegal|impossible|blocked|"
                  r"wouldn't|won't|fails?|invalid|without)\b", re.I)
@@ -116,10 +117,64 @@ def extract(trace: str) -> list[dict]:
     return uniq
 
 
-def check(item: dict, trace: str) -> dict:
+def extract_mapped(trace: str) -> tuple[list[dict], dict]:
+    """v1 claim map (llm_bench/claim_map.py): clause templates -> checks, plus the rule extractor's jump / win / no-jump
+    claims. Returns (claims, coverage counts)."""
+    from llm_bench.claim_map import DIRS, MAP
+    from llm_bench.claim_templates import clauses, normalize
+    out = [c for c in extract(trace) if c["kind"] in ("jump", "win", "nojump")]
+    cov = Counter()
+    for pos, cl in clauses(trace):
+        cov["square clauses"] += 1
+        t = normalize(cl); spec = MAP.get(t)
+        if spec is None: continue
+        cov["labelled"] += 1
+        if spec["check"] == "none": continue
+        cov["checked"] += 1
+        end = trace[pos + len(cl): pos + len(cl) + 1]
+        line = trace[trace.rfind("\n", 0, pos) + 1: (trace.find("\n", pos) + 1 or len(trace) + 1) - 1]
+        if end == "?" or HEDGE.search(line) or ASSUME.search(line): continue
+        hyp = bool(PLACE.search(cl)) or re.search(r"\b(if|would|could|suppose|imagine)\b", cl, re.I)
+        sqs = re.findall(SQ, cl, re.I); nums = [int(n) for n in re.findall(r"\b(\d+)\b", SQ_STRIP.sub(" ", cl))]
+        k = spec["check"]; base = {"text": cl.strip(), "pos": pos}
+        if k in ("man", "empty", "menlist", "ball", "goal") and hyp: continue
+        if k in ("ball", "menlist") and (MOVED.search(trace[:pos]) or re.search(r"\b(now|after|then)\b", cl, re.I)): continue
+        if k == "empty" and REMOVED.search(cl): continue
+        if k == "ball": out.append({**base, "kind": "ball", "args": (sqs[0],)})
+        elif k in ("man", "menlist"): out.append({**base, "kind": "man", "args": tuple(sqs)})
+        elif k == "empty": out.append({**base, "kind": "empty", "args": tuple(sqs[-1:] if spec.get("last") else sqs)})
+        elif k == "row" and nums: out.append({**base, "kind": "row", "args": (sqs[0], nums[-1])})
+        elif k == "rowlist" and nums: out += [{**base, "kind": "row", "args": (x, nums[0])} for x in sqs]
+        elif k == "coord" and len(nums) >= 2:
+            out.append({**base, "kind": "coord", "args": (sqs[0], nums[0], nums[1])})
+            if spec.get("also_empty"): out.append({**base, "kind": "empty", "args": (sqs[0],)})
+        elif k == "colrow" and len(nums) >= 2: out.append({**base, "kind": "colrow", "args": (sqs[0], nums[0], nums[1])})
+        elif k == "adjacent" and len(sqs) >= 2: out.append({**base, "kind": "adjacent", "args": (sqs[0], sqs[1])})
+        elif k == "dirlist" and len(sqs) >= 2:
+            d = t.split(":")[0].split(" (")[0].strip()
+            if d in DIRS: out.append({**base, "kind": "dirlist", "args": (DIRS[d], tuple(sqs))})
+        elif k == "path" and len(sqs) >= 3: out.append({**base, "kind": "path", "args": tuple(sqs)})
+        elif k == "goal": out.append({**base, "kind": "goal", "args": (sqs[0],)})
+    seen, uniq = set(), []
+    for c in sorted(out, key=lambda c: c["pos"]):
+        key = (c["kind"], c["args"], c["pos"] if c["kind"] in ("coord",) else 0)
+        if key not in seen: seen.add(key); uniq.append(c)
+    return uniq, dict(cov)
+
+
+def _squares_of(c: dict) -> list[str]:
+    a = c["args"]
+    if c["kind"] == "jump": return [x for x in (a[0], a[2], *a[1]) if x]
+    if c["kind"] == "dirlist": return list(a[1])
+    if c["kind"] in ("coord", "colrow", "row"): return [a[0]]
+    if c["kind"] == "nojump": return [a[0]] if a[0] else []
+    return [x for x in a if isinstance(x, str)]
+
+
+def check(item: dict, trace: str, extractor: str = "map") -> dict:
     s0 = State(item["rows"], item["cols"], list(item["board"]), item["ball"], item["player"])
     R, C = s0.rows, s0.cols; P = lambda t: parse_sq(t, R, C) if t else None
-    claims = extract(trace)
+    claims, cov = extract_mapped(trace) if extractor == "map" else (extract(trace), {})
     man0 = {i for i, v in enumerate(s0.board) if v == MAN}
     jumped_any = {P(t) for c in claims if c["kind"] == "jump" for t in c["args"][1]}
     for cl in CLAUSE.finditer(trace):
@@ -129,6 +184,7 @@ def check(item: dict, trace: str) -> dict:
     for cl in CLAUSE.finditer(trace):
         if PLACE.search(cl.group(0)): placed |= set(squares(cl.group(0), R, C))
     first_jump = min([c["pos"] for c in claims if c["kind"] == "jump"], default=len(trace) + 1)
+    claims = [c for c in claims if all(P(x) is not None for x in _squares_of(c))]       # squares off this board
     res = []
     for c in claims:
         k, a = c["kind"], c["args"]; why = None
@@ -179,6 +235,30 @@ def check(item: dict, trace: str) -> dict:
             ok, reason = wins()
             if not ok and any(wins(p)[0] for p in placed if s0.board[p] not in (MAN, BALL)): ok = True   # after a placement it proposes
             if not ok: why = f"not a win ({reason})"
+        elif k == "coord":                               # true under ANY convention: traces switch conventions
+            r, cc = divmod(P(a[0]), C)
+            valid = {(cc + cb, r + rb) for cb in (0, 1) for rb in (-1, 0, 1)} | {(r + rb, cc + cb) for cb in (0, 1) for rb in (-1, 0, 1)}
+            if (a[1], a[2]) not in valid: why = f"({a[1]}, {a[2]}) fits no coordinate convention for {a[0]} (column {cc}, row {r})"
+        elif k == "colrow":
+            r, cc = divmod(P(a[0]), C)
+            if a[1] not in (cc, cc + 1) or a[2] != r: why = f"{a[0]} is column {cc} (0-based), row {r}"
+        elif k == "adjacent":
+            (r1, c1), (r2, c2) = divmod(P(a[0]), C), divmod(P(a[1]), C)
+            if max(abs(r1 - r2), abs(c1 - c2)) != 1: why = f"{a[0]} and {a[1]} are not adjacent"
+        elif k == "dirlist":
+            (dr, dc), xs = a; pts = [divmod(P(x), C) for x in xs]
+            if any((q[0] - p_[0], q[1] - p_[1]) != (dr, dc) for p_, q in zip(pts, pts[1:])):
+                why = "the squares do not step one at a time in that direction"
+        elif k == "path":
+            pts = [divmod(P(x), C) for x in a]; steps = {(q[0] - p_[0], q[1] - p_[1]) for p_, q in zip(pts, pts[1:])}
+            if len(steps) != 1 or max(abs(v) for v in next(iter(steps))) != 1 or next(iter(steps)) == (0, 0):
+                why = "not a straight line of adjacent squares"
+        elif k == "goal":
+            nl = trace.find("\n", c["pos"]); line = trace[max(0, trace.rfind("\n", 0, c["pos"]) + 1): nl if nl >= 0 else len(trace)]
+            who = re.findall(r"\b(?:player\s*|p)([12])\b", line, re.I); r = P(a[0]) // C
+            goals = {1: r <= 1, 2: r >= R - 2}
+            if who and not goals[int(who[-1])]: why = f"{a[0]} (row {r}) is not Player {who[-1]}'s goal"
+            elif not who and not any(goals.values()): why = f"{a[0]} (row {r}) is in neither goal"
         elif k == "row":
             x = P(a[0])
             if x is not None and x // C != a[1]: why = f"{a[0]} is in row {x // C}"
@@ -192,7 +272,7 @@ def check(item: dict, trace: str) -> dict:
             "first_false_at": round(false[0]["pos"] / max(len(trace), 1), 3) if false else None,
             "contradictions": len(contra),
             "contradiction_pairs": [{"what": w, "first": a["text"], "then": b["text"]} for a, b, w in contra],
-            "slips": len(slips), "persistent": len(false) - len(slips)}
+            "slips": len(slips), "persistent": len(false) - len(slips), "coverage": cov}
 
 
 def contradictions(res: list[dict], trace: str, R: int, C: int, placed: set) -> list[tuple]:
@@ -252,6 +332,8 @@ def main():
     ap.add_argument("results", type=Path); ap.add_argument("--bench", type=Path, default=ROOT / "llm_bench/data/bench.jsonl")
     ap.add_argument("--show", type=int, default=5, help="print this many false claims")
     ap.add_argument("--out", type=Path, default=None, help="per-trace results (.jsonl)")
+    ap.add_argument("--extractor", choices=["map", "rules"], default="map",
+                    help="map: the versioned claim map (llm_bench/claim_map.py) + jump/win rules; rules: the v0 patterns")
     a = ap.parse_args()
     items = {}
     for b in [a.bench, ROOT / "llm_train/puzzles/val_v3.jsonl", ROOT / "llm_bench/data/prevent_v2_test.jsonl"]:
@@ -262,11 +344,12 @@ def main():
     for r in rows:
         it = items.get(r["id"])
         if it is None: continue
-        res = check(it, trace_of(r)); per.append({"id": r["id"], "sample": r.get("sample", 0), "correct": r.get("correct"), **res})
+        res = check(it, trace_of(r), a.extractor); per.append({"id": r["id"], "sample": r.get("sample", 0), "correct": r.get("correct"), **res})
         for key in (group(r), "all", "answer correct" if r.get("correct") else "answer wrong"):
             g = agg[key]; g["traces"] += 1; g["claims"] += res["claims"]; g["false"] += res["false"]
             g["with a false claim"] += res["false"] > 0; g["with a claim"] += res["claims"] > 0
             g["with a contradiction"] += res["contradictions"] > 0; g["slips"] += res["slips"]; g["persistent"] += res["persistent"]
+            for ck, cv in res["coverage"].items(): g["cov " + ck] += cv
         if res["false"] and shown < a.show:
             shown += 1; print(f"{r['id']} ({'correct' if r.get('correct') else 'wrong'} answer):")
             for fc in res["false_claims"][:3]: print(f"   [{fc['kind']}, {fc['type']}] \"{fc['text'][:90]}\" -> {fc['why']}")
@@ -278,6 +361,11 @@ def main():
         print(f"{k:28s} {g['traces']:7d} {g['claims'] / g['traces']:13.1f} {g['false'] / max(g['claims'], 1):12.1%} "
               f"{g['with a false claim'] / g['traces']:19.1%} {g['with a contradiction'] / g['traces']:19.1%} "
               f"{g['slips']:>13d} / {g['persistent']:<9d}")
+    g = agg["all"]
+    if g["cov square clauses"]:
+        print(f"\ncoverage (claim map v{__import__('llm_bench.claim_map', fromlist=['VERSION']).VERSION}): of {g['cov square clauses']:,} "
+              f"clauses that mention a square, {g['cov labelled'] / g['cov square clauses']:.1%} match a labelled template "
+              f"and {g['cov checked'] / g['cov square clauses']:.1%} a checked one")
     if a.out:
         with open(a.out, "w") as f:
             for p in per: f.write(json.dumps(p) + "\n")
