@@ -137,12 +137,26 @@ class State:
                               "paroled_now": paroled_now, "released": released, "status": dict(st)})
 
 
+FAMILIES = {"wins": ("win: positive, 1-jump", "win: positive, 2-jump", "win: positive, 3-jump", "win: positive, 4-jump"),
+            "no-win": ("win: near-miss negative",), "placements": ("block placement", "forced placement")}
+
+
+def pooled(S: dict, keys) -> float | None:
+    """n-weighted accuracy over several summary groups (pooling keeps the drop check out of small-sample noise)."""
+    num = sum(S[k]["accuracy"] * S[k]["n"] for k in keys if k in S); den = sum(S[k]["n"] for k in keys if k in S)
+    return num / den if den else None
+
+
 def gate(best: dict | None, new: dict, best_forced: dict | None, new_forced: dict) -> tuple[bool, str]:
-    """best/new: finished summaries; *_forced: budget-forced summaries (llm_bench.run). Returns (promote, reason)."""
+    """best/new: finished summaries; *_forced: budget-forced summaries (llm_bench.run), same eval protocol.
+    Promote if the mean finished pass@1 over GATE_KEYS improves and no family's pooled forced accuracy
+    (wins, no-win, placements) drops more than MAX_DROP. Returns (promote, reason)."""
     score = lambda S: sum(S[k]["accuracy"] for k in GATE_KEYS if k in S) / max(1, sum(k in S for k in GATE_KEYS))
     if best is None: return True, "no previous model"
-    drops = {k: round(best_forced[k]["accuracy"] - new_forced[k]["accuracy"], 3) for k in GATE_KEYS
-             if k in best_forced and k in new_forced}
+    drops = {}
+    for fam, keys in FAMILIES.items():
+        b, n = pooled(best_forced, keys), pooled(new_forced, keys)
+        if b is not None and n is not None: drops[fam] = round(b - n, 3)
     worst = max(drops.items(), key=lambda kv: kv[1]) if drops else (None, 0)
     if worst[1] > MAX_DROP: return False, f"forced accuracy on {worst[0]} dropped {worst[1]:.0%} (> {MAX_DROP:.0%})"
     if score(new) <= score(best): return False, f"mean finished pass@1 {score(new):.3f} <= best {score(best):.3f}"

@@ -48,7 +48,7 @@ def bench_keys() -> set:
 
 
 def worker(args):
-    wid, seed, quota, keep_adj, deadline = args
+    wid, seed, quota, keep_adj, deadline, tasks = args
     from expert.engine import State
     from expert.puzzle_data import CELLS, Generator
     from expert.puzzle_place import CapHit, make_block, make_forced, make_prevent, make_threat, threat_placements
@@ -58,7 +58,7 @@ def worker(args):
 
     gen = Generator(seed=seed); rng = random.Random(seed); avoid = bench_keys()
     win_cells = list(CELLS); place_cells = [c for c in CELLS if c[1] <= 3]
-    need = {t: quota for t in TASKS}; out = []; stats = Counter(); k = 0
+    need = {t: (quota if t in tasks else 0) for t in TASKS}; out = []; stats = Counter(); k = 0
 
     def emit(task, s, answers, meta, res):
         if res is None: stats[f"{task}: skipped (search cap / label mismatch)"] += 1; return False
@@ -78,7 +78,7 @@ def worker(args):
     while any(v > 0 for v in need.values()) and time.time() < deadline:
         k += 1
         try:
-            if need["win_pos"] > 0 and k % 3 == 0:
+            if need["win_pos"] > 0 and (k % 3 == 0 or all(need[t] <= 0 for t in TASKS if t != "win_pos")):
                 cell = win_cells[rng.randrange(len(win_cells))]
                 s = gen.puzzle(cell)
                 if s is None or key_of(s.board, s.ball, s.player) in avoid: continue
@@ -122,6 +122,7 @@ def worker(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--per-task", type=int, default=50, help="examples per subtask (win_pos, win_neg, forced, block, prevent)")
+    ap.add_argument("--tasks", default=",".join(TASKS), help="subtasks to generate (e.g. win_pos)")
     ap.add_argument("--workers", type=int, default=4); ap.add_argument("--seed", type=int, default=20000)
     ap.add_argument("--keep-adjacent-forced", action="store_true"); ap.add_argument("--minutes", type=float, default=60)
     ap.add_argument("--out", type=Path, default=ROOT / "llm_train/data/traces.jsonl")
@@ -129,7 +130,7 @@ def main():
     a = ap.parse_args(); t0 = time.time()
     quota = -(-a.per_task // a.workers); deadline = t0 + a.minutes * 60
     with mp.get_context("spawn").Pool(a.workers) as pool:
-        res = pool.map(worker, [(w, a.seed + w, quota, a.keep_adjacent_forced, deadline) for w in range(a.workers)])
+        res = pool.map(worker, [(w, a.seed + w, quota, a.keep_adjacent_forced, deadline, tuple(a.tasks.split(","))) for w in range(a.workers)])
     rows = [r for out, _ in res for r in out]; stats = sum((st for _, st in res), Counter())
     seen, uniq = set(), []
     for r in rows:
