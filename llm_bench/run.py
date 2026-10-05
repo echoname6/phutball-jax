@@ -72,7 +72,8 @@ def call_claude_code(a, prompt_text: str) -> dict:
                     "usage": {"completion_tokens": u.get("output_tokens", 0),
                               "thinking_tokens": (u.get("output_tokens_details") or {}).get("thinking_tokens", 0),
                               "prompt_tokens": u.get("input_tokens", 0)},
-                    "cost_usd": out.get("total_cost_usd", 0.0), "model_used": list(out.get("modelUsage", {}))}
+                    "cost_usd": out.get("total_cost_usd", 0.0), "model_used": list(out.get("modelUsage", {})),
+                    "latency_s": round((out.get("duration_api_ms") or 0) / 1000, 2)}
         except Exception as e:                               # noqa: BLE001
             err = repr(e)[:300]; time.sleep(5 * (attempt + 1))
     return {"reply": "", "error": err}
@@ -95,13 +96,15 @@ def call(a, prompt_text: str, raw: str | None = None) -> dict:
         url = a.base_url.rstrip("/") + "/chat/completions"
     for attempt in range(5):
         try:
+            t_req = time.time()
             req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
             with urllib.request.urlopen(req, timeout=a.timeout) as r:
                 out = json.loads(r.read())
             ch = out["choices"][0]
             text = ch.get("text") if a.completions else (ch["message"].get("content") or "")
             reasoning = None if a.completions else ch["message"].get("reasoning_content")
-            return {"reply": text, "reasoning": reasoning, "usage": out.get("usage", {}), "finish_reason": ch.get("finish_reason")}
+            return {"reply": text, "reasoning": reasoning, "usage": out.get("usage", {}), "finish_reason": ch.get("finish_reason"),
+                    "latency_s": round(time.time() - t_req, 2)}
         except Exception as e:                               # noqa: BLE001  (retry transient errors)
             err = repr(e); time.sleep(2 ** attempt)
     return {"reply": "", "error": err}
@@ -248,6 +251,15 @@ def summarize(rows, name, ck="correct", ok="outcome", t0=None):
         print(f"  {key:28s} n={len(g):4d}  accuracy {acc:6.1%} [{lo:5.1%}-{hi:5.1%}]{pk}  truncated {trunc:6.1%}   {top}")
     toks = [r.get("usage", {}).get("completion_tokens", 0) for r in rows]
     summary["mean_completion_tokens"] = round(sum(toks) / max(len(toks), 1), 1)
+    lat = [r.get("latency_s") for r in rows if r.get("latency_s")]
+    if lat:
+        n_ok = sum(r[ck] for r in rows); L = sorted(lat)
+        summary["seconds_per_move_mean"] = round(sum(lat) / len(lat), 1)
+        summary["seconds_per_move_median"] = L[len(L) // 2]
+        summary["seconds_per_correct"] = round(sum(lat) / n_ok, 1) if n_ok else None
+        print(f"  time per move: median {L[len(L) // 2]:.1f}s, mean {sum(lat) / len(lat):.1f}s"
+              + (f"; {sum(lat) / n_ok:.1f}s of answering per correct answer" if n_ok else "")
+              + "  (per request under this run's concurrency; for single-player speed use --concurrency 1)")
     costs = [r.get("cost_usd") for r in rows if r.get("cost_usd") is not None]
     if costs:
         n_ok = sum(r[ck] for r in rows)
