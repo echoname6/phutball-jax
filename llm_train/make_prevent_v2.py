@@ -80,22 +80,37 @@ def prevent_prefiltered(base, rng, forbidden):
 
 
 def worker(args):
-    wid, seed, quota, deadline, strict, part = args
+    wid, seed, quota, deadline, strict, part, sources, n_workers = args
     import numpy as np
     from expert.engine import BALL, EMPTY, MAN, State
     from expert.puzzle_place import CapHit
     from llm_bench.text import sq
     from llm_train.build_traces import bench_keys, key_of
     rng = random.Random(seed); avoid = bench_keys(); stats = Counter(); out = []
-    chunks = sorted((ROOT / "expert_data/games").glob("chunk_*.npz"))
-    states = np.load(chunks[wid % len(chunks)])["states"]
+    # every game chunk (ball and men planes only, ~23 MB each): one chunk per worker kept re-finding the same few
+    # positions (the scripted expert's games repeat endings; one puzzle came up 13 times in 62)
+    paths = sources or sorted((ROOT / "expert_data/games").glob("chunk_*.npz"))
+    states = np.concatenate([(lambda d: d["states" if "states" in d.files else "S"][:, :2] > 0.5)(np.load(c)) for c in paths])
+    sweep = None
+    if sources:                                                           # a finite source: every position once, both
+        order = np.random.default_rng(seed - wid).permutation(len(states))   # players to move, this worker's slice
+        sweep = iter([(int(i), pl) for i in order[wid::n_workers] for pl in (1, 2)])
+    seen = set()                                                          # puzzles already found, earlier runs included
+    for pf in Path(part).parent.glob(Path(part).name.split(".part")[0] + ".part*.jsonl"):
+        for l in open(pf):
+            r_ = json.loads(l)["item"]; seen.add(key_of(r_["board"], r_["ball"], r_["player"]))
     while len(out) < quota and time.time() < deadline:
-        o = states[rng.randrange(len(states))]
+        if sweep is not None:
+            nxt = next(sweep, None)
+            if nxt is None: stats["sweep done"] += 1; break
+            o, side = states[nxt[0]], nxt[1]
+        else:
+            o, side = states[rng.randrange(len(states))], rng.choice((1, 2))
         R, C = o.shape[1], o.shape[2]
         b = [EMPTY] * (R * C)
-        for i in np.flatnonzero(o[1].reshape(-1) > 0.5): b[int(i)] = MAN
-        ball = int(np.flatnonzero(o[0].reshape(-1) > 0.5)[0]); b[ball] = BALL
-        base = State(R, C, b, ball, rng.choice((1, 2)))           # any side to move is a legal position
+        for i in np.flatnonzero(o[1].reshape(-1)): b[int(i)] = MAN
+        ball = int(np.flatnonzero(o[0].reshape(-1))[0]); b[ball] = BALL
+        base = State(R, C, b, ball, side)                           # any side to move is a legal position
         stats["bases"] += 1
         try: r = prevent_prefiltered(base, rng, neighbours if strict else escape_squares)
         except CapHit: stats["search cap"] += 1; continue
@@ -104,6 +119,8 @@ def worker(args):
         s, pl, jl, meta = r; stats["prevent puzzles"] += 1
         assert not set(pl) & set(neighbours(s) if strict else escape_squares(s))      # the early test is exact
         if key_of(s.board, s.ball, s.player) in avoid: stats["dropped: in the benchmark"] += 1; continue
+        if key_of(s.board, s.ball, s.player) in seen: stats["dropped: already found"] += 1; continue
+        seen.add(key_of(s.board, s.ball, s.player))
         pid = f"prevent2-{seed}-{len(out)}"                          # seed in the id: restarts never collide
         item = {"id": pid, "task": "prevent", "rows": R, "cols": C, "board": list(map(int, s.board)), "ball": int(s.ball),
                 "player": int(s.player), "answers": {"placements": sorted(sq(p, C) for p in pl),
@@ -121,12 +138,15 @@ def main():
     ap.add_argument("--n", type=int, default=600); ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--minutes", type=float, default=180); ap.add_argument("--seed", type=int, default=31000)
     ap.add_argument("--strict", action="store_true", help="also drop puzzles where any square next to the ball saves")
+    ap.add_argument("--source", type=Path, nargs="*", default=None,
+                    help="position files (.npz with 'states' or 'S': ball and men planes first) swept exhaustively; "
+                         "default: the scripted expert's games, sampled")
     ap.add_argument("--out", type=Path, default=ROOT / "llm_train/puzzles/prevent_v2.jsonl.gz")
     a = ap.parse_args(); t0 = time.time()
     quota = -(-a.n // a.workers); deadline = t0 + a.minutes * 60
     with mp.get_context("spawn").Pool(a.workers) as pool:
-        res = pool.map(worker, [(w, a.seed + w, quota, deadline, a.strict, f"{a.out}.part{a.seed + w}.jsonl")
-                                for w in range(a.workers)])
+        res = pool.map(worker, [(w, a.seed + w, quota, deadline, a.strict, f"{a.out}.part{a.seed + w}.jsonl",
+                                 a.source, a.workers) for w in range(a.workers)])
     from llm_train.build_traces import key_of
     seen, rows = set(), []                                                # every part file, earlier runs included
     for part in sorted(a.out.parent.glob(a.out.name + ".part*.jsonl")):

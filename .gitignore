@@ -10,3 +10,6 @@ venv/
 expert_data/
 llm_bench/results/
 llm_train/data/
+
+# make_prevent_v2 per-worker part files (merged into the .jsonl.gz)
+llm_train/puzzles/*.part*.jsonl
