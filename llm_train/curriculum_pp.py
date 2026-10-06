@@ -33,7 +33,10 @@ States: unscreened -> active (0 < successes < K) | mastered (K/K) | paroled (0/K
              forced accuracy and a rise in finished "NO WIN on a real win" answers; both penalised learning to stop
              (a self-stopped answer is committed with less search than one forced at the cap, and finishing more
              means more of every finished answer), and rejected rounds 1-4 (wins finished 17% -> 37-41%) for
-             r5 (23%). Use `regate` to replay all rounds under the current rule.
+             r5 (23%). v3.2: also not clearly worse (same z) than the PEAK, the promoted model with the highest
+             finished accuracy so far, so small accepted losses cannot add up round after round (under v3.1 r6, 0.346,
+             replaced r4, 0.367, at z -1.07; a chain of such steps could drift arbitrarily far down). Use `regate` to
+             replay all rounds under the current rule.
 
   python -m llm_train.curriculum_pp screen   --state S --pool P --n 1600 --out R1/ids.json
   python -m llm_train.curriculum_pp allocate --state S --pool P --n 150 --round R --out R/ids.json
@@ -244,9 +247,15 @@ def paired_z(best: dict, new: dict, ids, ok) -> tuple[int, int, float]:
     return b, c, (b - c) / math.sqrt(b + c) if b + c else 0.0
 
 
-def gate(best: dict | None, new: dict) -> tuple[bool, str]:
-    """best/new: load_rows() of the same validation items. Promote unless finished accuracy is clearly worse or forced
-    accuracy collapses (see the module docstring); the NO-WIN count is reported, not used."""
+def finished_acc(rows: dict) -> float:
+    ids = [i for i in rows if family(rows[i])]
+    return sum(rows[i]["correct"] for i in ids) / len(ids)
+
+
+def gate(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, str]:
+    """best/new/peak: load_rows() of the same validation items. Promote unless finished accuracy is clearly worse than
+    the best's or the peak's, or forced accuracy collapses (see the module docstring); the NO-WIN count is reported,
+    not used."""
     if best is None: return True, "no previous model"
     ids = [i for i in new if i in best and family(new[i])]
     acc = lambda R: sum(R[i]["correct"] for i in ids) / len(ids)
@@ -255,6 +264,11 @@ def gate(best: dict | None, new: dict) -> tuple[bool, str]:
     nb, nc, nz = paired_z(best, new, pos, lambda r: r.get("forced_outcome", r["outcome"]) == "missed win (said NO WIN)")
     head = f"finished {acc(best):.3f} -> {acc(new):.3f} (+{b}/-{c}, z {z:+.2f}); forced NO WIN on real wins +{nb}/-{nc}"
     if z < -GATE_Z: return False, f"finished accuracy clearly worse: {head}"
+    if peak is not None and peak is not best:
+        pids = [i for i in ids if i in peak]
+        pb, pc, pz = paired_z(peak, new, pids, lambda r: r["correct"])
+        head += f"; vs peak {finished_acc(peak):.3f} (+{pb}/-{pc}, z {pz:+.2f})"
+        if pz < -GATE_Z: return False, f"finished accuracy clearly worse than the peak: {head}"
     for fam in ("wins", "no-win", "placements"):
         fi = [i for i in ids if family(new[i]) == fam]
         fb, fc, fz = paired_z(best, new, fi, lambda r: r.get("forced_correct", r["correct"]))
@@ -297,20 +311,31 @@ def main():
     elif a.cmd == "gate":
         if st.d["best"] is None and a.init_best:
             st.d["best"], st.d["best_eval"] = a.init_adapter, a.init_best
-        ok, why = gate(load_rows(st.d["best_eval"]) if st.d["best_eval"] else None, load_rows(a.new))
-        if ok: st.d["best"], st.d["best_eval"] = a.adapter, a.new
-        st.d["log"].append({"round": a.round, "event": "gate", "promoted": ok, "reason": why, "best": st.d["best"]})
+        best_rows = load_rows(st.d["best_eval"]) if st.d["best_eval"] else None
+        peak_eval = st.d.get("peak_eval") or st.d["best_eval"]
+        peak_rows = (best_rows if peak_eval == st.d["best_eval"] else load_rows(peak_eval)) if peak_eval else None
+        new_rows = load_rows(a.new); ok, why = gate(best_rows, new_rows, peak_rows)
+        if ok:
+            st.d["best"], st.d["best_eval"] = a.adapter, a.new
+            if peak_rows is None or finished_acc(new_rows) > finished_acc(peak_rows): st.d["peak_eval"] = a.new
+        st.d["log"].append({"round": a.round, "event": "gate", "promoted": ok, "reason": why, "best": st.d["best"],
+                            "peak_eval": st.d.get("peak_eval")})
         st.save(); print(("PROMOTED: " if ok else "kept previous best: ") + why); print("best:", st.d["best"])
     elif a.cmd == "regate":
-        best_eval, best = a.init_best, a.init_adapter; R = 1; decisions = []
+        best_eval, best = a.init_best, a.init_adapter; peak_eval = best_eval; R = 1; decisions = []
         while Path(f"{a.eval_dir}/v{R}.jsonl").exists():
-            ok, why = gate(load_rows(best_eval), load_rows(f"{a.eval_dir}/v{R}"))
+            new_eval = f"{a.eval_dir}/v{R}"; best_rows, new_rows = load_rows(best_eval), load_rows(new_eval)
+            peak_rows = best_rows if peak_eval == best_eval else load_rows(peak_eval)
+            ok, why = gate(best_rows, new_rows, peak_rows)
             decisions.append({"round": R, "promoted": ok, "reason": why})
             print(f"round {R}: " + ("PROMOTED: " if ok else "kept previous best: ") + why)
-            if ok: best_eval, best = f"{a.eval_dir}/v{R}", f"{a.out_dir}/r{R}/adapter/final"
+            if ok:
+                best_eval, best = new_eval, f"{a.out_dir}/r{R}/adapter/final"
+                if finished_acc(new_rows) > finished_acc(peak_rows): peak_eval = new_eval
             R += 1
-        st.d["best"], st.d["best_eval"] = best, best_eval
-        st.d["log"].append({"round": R - 1, "event": "regate", "rule": "v3.1", "decisions": decisions, "best": best})
+        st.d["best"], st.d["best_eval"], st.d["peak_eval"] = best, best_eval, peak_eval
+        st.d["log"].append({"round": R - 1, "event": "regate", "rule": "v3.2", "decisions": decisions, "best": best,
+                            "peak_eval": peak_eval})
         st.save(); print("best:", best)
     else:
         print(json.dumps({k: v for k, v in st.d.items() if k != "puzzles"}, indent=1)[:6000])
