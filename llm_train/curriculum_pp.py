@@ -24,15 +24,16 @@ States: unscreened -> active (0 < successes < K) | mastered (K/K) | paroled (0/K
              data can be forgotten. Each puzzle's latest verified examples go into a bank; the round's training set is
              its new examples (mastered puzzles' excluded: no further training on them) plus replay from the bank (other
              puzzles, mastered ones included) up to REPLAY x the new examples, at most TRAIN_MAX in total.
-  gate       paired and regression-only, on the validation set (llm_train/make_val.py: 100 puzzles per bucket, never
-             trained on; the benchmark stays the test set). Per-round gains are a few points, too small to confirm on
-             ~1,000 items, so demanding a significant improvement stalls the run (v2 rejected its two lowest-truncation
-             rounds on 25-item noise); sampling from a slightly worse model costs little with the replay bank. The new
-             model is compared item by item with the best's stored results: b = items only the new model gets right,
-             c = items only the best gets right, z = (b - c) / sqrt(b + c). Promote unless
-               finished accuracy (all but prevent)                    z < -GATE_Z   (clearly worse)
-               forced accuracy within wins / no-win / placements      z < -GATE_Z   (knowledge traded for stopping)
-               "NO WIN" said on a real win (finished)                 z > +GATE_Z   (v2 round 8's failure)
+  gate       paired, regression-only, on the validation set (llm_train/make_val.py, never trained on; the benchmark
+             stays the test set). The objective is more correct answers the model finishes on its own, so: promote
+             unless FINISHED accuracy (all but prevent) is clearly worse, z = (b - c) / sqrt(b + c) < -GATE_Z, with
+             b / c the items only the new / only the best model gets right; plus one safety net: reject a
+             catastrophic forced-accuracy drop within wins / no-win / placements (z < -FORCED_Z), e.g. a model that
+             "finishes" by answering garbage. v3.1 (2026-10-06, after rounds 1-6): v3.0 also rejected z < -1.5 on
+             forced accuracy and a rise in finished "NO WIN on a real win" answers; both penalised learning to stop
+             (a self-stopped answer is committed with less search than one forced at the cap, and finishing more
+             means more of every finished answer), and rejected rounds 1-4 (wins finished 17% -> 37-41%) for
+             r5 (23%). Use `regate` to replay all rounds under the current rule.
 
   python -m llm_train.curriculum_pp screen   --state S --pool P --n 1600 --out R1/ids.json
   python -m llm_train.curriculum_pp allocate --state S --pool P --n 150 --round R --out R/ids.json
@@ -63,6 +64,7 @@ MIN_SAMPLES = 32          # a bucket's finished rate is logged only from at leas
 REPLAY = 1.0
 TRAIN_MAX = 1000
 GATE_Z = 1.5
+FORCED_Z = 3.0
 
 
 def priority(p: float, k: int = K) -> float:
@@ -243,22 +245,21 @@ def paired_z(best: dict, new: dict, ids, ok) -> tuple[int, int, float]:
 
 
 def gate(best: dict | None, new: dict) -> tuple[bool, str]:
-    """best/new: load_rows() of the same validation items. Promote unless clearly worse (see the module docstring)."""
+    """best/new: load_rows() of the same validation items. Promote unless finished accuracy is clearly worse or forced
+    accuracy collapses (see the module docstring); the NO-WIN count is reported, not used."""
     if best is None: return True, "no previous model"
     ids = [i for i in new if i in best and family(new[i])]
     acc = lambda R: sum(R[i]["correct"] for i in ids) / len(ids)
     b, c, z = paired_z(best, new, ids, lambda r: r["correct"])
-    head = f"finished {acc(best):.3f} -> {acc(new):.3f} (+{b}/-{c}, z {z:+.2f})"
+    pos = [i for i in ids if family(new[i]) == "wins"]
+    nb, nc, nz = paired_z(best, new, pos, lambda r: r.get("forced_outcome", r["outcome"]) == "missed win (said NO WIN)")
+    head = f"finished {acc(best):.3f} -> {acc(new):.3f} (+{b}/-{c}, z {z:+.2f}); forced NO WIN on real wins +{nb}/-{nc}"
     if z < -GATE_Z: return False, f"finished accuracy clearly worse: {head}"
     for fam in ("wins", "no-win", "placements"):
         fi = [i for i in ids if family(new[i]) == fam]
         fb, fc, fz = paired_z(best, new, fi, lambda r: r.get("forced_correct", r["correct"]))
-        if fz < -GATE_Z: return False, f"forced accuracy on {fam} clearly worse (+{fb}/-{fc}, z {fz:+.2f}); {head}"
-    pos = [i for i in ids if family(new[i]) == "wins"]
-    nb, nc, nz = paired_z(best, new, pos, lambda r: r["outcome"] == "missed win (said NO WIN)")
-    if nz > GATE_Z: return False, f"says NO WIN on more real wins (+{nb}/-{nc}, z {nz:+.2f}); {head}"
+        if fz < -FORCED_Z: return False, f"forced accuracy on {fam} collapsed (+{fb}/-{fc}, z {fz:+.2f}); {head}"
     return True, head
-
 
 def main():
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
@@ -275,6 +276,10 @@ def main():
     a3 = sub.add_parser("gate"); a3.add_argument("--state", required=True); a3.add_argument("--round", type=int, required=True)
     a3.add_argument("--new", required=True); a3.add_argument("--adapter", required=True)
     a3.add_argument("--init-best", default=None); a3.add_argument("--init-adapter", default=None)
+    a5 = sub.add_parser("regate", help="replay every round's gate under the current rule and set the best")
+    a5.add_argument("--state", required=True); a5.add_argument("--eval-dir", required=True)
+    a5.add_argument("--out-dir", required=True, help="the run folder (round adapters at <out-dir>/rR/adapter/final)")
+    a5.add_argument("--init-best", required=True); a5.add_argument("--init-adapter", required=True)
     a4 = sub.add_parser("show"); a4.add_argument("--state", required=True)
     a = ap.parse_args(); st = State(a.state)
     if a.cmd == "screen":
@@ -296,6 +301,17 @@ def main():
         if ok: st.d["best"], st.d["best_eval"] = a.adapter, a.new
         st.d["log"].append({"round": a.round, "event": "gate", "promoted": ok, "reason": why, "best": st.d["best"]})
         st.save(); print(("PROMOTED: " if ok else "kept previous best: ") + why); print("best:", st.d["best"])
+    elif a.cmd == "regate":
+        best_eval, best = a.init_best, a.init_adapter; R = 1; decisions = []
+        while Path(f"{a.eval_dir}/v{R}.jsonl").exists():
+            ok, why = gate(load_rows(best_eval), load_rows(f"{a.eval_dir}/v{R}"))
+            decisions.append({"round": R, "promoted": ok, "reason": why})
+            print(f"round {R}: " + ("PROMOTED: " if ok else "kept previous best: ") + why)
+            if ok: best_eval, best = f"{a.eval_dir}/v{R}", f"{a.out_dir}/r{R}/adapter/final"
+            R += 1
+        st.d["best"], st.d["best_eval"] = best, best_eval
+        st.d["log"].append({"round": R - 1, "event": "regate", "rule": "v3.1", "decisions": decisions, "best": best})
+        st.save(); print("best:", best)
     else:
         print(json.dumps({k: v for k, v in st.d.items() if k != "puzzles"}, indent=1)[:6000])
         print(dict(Counter(s["status"] for s in st.d["puzzles"].values())))
