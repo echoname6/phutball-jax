@@ -42,6 +42,10 @@ States: unscreened -> active (0 < successes < K) | mastered (K/K) | paroled (0/K
   python -m llm_train.curriculum_pp allocate --state S --pool P --n 150 --round R --out R/ids.json
   python -m llm_train.curriculum_pp update   --state S --round R --outcomes R/outcomes.jsonl --sft R/sft.jsonl \
                                              --bank BANK.jsonl --train-out R/train.jsonl
+v4 (curriculum_v4_colab.ipynb): the same scheduler and gate, but each round CONTINUES the best adapter
+(sft_stop --init-adapter) instead of a fresh LoRA on the base model, so rounds build on each other; replay then only
+guards against forgetting: --replay 0.5 --balance-replay; learning rate 1e-4. Forks from v3's round 1 screen.
+
   python -m llm_train.curriculum_pp gate     --state S --round R --new EVAL/vR --adapter R/adapter/final \
                                              --init-best EVAL/v0 --init-adapter INIT     (EVAL/name.jsonl: llm_bench rows)
 """
@@ -199,9 +203,10 @@ class State:
 
 
 def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, out: Path, seed: int,
-                replay: float = REPLAY, train_max: int = TRAIN_MAX) -> dict:
+                replay: float = REPLAY, train_max: int = TRAIN_MAX, balance: bool = False) -> dict:
     """Bank this round's examples (latest per puzzle), then write the training set: new examples of non-mastered
-    puzzles + replay of other puzzles' banked examples."""
+    puzzles + replay of other puzzles' banked examples (balance: spread evenly over the subtasks, as far as each has
+    banked examples, instead of in proportion to the bank, so every skill gets refreshed every round)."""
     bank = {}
     if bank_path.exists():
         for l in open(bank_path):
@@ -219,7 +224,14 @@ def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, o
     if len(new) > train_max: rng.shuffle(new); new = new[:train_max]
     others = [r for pid, rows in bank.items() if pid not in new_by_id or status.get(pid) == "mastered" for r in rows]
     rng.shuffle(others)
-    rep = others[: max(0, min(int(replay * len(new)), train_max - len(new)))]
+    n_rep = max(0, min(int(replay * len(new)), train_max - len(new)))
+    if balance:
+        by = defaultdict(list)
+        for r in others: by[r["subtask"]].append(r)
+        alloc = spread(n_rep, {k: 1.0 for k in by}, {k: len(v) for k, v in by.items()})
+        rep = [r for k, m in alloc.items() for r in by[k][:m]]
+    else:
+        rep = others[:n_rep]
     rows = new + rep; rng.shuffle(rows)
     with open(out, "w") as f:
         for r in rows: f.write(json.dumps({k: v for k, v in r.items() if k != "round"}) + "\n")
@@ -287,6 +299,7 @@ def main():
     a2.add_argument("--outcomes", required=True); a2.add_argument("--sft", required=True); a2.add_argument("--bank", required=True)
     a2.add_argument("--train-out", required=True); a2.add_argument("--replay", type=float, default=REPLAY)
     a2.add_argument("--train-max", type=int, default=TRAIN_MAX)
+    a2.add_argument("--balance-replay", action="store_true", help="replay spread evenly over the subtasks")
     a3 = sub.add_parser("gate"); a3.add_argument("--state", required=True); a3.add_argument("--round", type=int, required=True)
     a3.add_argument("--new", required=True); a3.add_argument("--adapter", required=True)
     a3.add_argument("--init-best", default=None); a3.add_argument("--init-adapter", default=None)
@@ -305,7 +318,7 @@ def main():
     elif a.cmd == "update":
         status = st.update(a.round, [json.loads(l) for l in open(a.outcomes)])
         info = build_train(a.round, [json.loads(l) for l in open(a.sft)], status, Path(a.bank), Path(a.train_out),
-                           seed=a.round, replay=a.replay, train_max=a.train_max)
+                           seed=a.round, replay=a.replay, train_max=a.train_max, balance=a.balance_replay)
         st.d["log"].append({"round": a.round, "event": "train_set", **info}); st.save()
         print(json.dumps(st.d["log"][-2], indent=1)); print(json.dumps(st.d["log"][-1], indent=1))
     elif a.cmd == "gate":

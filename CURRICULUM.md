@@ -137,3 +137,22 @@ answers only; round 1 screens 1,600 puzzles; 8/8 mastered (no more sampling or n
 spot checks as the only way back; a bank of each puzzle's latest verified examples, replayed 1:1 with each round's new
 examples (at most 1,000) so the from-base retrain accumulates. Starts from v2's r6. The gate is unchanged (still the
 weak point).
+
+## v3 rounds 1-9 and v4: carrying the weights over (2026-10-06)
+
+**Gate.** v3.0 rejected rounds 1-4 (validation wins finished 17% -> 37-41%) for saying NO WIN more and for losing forced
+accuracy, both of which follow from learning to stop, and promoted r5, the worst model of the run (finished 0.191).
+v3.1 promotes unless finished accuracy (wins, no-win, placements) is clearly worse (z < -1.5), with a forced-accuracy
+collapse guard at z < -3; v3.2 also compares against the peak (the highest finished accuracy promoted so far), so
+small accepted losses cannot add up. `regate` replayed every round: r1-r4 and r6 promoted, r5, r7, r8 rejected.
+
+**Plateau.** Validation finished accuracy: v0 0.149, r1 0.320, r2 0.322, r3 0.313, r4 0.367, r5 0.191, r6 0.346,
+r7 0.303, r8 0.317, r9 0.297 (r9 sampled from r6 and still lost). Almost all the gain came in round 1. Cause: every
+round trained a fresh LoRA on the base model from ~544 examples (~272 new + equal replay), so no round built on the
+previous one and even the warm start was not carried over. STaR and ReST-EM also retrain from base, but on a
+re-sampled whole dataset; with 150 puzzles a round neither the data nor the weights accumulated.
+
+**v4** (curriculum_v4_colab.ipynb): each round continues the best adapter (`sft_stop --init-adapter`; a rejected round
+is discarded), replay 0.5x balanced over the subtasks (forgetting guard only), learning rate 1e-4. Round 1 reuses v3's
+screen samples and continues the warm start, so v3 vs v4 differ only in whether the weights carry over. If v4 also
+plateaus, the next test is LoRA (5e-5 / 2e-4) vs full-weight fine-tuning on the same data.

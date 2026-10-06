@@ -6,6 +6,10 @@ configuration matches llm_train/grpo_pilot.py exactly, so the adapter continues 
 --init-adapter.
 
   python -m llm_train.sft_stop --data DRIVE/self_stop/sft.jsonl --out DRIVE/self_stop/adapter
+
+--init-adapter continues an existing adapter (same rank and modules) instead of a fresh LoRA on the base model: the
+v4 curriculum carries the weights from round to round (v3 retrained from base every round, so no round built on the
+previous one and even the warm start was not carried over).
 """
 from __future__ import annotations
 
@@ -29,7 +33,12 @@ def main():
                     help="keep at most this many no-win examples per win example (the first warm start had 173 no-win "
                          "vs 146 win and started RL leaning to NO WIN: wins 5/16 vs no-wins 12/16 before any update)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--init-adapter", type=Path, default=None,
+                    help="continue this LoRA adapter (trained with the same --rank) instead of a fresh one")
     a = ap.parse_args()
+    if a.init_adapter:
+        r0 = json.loads((a.init_adapter / "adapter_config.json").read_text())["r"]
+        if r0 != a.rank: sys.exit(f"--init-adapter has rank {r0}, not --rank {a.rank}")
     import torch
     from datasets import Dataset
     from peft import LoraConfig
@@ -58,6 +67,16 @@ def main():
     except TypeError:
         lora = LoraConfig(**lora_kw)
     trainer = SFTTrainer(model=a.model, args=cfg, train_dataset=data, peft_config=lora)
+    if a.init_adapter:                                                  # continue it (same as grpo_pilot)
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+        sd = load_file(str(a.init_adapter / "adapter_model.safetensors"))
+        res = set_peft_model_state_dict(trainer.model, sd)
+        miss = [k for k in getattr(res, "missing_keys", []) if "lora_" in k]
+        unexp = [k for k in getattr(res, "unexpected_keys", []) if "lora_" in k]
+        if miss or unexp: sys.exit(f"adapter mismatch: {len(miss)} missing, {len(unexp)} unexpected LoRA keys "
+                                   f"(e.g. {(miss + unexp)[:3]})")
+        print(f"continuing adapter {a.init_adapter} ({len(sd)} tensors)", flush=True)
     trainer.train()
     trainer.save_model(str(a.out / "final"))
     print("saved", a.out / "final", flush=True)
