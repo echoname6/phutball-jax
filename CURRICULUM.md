@@ -156,3 +156,8 @@ re-sampled whole dataset; with 150 puzzles a round neither the data nor the weig
 is discarded), replay 0.5x balanced over the subtasks (forgetting guard only), learning rate 1e-4. Round 1 reuses v3's
 screen samples and continues the warm start, so v3 vs v4 differ only in whether the weights carry over. If v4 also
 plateaus, the next test is LoRA (5e-5 / 2e-4) vs full-weight fine-tuning on the same data.
+
+**v4 rounds 1-5** (validation finished accuracy): r1 0.383, r2 0.418 (promoted; best), r3 0.456, r4 0.467, r5 0.442 - r3-r5
+rejected by the forced-accuracy collapse guard (wins: z -5.8, -8.3, -4.6; finished "NO WIN" on real wins 82 -> 169 -> 276).
+Replay balanced over the subtasks had cut win-finding to ~53% of each training set, and with the weights carried over the
+shift compounded. From round 6 replay is proportional to the bank (the notebook no longer passes --balance-replay).
