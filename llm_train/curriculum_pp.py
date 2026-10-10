@@ -71,6 +71,7 @@ MIN_SAMPLES = 32          # a bucket's finished rate is logged only from at leas
 REPLAY = 1.0
 TRAIN_MAX = 1000
 MIN_NOWIN_THINK = 2048    # a NO WIN example must show at least this much search (natural finishes included)
+NOWIN_SHARE = 0.10        # ...and NO WIN examples are topped up to this share of the training set from the bank
 GATE_Z = 1.5
 FORCED_Z = 3.0
 
@@ -205,7 +206,7 @@ class State:
 
 def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, out: Path, seed: int,
                 replay: float = REPLAY, train_max: int = TRAIN_MAX, balance: bool = False,
-                min_nowin_think: int = MIN_NOWIN_THINK) -> dict:
+                min_nowin_think: int = MIN_NOWIN_THINK, nowin_share: float = NOWIN_SHARE) -> dict:
     """Bank this round's examples (latest per puzzle), then write the training set: new examples of non-mastered
     puzzles + replay of other puzzles' banked examples (balance: spread evenly over the subtasks, as far as each has
     banked examples, instead of in proportion to the bank, so every skill gets refreshed every round)."""
@@ -240,10 +241,18 @@ def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, o
         rep = [r for k, m in alloc.items() for r in by[k][:m]]
     else:
         rep = others[:n_rep]
+    # rounds 14-16 with the floor alone: NO WIN fell to ~3% of the training set and the model swung to claiming wins
+    # (r15: finished 0.545, but forced near-miss accuracy 93% -> 67%). Top long-search NO WIN examples back up.
+    have = sum(r["subtask"] == "win_neg" for r in new + rep); target = int(nowin_share * len(new + rep))
+    used = {id(r) for r in rep}
+    pool_neg = [r for r in others if r["subtask"] == "win_neg" and id(r) not in used]; rng.shuffle(pool_neg)
+    topup = pool_neg[:max(0, target - have)]
+    rep = rep + topup
     rows = new + rep; rng.shuffle(rows)
     with open(out, "w") as f:
         for r in rows: f.write(json.dumps({k: v for k, v in r.items() if k != "round"}) + "\n")
     info = {"new": len(new), "replay": len(rep), "bank_puzzles": len(bank), "dropped_short_nowin": dropped_short,
+            "nowin_topup": len(topup),
             "dropped_mastered": sum(len(v) for pid, v in new_by_id.items() if status.get(pid) == "mastered"),
             "by_subtask": dict(Counter(r["subtask"] for r in rows))}
     return info
@@ -308,6 +317,8 @@ def main():
     a2.add_argument("--train-out", required=True); a2.add_argument("--replay", type=float, default=REPLAY)
     a2.add_argument("--train-max", type=int, default=TRAIN_MAX)
     a2.add_argument("--balance-replay", action="store_true", help="replay spread evenly over the subtasks")
+    a2.add_argument("--nowin-share", type=float, default=NOWIN_SHARE,
+                    help="top long NO WIN examples up to this share of the training set from the bank")
     a2.add_argument("--min-nowin-think", type=int, default=MIN_NOWIN_THINK,
                     help="drop NO WIN examples (new and replayed) with fewer thinking tokens")
     a3 = sub.add_parser("gate"); a3.add_argument("--state", required=True); a3.add_argument("--round", type=int, required=True)
@@ -329,7 +340,7 @@ def main():
         status = st.update(a.round, [json.loads(l) for l in open(a.outcomes)])
         info = build_train(a.round, [json.loads(l) for l in open(a.sft)], status, Path(a.bank), Path(a.train_out),
                            seed=a.round, replay=a.replay, train_max=a.train_max, balance=a.balance_replay,
-                           min_nowin_think=a.min_nowin_think)
+                           min_nowin_think=a.min_nowin_think, nowin_share=a.nowin_share)
         st.d["log"].append({"round": a.round, "event": "train_set", **info}); st.save()
         print(json.dumps(st.d["log"][-2], indent=1)); print(json.dumps(st.d["log"][-1], indent=1))
     elif a.cmd == "gate":

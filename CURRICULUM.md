@@ -170,3 +170,10 @@ real wins were answered NO WIN. Cause, in the training sets: 40-55% of the NO WI
 cut-off answers, not to NO WIN answers the model finished by itself, and the bank replayed them. So each round taught
 "no early win -> NO WIN". From round 14 the training set drops NO WIN examples under 2,048 thinking tokens (new and
 replayed; curriculum_pp update --min-nowin-think), and the best is reset to r6.
+
+**Rounds 14-16 with the floor: the swing the other way.** r14 promoted (0.459; NO WIN on real wins 167 -> 136). r15 reached
+finished accuracy 0.545 (z +4.7 over r14, +3.8 over the peak r6; only 38 real wins answered NO WIN) but was rejected:
+forced accuracy on near-miss negatives 93% -> 67% (z -3.9) - cut off on a no-win position it now guessed a win - and r16
+claimed 80 "wins" that do not reach the goal. With the floor alone NO WIN fell to ~3% of each training set (11-13
+examples, r6 had ~10%). From round 17 long NO WIN examples (>= 2,048 thinking tokens) are topped up to 10% of the
+training set from the bank (--nowin-share).
