@@ -70,6 +70,7 @@ MAX_SHARE = 0.3
 MIN_SAMPLES = 32          # a bucket's finished rate is logged only from at least this many regular samples
 REPLAY = 1.0
 TRAIN_MAX = 1000
+MIN_NOWIN_THINK = 2048    # a NO WIN example must show at least this much search (natural finishes included)
 GATE_Z = 1.5
 FORCED_Z = 3.0
 
@@ -203,7 +204,8 @@ class State:
 
 
 def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, out: Path, seed: int,
-                replay: float = REPLAY, train_max: int = TRAIN_MAX, balance: bool = False) -> dict:
+                replay: float = REPLAY, train_max: int = TRAIN_MAX, balance: bool = False,
+                min_nowin_think: int = MIN_NOWIN_THINK) -> dict:
     """Bank this round's examples (latest per puzzle), then write the training set: new examples of non-mastered
     puzzles + replay of other puzzles' banked examples (balance: spread evenly over the subtasks, as far as each has
     banked examples, instead of in proportion to the bank, so every skill gets refreshed every round)."""
@@ -220,9 +222,15 @@ def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, o
             for r in rows: f.write(json.dumps(r) + "\n")
     tmp.replace(bank_path)
     rng = random.Random(seed)
-    new = [r for pid, rows in new_by_id.items() if status.get(pid) != "mastered" for r in rows]
+    # v4 rounds 6-13: 40-55% of the NO WIN examples (natural finishes; the 2,048-token floor in expert_iter covered
+    # only cut-off answers) had < 1,000 thinking tokens against a ~3,100 median for wins, so each round taught "no
+    # early win -> say NO WIN": answers fell to 12-16 s and 400+ real wins were called NO WIN. The bank keeps them.
+    short = lambda r: r.get("subtask") == "win_neg" and r.get("think_tokens", min_nowin_think) < min_nowin_think
+    dropped_short = sum(short(r) for rows in new_by_id.values() for r in rows)
+    new = [r for pid, rows in new_by_id.items() if status.get(pid) != "mastered" for r in rows if not short(r)]
     if len(new) > train_max: rng.shuffle(new); new = new[:train_max]
-    others = [r for pid, rows in bank.items() if pid not in new_by_id or status.get(pid) == "mastered" for r in rows]
+    others = [r for pid, rows in bank.items() if pid not in new_by_id or status.get(pid) == "mastered" for r in rows
+              if not short(r)]
     rng.shuffle(others)
     n_rep = max(0, min(int(replay * len(new)), train_max - len(new)))
     if balance:
@@ -235,7 +243,7 @@ def build_train(rnd: int, sft_rows: list[dict], status: dict, bank_path: Path, o
     rows = new + rep; rng.shuffle(rows)
     with open(out, "w") as f:
         for r in rows: f.write(json.dumps({k: v for k, v in r.items() if k != "round"}) + "\n")
-    info = {"new": len(new), "replay": len(rep), "bank_puzzles": len(bank),
+    info = {"new": len(new), "replay": len(rep), "bank_puzzles": len(bank), "dropped_short_nowin": dropped_short,
             "dropped_mastered": sum(len(v) for pid, v in new_by_id.items() if status.get(pid) == "mastered"),
             "by_subtask": dict(Counter(r["subtask"] for r in rows))}
     return info
@@ -300,6 +308,8 @@ def main():
     a2.add_argument("--train-out", required=True); a2.add_argument("--replay", type=float, default=REPLAY)
     a2.add_argument("--train-max", type=int, default=TRAIN_MAX)
     a2.add_argument("--balance-replay", action="store_true", help="replay spread evenly over the subtasks")
+    a2.add_argument("--min-nowin-think", type=int, default=MIN_NOWIN_THINK,
+                    help="drop NO WIN examples (new and replayed) with fewer thinking tokens")
     a3 = sub.add_parser("gate"); a3.add_argument("--state", required=True); a3.add_argument("--round", type=int, required=True)
     a3.add_argument("--new", required=True); a3.add_argument("--adapter", required=True)
     a3.add_argument("--init-best", default=None); a3.add_argument("--init-adapter", default=None)
@@ -318,7 +328,8 @@ def main():
     elif a.cmd == "update":
         status = st.update(a.round, [json.loads(l) for l in open(a.outcomes)])
         info = build_train(a.round, [json.loads(l) for l in open(a.sft)], status, Path(a.bank), Path(a.train_out),
-                           seed=a.round, replay=a.replay, train_max=a.train_max, balance=a.balance_replay)
+                           seed=a.round, replay=a.replay, train_max=a.train_max, balance=a.balance_replay,
+                           min_nowin_think=a.min_nowin_think)
         st.d["log"].append({"round": a.round, "event": "train_set", **info}); st.save()
         print(json.dumps(st.d["log"][-2], indent=1)); print(json.dumps(st.d["log"][-1], indent=1))
     elif a.cmd == "gate":

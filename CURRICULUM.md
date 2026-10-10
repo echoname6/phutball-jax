@@ -161,3 +161,12 @@ plateaus, the next test is LoRA (5e-5 / 2e-4) vs full-weight fine-tuning on the 
 rejected by the forced-accuracy collapse guard (wins: z -5.8, -8.3, -4.6; finished "NO WIN" on real wins 82 -> 169 -> 276).
 Replay balanced over the subtasks had cut win-finding to ~53% of each training set, and with the weights carried over the
 shift compounded. From round 6 replay is proportional to the bank (the notebook no longer passes --balance-replay).
+
+**v4 rounds 6-14, and the NO WIN length floor.** With proportional replay r6 was promoted (0.474, z +2.8 over r2), but
+every later round trained from the best slid back (r7 0.457, r8 0.471, r9 0.435, r10 0.405, r12 0.391, r13 0.389; r11
+0.450 passed the gate's tolerance) - at lr 1e-4 and at 5e-5 alike: answers shortened to a 12-16 s median and 270-420
+real wins were answered NO WIN. Cause, in the training sets: 40-55% of the NO WIN examples had < 1,000 thinking tokens
+(median as low as 876 in r10) against a ~3,100 median for wins - the 2,048-token floor in expert_iter applied only to
+cut-off answers, not to NO WIN answers the model finished by itself, and the bank replayed them. So each round taught
+"no early win -> NO WIN". From round 14 the training set drops NO WIN examples under 2,048 thinking tokens (new and
+replayed; curriculum_pp update --min-nowin-think), and the best is reset to r6.
