@@ -38,10 +38,11 @@ BUDGET_HINT = ("\n\nYou have a thinking budget of about {n:,} tokens. When you h
                "and give it.")
 
 
-def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4, hint: int = 0):
+def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4, hint: int = 0, fmt: str = "ascii"):
     from expert.engine import State
     from llm_bench.text import prompt
-    rows = [json.loads(l) for l in open(path)]
+    import gzip
+    rows = [json.loads(l) for l in (gzip.open(path, "rt") if str(path).endswith(".gz") else open(path))]
     rng = random.Random(seed); rng.shuffle(rows)
     rows = [r for r in rows if r["subtask"] != "win_pos" or int(r["item"]["meta"].get("J", 1)) <= max_j]
     if mix:                                                             # optional subtask weights, e.g. prevent=0.5
@@ -49,7 +50,7 @@ def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4, hint: 
     out = []
     for r in rows:
         it = r["item"]; s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
-        text = prompt(it["task"], s) + (BUDGET_HINT.format(n=hint) if hint else "")
+        text = prompt(it["task"], s, fmt) + (BUDGET_HINT.format(n=hint) if hint else "")
         out.append({"prompt": [{"role": "user", "content": text}], "item": json.dumps(it),
                     "task": it["task"], "subtask": r["subtask"]})
     return out
@@ -124,6 +125,8 @@ def main():
     ap.add_argument("--lam", type=float, default=3e-5, help="cost: per-token cost on correct answers")
     ap.add_argument("--lam-ramp", type=int, default=50, help="cost: reward calls over which lam ramps up from 0")
     ap.add_argument("--force-ok", type=float, default=0.5, help="cost: reward for a correct answer forced at the cap")
+    ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"],
+                    help="must match the adapter's training (the v4 curriculum used ascii+men)")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -141,7 +144,7 @@ def main():
     mix = dict((k, float(v)) for k, v in (p.split("=") for p in a.mix.split(",") if p)) if a.mix else None
     max_j = 4
     if a.stage: mix, max_j = STAGES[a.stage]
-    data = Dataset.from_list(load_puzzles(a.puzzles, a.seed, mix, max_j, a.budget_hint))
+    data = Dataset.from_list(load_puzzles(a.puzzles, a.seed, mix, max_j, a.budget_hint, a.prompt_format))
     if a.budget_hint: print("budget hint:", BUDGET_HINT.format(n=a.budget_hint).strip(), flush=True)
     print(f"{len(data)} puzzles", flush=True)
 
