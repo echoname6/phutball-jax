@@ -73,6 +73,7 @@ TRAIN_MAX = 1000
 MIN_NOWIN_THINK = 2048    # a NO WIN example must show at least this much search (natural finishes included)
 NOWIN_SHARE = 0.10        # ...and NO WIN examples are topped up to this share of the training set from the bank
 GATE_Z = 1.5
+ERR_Z = 2.0               # two-sided error guards: false NO WIN on real wins / false win claims, finished and forced
 FORCED_Z = 3.0
 
 
@@ -281,6 +282,19 @@ def finished_acc(rows: dict) -> float:
     return sum(rows[i]["correct"] for i in ids) / len(ids)
 
 
+def false_nowin(r: dict, forced: bool = False) -> bool:
+    o = r.get("forced_outcome", r["outcome"]) if forced else r["outcome"]
+    return o == "missed win (said NO WIN)"
+
+
+def false_claim(r: dict, forced: bool = False) -> bool:
+    """A claimed winning chain that does not win (on a no-win position, or a broken chain on a win)."""
+    o = r.get("forced_outcome", r["outcome"]) if forced else r["outcome"]
+    if r["task"] != "win" or (r.get("forced_correct") if forced else r["correct"]): return False
+    return o.startswith("claimed a win") or o.startswith("illegal jump") or o.startswith("bad square") or \
+        o == "the sequence ends without reaching the goal"
+
+
 def gate(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, str]:
     """best/new/peak: load_rows() of the same validation items. Promote unless finished accuracy is clearly worse than
     the best's or the peak's, or forced accuracy collapses (see the module docstring); the NO-WIN count is reported,
@@ -302,7 +316,19 @@ def gate(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, 
         fi = [i for i in ids if family(new[i]) == fam]
         fb, fc, fz = paired_z(best, new, fi, lambda r: r.get("forced_correct", r["correct"]))
         if fz < -FORCED_Z: return False, f"forced accuracy on {fam} collapsed (+{fb}/-{fc}, z {fz:+.2f}); {head}"
-    return True, head
+    # v3.3 two-sided error guards (v4 r7-r13 drifted into false NO WINs, r15-r16 into false win claims; each round
+    # traded one error for the other): neither error may clearly grow, finished or forced. z = (fewer - more) / sqrt
+    errs = []
+    win_ids = [i for i in ids if new[i]["task"] == "win"]
+    for name, fn, sub in (("false NO WIN", false_nowin, pos), ("false win claims", false_claim, win_ids)):
+        for forced in (False, True):
+            eb, ec, _ = paired_z(best, new, sub, lambda r: fn(r, forced))       # eb: new errs only, ec: best errs only
+            ez = (ec - eb) / math.sqrt(eb + ec) if eb + ec else 0.0
+            tot_b, tot_n = sum(fn(best[i], forced) for i in sub), sum(fn(new[i], forced) for i in sub)
+            errs.append(f"{name}{' (forced)' if forced else ''} {tot_b}->{tot_n}")
+            if ez < -ERR_Z:
+                return False, f"{name}{' (forced)' if forced else ''} clearly up ({tot_b} -> {tot_n}, z {ez:+.2f}); {head}"
+    return True, head + "; " + ", ".join(errs)
 
 def main():
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)

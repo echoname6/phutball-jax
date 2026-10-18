@@ -145,3 +145,86 @@ class PhutballReward:
         self.stats.append({"per": {k: tuple(v) for k, v in per.items()}, "correct": sum(r["correct"] for r in rows) / n, "trunc": sum(r["trunc"] for r in rows) / n,
                            "forced": sum(r.get("forced_correct", False) for r in rows) / n,
                            "len": sum(r["len"] for r in rows) / n})
+
+
+# --- cost-sensitive reward (v2) --------------------------------------------------------------------------------------
+FORCE_TAIL_NF = ("\n\nTime is up. Commit to your best answer now; if you have not found one, answer NOT FOUND.\n"
+                 "</think>\n\nANSWER:")
+NOT_FOUND = re.compile(r"ANSWER:\s*NOT\s*FOUND", re.I)
+
+
+class PhutballCostReward(PhutballReward):
+    """Decision-theoretic reward (expert iteration could only reward correct answers, never penalise the two
+    mistakes, so the training mix decided which one the model drifted into: v4 r7-r13 said NO WIN on real wins,
+    r15-r16 claimed wins that do not work).
+
+      finished, correct                       +1 - lam * tokens      (lam ramps up over --lam-ramp reward calls)
+      finished, false win claim / wrong move  -a                     (a jump chain that does not win, a bad placement)
+      finished, NO WIN on a real win          -b
+      finished, no parsable answer            -c                     (incl. NOT FOUND it chose itself: not offered)
+      cut off at the cap -> forced answer ("Time is up ... if you have not found one, answer NOT FOUND"):
+            correct  +force_ok   NOT FOUND  0   false win -a   false NO WIN -b   unparsable -c
+    With calibrated beliefs a win is claimed when P(win) > (1 + a) / (2 + a + b); lam * cap << min(a, b), so thinking
+    longer is never worse than a wrong early answer, and lam only orders correct answers. NOT FOUND (0) beats any
+    wrong forced guess, and running to the cap and saying NOT FOUND beats a self-chosen early abstention (-c): when
+    unsure, keep searching."""
+
+    def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, lam=3e-5, lam_ramp=50, force_ok=0.5, budgets=(1.0,)):
+        super().__init__(cap, log_path=log_path, eff=0.0, trunc=0.0, force_credit=1.0, budgets=budgets)
+        self.a, self.b, self.c, self.lam, self.lam_ramp, self.force_ok = a, b, c, lam, lam_ramp, force_ok
+
+    def force(self, prompts, texts):
+        raws = [self.template(p) + t + FORCE_TAIL_NF for p, t in zip(prompts, texts)]
+        return ["ANSWER:" + c.split("\n")[0] for c in self.forcer(raws)]
+
+    def judge(self, it, ans):
+        """(category, correct) for an answer string."""
+        if NOT_FOUND.search(ans or ""): return "not_found", False
+        sc = score(it, ans) if ans else {"correct": False, "outcome": "unparsed"}
+        o = sc["outcome"]
+        if sc["correct"]: return "correct", True
+        if o == "missed win (said NO WIN)": return "false_nowin", False
+        if o in ("unparsed", "wrong answer type", "unverifiable (search cap)") or o.startswith("no answer"): return "unparsed", False
+        return "false_claim", False                     # a chain that does not win / a placement that does not work
+
+    def __call__(self, prompts, completions, item, subtask=None, completion_ids=None, **kw):
+        self.calls += 1
+        texts = [text_of(c) for c in completions]
+        lens = [len(x) for x in completion_ids] if completion_ids is not None else [len(t) // 3 for t in texts]
+        lam = self.lam * min(1.0, self.calls / max(1, self.lam_ramp))
+        rows, cut = [], []
+        for i, (t, it, L) in enumerate(zip(texts, item, lens)):
+            it = json.loads(it) if isinstance(it, str) else it
+            think, ans = split(t)
+            trunc = L >= self.cap - 1 and not re.search(r"ANSWER:", ans)
+            cat, ok = ("cut", False) if trunc else self.judge(it, ans)
+            rows.append({"i": i, "id": it.get("id"), "task": it["task"], "subtask": subtask[i] if subtask else it["task"],
+                         "len": L, "trunc": trunc, "correct": ok, "cat": cat, **legibility(think)})
+            if trunc: cut.append(i)
+        forced = {}
+        if cut and self.forcer:
+            try:
+                fa = self.force([prompts[i] for i in cut], [split(texts[i])[0] for i in cut])
+                for i, ans in zip(cut, fa):
+                    it = json.loads(item[i]) if isinstance(item[i], str) else item[i]
+                    forced[i] = (ans, *self.judge(it, ans))
+            except Exception as e:                                   # noqa: BLE001  (never kill a training step)
+                print("budget forcing failed:", repr(e)[:300], flush=True)
+        for r in rows:
+            i = r["i"]
+            if not r["trunc"]:
+                r["reward"] = {"correct": 1.0 - lam * r["len"], "false_claim": -self.a, "false_nowin": -self.b}.get(r["cat"], -self.c)
+            else:
+                ans, cat, ok = forced.get(i, ("", "unparsed", False))
+                r.update(forced=ans, forced_cat=cat, forced_correct=ok)
+                r["reward"] = {"correct": self.force_ok, "not_found": 0.0, "false_claim": -self.a,
+                               "false_nowin": -self.b}.get(cat, -self.c)
+        self.summary(rows)
+        cats = defaultdict(int)
+        for r in rows: cats[r.get("forced_cat") if r["trunc"] else r["cat"]] += 1
+        print(f"  [cost reward] lam {lam:.1e} | " + " ".join(f"{k} {v}" for k, v in sorted(cats.items())), flush=True)
+        if self.log_path:
+            with open(self.log_path, "a") as f:
+                for r, t in zip(rows, texts):
+                    f.write(json.dumps({"call": self.calls, "time": time.time(), **r, "text": t}) + "\n")
+        return [r["reward"] for r in rows]

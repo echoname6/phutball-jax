@@ -116,6 +116,14 @@ def main():
     ap.add_argument("--budget-hint", type=int, default=0,
                     help="append 'You have a thinking budget of about N tokens ...' to every prompt (0: off); "
                          "evaluate with the same hint (llm_bench.run --budget-hint)")
+    ap.add_argument("--reward", choices=["v1", "cost"], default="v1",
+                    help="v1: correct + length bonus + forced credit; cost: decision-theoretic (grpo_reward.PhutballCostReward)")
+    ap.add_argument("--cost-a", type=float, default=1.0, help="cost: penalty for a false win claim / wrong move")
+    ap.add_argument("--cost-b", type=float, default=1.5, help="cost: penalty for NO WIN on a real win")
+    ap.add_argument("--cost-c", type=float, default=0.25, help="cost: penalty for no parsable answer")
+    ap.add_argument("--lam", type=float, default=3e-5, help="cost: per-token cost on correct answers")
+    ap.add_argument("--lam-ramp", type=int, default=50, help="cost: reward calls over which lam ramps up from 0")
+    ap.add_argument("--force-ok", type=float, default=0.5, help="cost: reward for a correct answer forced at the cap")
     ap.add_argument("--smoke", action="store_true")
     a = ap.parse_args()
     if a.smoke: a.cap, a.prompts, a.gens, a.micro, a.max_steps, a.hours, a.save_every = 512, 2, 4, 2, 2, 0.5, 1000
@@ -127,7 +135,7 @@ def main():
     from datasets import Dataset
     from peft import LoraConfig
     from trl import GRPOConfig, GRPOTrainer
-    from llm_train.grpo_reward import PhutballReward
+    from llm_train.grpo_reward import PhutballCostReward, PhutballReward
     print("torch", torch.__version__, "transformers", transformers.__version__, "trl", trl.__version__, flush=True)
 
     mix = dict((k, float(v)) for k, v in (p.split("=") for p in a.mix.split(",") if p)) if a.mix else None
@@ -158,8 +166,13 @@ def main():
     except TypeError:
         lora = LoraConfig(**lora_kw)
 
-    reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit,
-                            budgets=tuple(float(x) for x in a.force_budgets.split(",")))
+    if a.reward == "cost":
+        reward = PhutballCostReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b,
+                                    c=a.cost_c, lam=a.lam, lam_ramp=a.lam_ramp, force_ok=a.force_ok)
+        a.force_credit = a.force_credit or 1.0                   # forcing must be on: cut-off rollouts are judged
+    else:
+        reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit,
+                                budgets=tuple(float(x) for x in a.force_budgets.split(",")))
 
     class TimeLimit(transformers.TrainerCallback):
         def __init__(self): self.t0 = time.time()

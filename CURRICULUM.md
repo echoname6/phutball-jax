@@ -177,3 +177,16 @@ forced accuracy on near-miss negatives 93% -> 67% (z -3.9) - cut off on a no-win
 claimed 80 "wins" that do not reach the goal. With the floor alone NO WIN fell to ~3% of each training set (11-13
 examples, r6 had ~10%). From round 17 long NO WIN examples (>= 2,048 thinking tokens) are topped up to 10% of the
 training set from the bank (--nowin-share).
+
+**Gate v3.3 and the cost-sensitive GRPO reward (2026-10-18).** Expert iteration only ever trains on correct samples, so it
+cannot penalise either mistake; the training mix alone decided which error the model drifted into (r7-r13 false NO WIN,
+r15-r16 false wins). Two changes:
+- gate v3.3 (curriculum_pp.gate): besides finished accuracy (vs best and peak) and the forced-collapse guards, neither
+  error may clearly grow (z < -2.0), finished or forced: false NO WIN on real wins, and false win claims (a chain that
+  does not win, on a no-win position or a broken chain on a win). A round that trades one error for the other is
+  rejected even when finished accuracy is flat.
+- `grpo_pilot --reward cost` (grpo_reward.PhutballCostReward): correct +1 - lam * tokens (lam 3e-5, ramped in), false
+  win claim / wrong move -a (1.0), false NO WIN -b (1.5), unparsable or self-chosen NOT FOUND -c (0.25); a rollout cut
+  off at the cap is forced with "... if you have not found one, answer NOT FOUND": correct +0.5, NOT FOUND 0, wrong
+  as above. NOT FOUND exists only at the budget limit, so in training every puzzle gets a real attempt; with calibrated
+  beliefs a win is claimed when P(win) > (1 + a) / (2 + a + b) = 0.44, and lam * cap (0.18) < min(a, b).
