@@ -58,7 +58,8 @@ this up. Numbers are from the logs; where a figure is an estimate it says so.
 
 ## Results
 
-**Self-play ladder** (about 300k+ games in total; estimate from the logs):
+**Self-play ladder** (319,500 self-play games in total, from `selfplay/log.csv`: 13x9 52,592 games / 30 logged
+iterations, 15x11 92,448 / 80, 17x13 93,063 / 115, 21x15 81,397 / 119; gating matches not included):
 
 | Rung | Iterations | Notes |
 | --- | --- | --- |
