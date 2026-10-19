@@ -190,3 +190,10 @@ r15-r16 false wins). Two changes:
   off at the cap is forced with "... if you have not found one, answer NOT FOUND": correct +0.5, NOT FOUND 0, wrong
   as above. NOT FOUND exists only at the budget limit, so in training every puzzle gets a real attempt; with calibrated
   beliefs a win is claimed when P(win) > (1 + a) / (2 + a + b) = 0.44, and lam * cap (0.18) < min(a, b).
+
+**Gated GRPO phases 1-2 (grpo_gated_colab.ipynb, from v4 r14).** Both rejected on finished accuracy (0.335, 0.361 vs
+0.459), but forced accuracy on wins rose 64.6% -> 81.1% / 74.5% and finished NO WIN on real wins fell 136 -> 11 / 24: the
+model searched far better and committed far less (validation wins cut off at the cap 33% -> 62% / 57%). With
+--force-ok 0.5 a correct forced answer paid; with 0.0 the cap was still the safe bet on hard puzzles, because the
+forced answer, after the full search, is wrong less often than an earlier commitment. From phase 3: --cut-cost 0.35
+(any rollout cut off at the cap pays -0.35 on top of its forced answer's score).

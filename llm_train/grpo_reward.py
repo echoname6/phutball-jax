@@ -163,15 +163,23 @@ class PhutballCostReward(PhutballReward):
       finished, NO WIN on a real win          -b
       finished, no parsable answer            -c                     (incl. NOT FOUND it chose itself: not offered)
       cut off at the cap -> forced answer ("Time is up ... if you have not found one, answer NOT FOUND"):
-            correct  +force_ok   NOT FOUND  0   false win -a   false NO WIN -b   unparsable -c
+            correct  +force_ok   NOT FOUND  0   false win -a   false NO WIN -b   unparsable -c,  all minus cut_cost
+    cut_cost (gated GRPO phases 1-2): without it, running to the cap was the safe bet on hard puzzles - the forced answer
+    comes after the full search, so it is wrong less often than an earlier commitment (commit EV ~ 2p - 1, cut-off
+    EV ~ -(1 - q)), and validation wins cut off at the cap rose 33% -> 57-62% (finished 0.459 -> 0.34-0.36) while forced
+    accuracy rose 65% -> 75-81%. With cut_cost t a cut-off is worth at most -t, so committing (EV 2p - 1 for a = 1) beats
+    it once p > (1 - t) / 2 even against a sure forced answer, and once p > (q - t) / 2 against the forced accuracy q
+    the model actually has (t = 0.35, q ~ 0.75: p > 0.2).
     With calibrated beliefs a win is claimed when P(win) > (1 + a) / (2 + a + b); lam * cap << min(a, b), so thinking
     longer is never worse than a wrong early answer, and lam only orders correct answers. NOT FOUND (0) beats any
     wrong forced guess, and running to the cap and saying NOT FOUND beats a self-chosen early abstention (-c): when
     unsure, keep searching."""
 
-    def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, lam=3e-5, lam_ramp=50, force_ok=0.5, budgets=(1.0,)):
+    def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, lam=3e-5, lam_ramp=50, force_ok=0.5, budgets=(1.0,),
+                 cut_cost=0.0):
         super().__init__(cap, log_path=log_path, eff=0.0, trunc=0.0, force_credit=1.0, budgets=budgets)
         self.a, self.b, self.c, self.lam, self.lam_ramp, self.force_ok = a, b, c, lam, lam_ramp, force_ok
+        self.cut_cost = cut_cost
 
     def force(self, prompts, texts):
         raws = [self.template(p) + t + FORCE_TAIL_NF for p, t in zip(prompts, texts)]
@@ -218,7 +226,7 @@ class PhutballCostReward(PhutballReward):
                 ans, cat, ok = forced.get(i, ("", "unparsed", False))
                 r.update(forced=ans, forced_cat=cat, forced_correct=ok)
                 r["reward"] = {"correct": self.force_ok, "not_found": 0.0, "false_claim": -self.a,
-                               "false_nowin": -self.b}.get(cat, -self.c)
+                               "false_nowin": -self.b}.get(cat, -self.c) - self.cut_cost
         self.summary(rows)
         cats = defaultdict(int)
         for r in rows: cats[r.get("forced_cat") if r["trunc"] else r["cat"]] += 1

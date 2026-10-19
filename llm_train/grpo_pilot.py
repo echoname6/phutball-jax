@@ -125,6 +125,7 @@ def main():
     ap.add_argument("--lam", type=float, default=3e-5, help="cost: per-token cost on correct answers")
     ap.add_argument("--lam-ramp", type=int, default=50, help="cost: reward calls over which lam ramps up from 0")
     ap.add_argument("--force-ok", type=float, default=0.5, help="cost: reward for a correct answer forced at the cap")
+    ap.add_argument("--cut-cost", type=float, default=0.0, help="cost: extra penalty for any rollout cut off at the cap")
     ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"],
                     help="must match the adapter's training (the v4 curriculum used ascii+men)")
     ap.add_argument("--smoke", action="store_true")
@@ -171,7 +172,7 @@ def main():
 
     if a.reward == "cost":
         reward = PhutballCostReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b,
-                                    c=a.cost_c, lam=a.lam, lam_ramp=a.lam_ramp, force_ok=a.force_ok)
+                                    c=a.cost_c, lam=a.lam, lam_ramp=a.lam_ramp, force_ok=a.force_ok, cut_cost=a.cut_cost)
         a.force_credit = a.force_credit or 1.0                   # forcing must be on: cut-off rollouts are judged
     else:
         reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit,
