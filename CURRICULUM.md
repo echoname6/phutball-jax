@@ -204,3 +204,11 @@ over p3, +6.5 over the peak r6), wins found 312 -> 428, cut off 47% -> 22% - rej
 NO WINs rose 30 -> 63: p3's 30 was low because it hid its doubtful cases in cut-offs. Gate v3.4: finished errors are
 compared as a rate among finished answers (p4: 8.0% -> 11.5% of finished win answers, z -1.7, within -2.0); forced
 error counts, which include the finished answers, only guard against a collapse (z < -3).
+
+**Gated GRPO p5-p9 and targeting.** p5 0.606 (false win claims 10.8% -> 3.9% of finished answers), p6 0.640, p7 rejected
+(0.612), p8 **0.646** (false NO WIN 4.8%), p9 0.641 (the two errors traded places): a plateau near 0.64. Forced minus
+finished accuracy on the best's validation run shows where the model knows but does not finish: 4-jump wins and
+backward traps, near-miss negatives, forced / prevent placements (15-24 points), against ~5 for 1-2 jump wins, which
+uniform sampling kept drilling. From phase 10 (TARGET in grpo_gated_colab.ipynb) llm_train.grpo_targets draws each
+phase's puzzles with bucket shares proportional to that gap and down-weights puzzles finished correctly in >= 90% of
+their past GRPO samples.
