@@ -197,3 +197,10 @@ model searched far better and committed far less (validation wins cut off at the
 --force-ok 0.5 a correct forced answer paid; with 0.0 the cap was still the safe bet on hard puzzles, because the
 forced answer, after the full search, is wrong less often than an earlier commitment. From phase 3: --cut-cost 0.35
 (any rollout cut off at the cap pays -0.35 on top of its forced answer's score).
+
+**Gated GRPO phases 3-4.** p3 (cut cost 0.35) promoted: finished 0.454 (= r14), false NO WIN 136 -> 30, false win claims
+75 -> 42, forced wins 64.6% -> 78.2%, but 47% of validation wins still cut off. p4 (from p3): finished **0.604** (z +7.6
+over p3, +6.5 over the peak r6), wins found 312 -> 428, cut off 47% -> 22% - rejected by gate v3.3 because finished false
+NO WINs rose 30 -> 63: p3's 30 was low because it hid its doubtful cases in cut-offs. Gate v3.4: finished errors are
+compared as a rate among finished answers (p4: 8.0% -> 11.5% of finished win answers, z -1.7, within -2.0); forced
+error counts, which include the finished answers, only guard against a collapse (z < -3).

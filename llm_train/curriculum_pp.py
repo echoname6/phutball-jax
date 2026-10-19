@@ -73,7 +73,7 @@ TRAIN_MAX = 1000
 MIN_NOWIN_THINK = 2048    # a NO WIN example must show at least this much search (natural finishes included)
 NOWIN_SHARE = 0.10        # ...and NO WIN examples are topped up to this share of the training set from the bank
 GATE_Z = 1.5
-ERR_Z = 2.0               # two-sided error guards: false NO WIN on real wins / false win claims, finished and forced
+ERR_Z = 2.0               # two-sided error guards: false NO WIN / false win claims (finished: rate; forced: paired)
 FORCED_Z = 3.0
 
 
@@ -318,16 +318,26 @@ def gate(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, 
         if fz < -FORCED_Z: return False, f"forced accuracy on {fam} collapsed (+{fb}/-{fc}, z {fz:+.2f}); {head}"
     # v3.3 two-sided error guards (v4 r7-r13 drifted into false NO WINs, r15-r16 into false win claims; each round
     # traded one error for the other): neither error may clearly grow, finished or forced. z = (fewer - more) / sqrt
+    # Finished errors are compared as a RATE among finished answers: a model that commits on more puzzles makes more
+    # finished answers of every kind (gated GRPO p4: finished 0.454 -> 0.604, false NO WIN 30 -> 63 because p3 hid its
+    # doubtful cases in cut-offs: 47% of wins). Forced answers exist for every item: paired counts, as before.
     errs = []
     win_ids = [i for i in ids if new[i]["task"] == "win"]
     for name, fn, sub in (("false NO WIN", false_nowin, pos), ("false win claims", false_claim, win_ids)):
-        for forced in (False, True):
-            eb, ec, _ = paired_z(best, new, sub, lambda r: fn(r, forced))       # eb: new errs only, ec: best errs only
-            ez = (ec - eb) / math.sqrt(eb + ec) if eb + ec else 0.0
-            tot_b, tot_n = sum(fn(best[i], forced) for i in sub), sum(fn(new[i], forced) for i in sub)
-            errs.append(f"{name}{' (forced)' if forced else ''} {tot_b}->{tot_n}")
-            if ez < -ERR_Z:
-                return False, f"{name}{' (forced)' if forced else ''} clearly up ({tot_b} -> {tot_n}, z {ez:+.2f}); {head}"
+        fin = lambda R, i: R[i]["outcome"] != "unparsed"
+        nb_, nn_ = sum(fin(best, i) for i in sub), sum(fin(new, i) for i in sub)
+        kb, kn = sum(fn(best[i]) for i in sub), sum(fn(new[i]) for i in sub)
+        rb, rn = kb / max(nb_, 1), kn / max(nn_, 1); pool = (kb + kn) / max(nb_ + nn_, 1)
+        ez = (rb - rn) / math.sqrt(pool * (1 - pool) * (1 / max(nb_, 1) + 1 / max(nn_, 1))) if 0 < pool < 1 else 0.0
+        errs.append(f"{name} {kb}/{nb_} -> {kn}/{nn_} finished ({rb:.1%} -> {rn:.1%})")
+        if ez < -ERR_Z:
+            return False, f"{name} rate clearly up ({rb:.1%} -> {rn:.1%} of finished answers, z {ez:+.2f}); {head}"
+        eb, ec, _ = paired_z(best, new, sub, lambda r: fn(r, True))              # eb: new errs only, ec: best errs only
+        ez = (ec - eb) / math.sqrt(eb + ec) if eb + ec else 0.0
+        tot_b, tot_n = sum(fn(best[i], True) for i in sub), sum(fn(new[i], True) for i in sub)
+        errs.append(f"{name} (forced) {tot_b}->{tot_n}")
+        if ez < -FORCED_Z:                    # forced answers include the finished ones: only a collapse counts here
+            return False, f"{name} (forced) collapsed ({tot_b} -> {tot_n}, z {ez:+.2f}); {head}"
     return True, head + "; " + ", ".join(errs)
 
 def main():
