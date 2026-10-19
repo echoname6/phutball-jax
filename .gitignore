@@ -13,3 +13,6 @@ llm_train/data/
 
 # make_prevent_v2 per-worker part files (merged into the .jsonl.gz)
 llm_train/puzzles/*.part*.jsonl
+
+llm_transfer/data/
+llm_transfer/results/
