@@ -248,3 +248,11 @@ sampled: finished answer's utility x w(t), w(t) = min(1, log2(32k / t) / 4) (1 /
 16k); no answer -c flat; cut off at 16k: a wrong forced answer x 0.25, minus cut_cost 0.1. Rollouts run to 16k (run 1:
 6k, so a hard puzzle solved past 6k earned nothing); correct and wrong answers at the same t scale by the same w, so the
 claim / NO WIN trade-off at any moment is run 1's; only WHEN to answer is reshaped. Tightening later = lower deadlines.
+
+**Surface ladder (same 200 puzzles: board = the training prompt, xy = numbered coordinates, named = the bridge;
+forced at 24k, finished at 24k in brackets).** base 91 (64) / 96 (78) / 87 (63); r14 66 (50) / 91 (51) / 76 (39); p11
+88 (88) / 95 (81) / 90 (75). Untrained Qwen reaches run 1's best on its own training format given 24k tokens (base vs
+p11 on the board, paired: +18/-13); expert iteration's r14 lost a third of that on the board (z -5.4 vs p11) and much
+less in xy: the damage is concentrated on the surface it was trained on. GRPO's gain over base is committing: finished
+at 24k 88% vs 64% on the board, 75% vs 63% named. Numbered coordinates are the easiest surface for every model (base
+xy 96%, 4-jump backward traps 88% vs 76% on the board). Run 2 therefore starts from the base model (START = 'base').
