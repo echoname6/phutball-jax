@@ -117,8 +117,11 @@ def main():
     ap.add_argument("--budget-hint", type=int, default=0,
                     help="append 'You have a thinking budget of about N tokens ...' to every prompt (0: off); "
                          "evaluate with the same hint (llm_bench.run --budget-hint)")
-    ap.add_argument("--reward", choices=["v1", "cost"], default="v1",
-                    help="v1: correct + length bonus + forced credit; cost: decision-theoretic (grpo_reward.PhutballCostReward)")
+    ap.add_argument("--reward", choices=["v1", "cost", "curve"], default="v1",
+                    help="v1: correct + length bonus + forced credit; cost: decision-theoretic (grpo_reward.PhutballCostReward); "
+                         "curve: the cost reward's expectation under an unknown log-uniform deadline in [--curve-min, --cap] "
+                         "(grpo_reward.PhutballCurveReward, the curve gate's objective)")
+    ap.add_argument("--curve-min", type=int, default=2048, help="curve: the smallest deadline (weight 1 below it)")
     ap.add_argument("--cost-a", type=float, default=1.0, help="cost: penalty for a false win claim / wrong move")
     ap.add_argument("--cost-b", type=float, default=1.5, help="cost: penalty for NO WIN on a real win")
     ap.add_argument("--cost-c", type=float, default=0.25, help="cost: penalty for no parsable answer")
@@ -173,7 +176,12 @@ def main():
     except TypeError:
         lora = LoraConfig(**lora_kw)
 
-    if a.reward == "cost":
+    if a.reward == "curve":
+        from llm_train.grpo_reward import PhutballCurveReward
+        reward = PhutballCurveReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b, c=a.cost_c,
+                                     bmin=a.curve_min, cut_cost=a.cut_cost, prior_correct=a.prior_correct)
+        a.force_credit = a.force_credit or 1.0
+    elif a.reward == "cost":
         reward = PhutballCostReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b,
                                     c=a.cost_c, lam=a.lam, lam_ramp=a.lam_ramp, force_ok=a.force_ok, cut_cost=a.cut_cost,
                                     prior_correct=a.prior_correct)

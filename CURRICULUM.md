@@ -242,3 +242,9 @@ rewards weighted by validation share / draw share of the bucket (Dr. GRPO withou
 the weight), so targeting picks where the steps go without changing the base rates. test_gate: 16/16 (8 curve cases:
 faster at the same peak promotes; slower, a lower ceiling, a hidden ceiling loss among cut-off items, or faster by
 committing to wrong answers rejects).
+(4) `grpo_pilot --reward curve` (grpo_reward.PhutballCurveReward): the curve gate's objective as the reward, i.e. the
+cost reward's expectation under an unknown deadline drawn log-uniformly from 2k-16k, computed from one rollout instead of
+sampled: finished answer's utility x w(t), w(t) = min(1, log2(32k / t) / 4) (1 / 0.75 / 0.5 / 0.25 at 2k / 4k / 8k /
+16k); no answer -c flat; cut off at 16k: a wrong forced answer x 0.25, minus cut_cost 0.1. Rollouts run to 16k (run 1:
+6k, so a hard puzzle solved past 6k earned nothing); correct and wrong answers at the same t scale by the same w, so the
+claim / NO WIN trade-off at any moment is run 1's; only WHEN to answer is reshaped. Tightening later = lower deadlines.

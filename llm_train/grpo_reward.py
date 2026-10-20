@@ -21,6 +21,7 @@ llm_train/analyze_rollouts.py).
 from __future__ import annotations
 
 import json
+import math
 import re
 import statistics
 import time
@@ -185,6 +186,14 @@ class PhutballCostReward(PhutballReward):
         raws = [self.template(p) + t + FORCE_TAIL_NF for p, t in zip(prompts, texts)]
         return ["ANSWER:" + c.split("\n")[0] for c in self.forcer(raws)]
 
+    tag = "cost reward"
+
+    def row_reward(self, r, lam):
+        if not r["trunc"]:
+            return {"correct": 1.0 - lam * r["len"], "false_claim": -self.a, "false_nowin": -self.b}.get(r["cat"], -self.c)
+        return {"correct": self.force_ok, "not_found": 0.0, "false_claim": -self.a,
+                "false_nowin": -self.b}.get(r["forced_cat"], -self.c) - self.cut_cost
+
     def judge(self, it, ans):
         """(category, correct) for an answer string."""
         if NOT_FOUND.search(ans or ""): return "not_found", False
@@ -219,18 +228,14 @@ class PhutballCostReward(PhutballReward):
             except Exception as e:                                   # noqa: BLE001  (never kill a training step)
                 print("budget forcing failed:", repr(e)[:300], flush=True)
         for r in rows:
-            i = r["i"]
-            if not r["trunc"]:
-                r["reward"] = {"correct": 1.0 - lam * r["len"], "false_claim": -self.a, "false_nowin": -self.b}.get(r["cat"], -self.c)
-            else:
-                ans, cat, ok = forced.get(i, ("", "unparsed", False))
+            if r["trunc"]:
+                ans, cat, ok = forced.get(r["i"], ("", "unparsed", False))
                 r.update(forced=ans, forced_cat=cat, forced_correct=ok)
-                r["reward"] = {"correct": self.force_ok, "not_found": 0.0, "false_claim": -self.a,
-                               "false_nowin": -self.b}.get(cat, -self.c) - self.cut_cost
+            r["reward"] = self.row_reward(r, lam)
         self.summary(rows)
         cats = defaultdict(int)
         for r in rows: cats[r.get("forced_cat") if r["trunc"] else r["cat"]] += 1
-        print(f"  [cost reward] lam {lam:.1e} | " + " ".join(f"{k} {v}" for k, v in sorted(cats.items())), flush=True)
+        print(f"  [{self.tag}] lam {lam:.1e} | " + " ".join(f"{k} {v}" for k, v in sorted(cats.items())), flush=True)
         if self.log_path:
             with open(self.log_path, "a") as f:
                 for r, t in zip(rows, texts):
@@ -238,3 +243,38 @@ class PhutballCostReward(PhutballReward):
         w = kw.get("w_prior") if self.prior_correct else None   # importance weight: the advantage scales by it
         if w is not None: return [r["reward"] * float(x) for r, x in zip(rows, w)]
         return [r["reward"] for r in rows]
+
+
+# --- curve reward (run 2) ----------------------------------------------------------------------------------------------
+class PhutballCurveReward(PhutballCostReward):
+    """The curve gate's objective as a reward: the expected cost-reward under an UNKNOWN deadline B drawn log-uniformly
+    (budgets bmin, 2 bmin, ..., bmax, as the gate's 2k / 4k / 8k / 16k), computed from one rollout instead of sampled.
+    A rollout that finishes at t tokens with answer utility u (+1 correct, -a false claim, -b false NO WIN) has its
+    answer by every deadline >= t:
+
+      finished:  u * w(t),   w(t) = min(1, log2(2 bmax / t) / log2(2 bmax / bmin))   (1 at bmin, 0.5 at bmax / 2,
+                                                                                     0.25 at bmax: the gate's grid)
+                 no parsable answer (incl. a self-chosen NOT FOUND): -c, flat (quitting is never cheap)
+      cut off at bmax (the generation cap): forced answer wrong -> u * w(bmax); correct or NOT FOUND -> 0; minus cut_cost
+
+    Against the 6k cost reward: a hard puzzle solved at 12k earns credit (GRPO gets signal on puzzles every sample of
+    which was cut off at 6k), the same answer earlier earns more by the same factor at every scale (no per-token lam),
+    and a wrong early answer costs the most (it is wrong at every deadline). cut_cost (default 0.1): with 0, running to
+    the cap (0) beats answering at the cap (0.25 (2p - 1)) whenever P(right) < 0.5; with 0.1, answering pays from p ~ 0.3.
+    Tightening later: lower bmin / bmax (the deadlines), not a per-bucket schedule."""
+    tag = "curve reward"
+
+    def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, bmin=2048, cut_cost=0.1, prior_correct=False, **_):
+        super().__init__(cap, log_path=log_path, a=a, b=b, c=c, lam=0.0, lam_ramp=1, force_ok=0.0, cut_cost=cut_cost,
+                         prior_correct=prior_correct)
+        self.bmin, self.bmax = bmin, cap
+
+    def weight(self, tokens: int) -> float:
+        return max(0.0, min(1.0, math.log2(2 * self.bmax / max(tokens, 1)) / math.log2(2 * self.bmax / self.bmin)))
+
+    def row_reward(self, r, lam):
+        u = {"correct": 1.0, "false_claim": -self.a, "false_nowin": -self.b}
+        if not r["trunc"]:
+            return u[r["cat"]] * self.weight(r["len"]) if r["cat"] in u else -self.c
+        fc = r.get("forced_cat")
+        return (u[fc] * self.weight(self.bmax) if fc in ("false_claim", "false_nowin") else 0.0) - self.cut_cost
