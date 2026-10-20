@@ -255,18 +255,23 @@ class PhutballCurveReward(PhutballCostReward):
       finished:  u * w(t),   w(t) = min(1, log2(2 bmax / t) / log2(2 bmax / bmin))   (1 at bmin, 0.5 at bmax / 2,
                                                                                      0.25 at bmax: the gate's grid)
                  no parsable answer (incl. a self-chosen NOT FOUND): -c, flat (quitting is never cheap)
-      cut off at bmax (the generation cap): forced answer wrong -> u * w(bmax); correct or NOT FOUND -> 0; minus cut_cost
+      cut off at bmax (the generation cap): forced answer wrong -> u * w(bmax); correct -> force_ok; NOT FOUND -> 0;
+                 minus cut_cost
 
     Against the 6k cost reward: a hard puzzle solved at 12k earns credit (GRPO gets signal on puzzles every sample of
     which was cut off at 6k), the same answer earlier earns more by the same factor at every scale (no per-token lam),
     and a wrong early answer costs the most (it is wrong at every deadline). cut_cost (default 0.1): with 0, running to
     the cap (0) beats answering at the cap (0.25 (2p - 1)) whenever P(right) < 0.5; with 0.1, answering pays from p ~ 0.3.
-    Tightening later: lower bmin / bmax (the deadlines), not a per-bucket schedule."""
+    Tightening later: lower bmin / bmax (the deadlines), not a per-bucket schedule.
+    force_ok (run 2 from the base model: 0.15): the untrained model finishes few rollouts within 16k at first (run 2
+    phase 1: 91-100% cut off), so a correct forced answer earns a little (0.15 - cut_cost) to give GRPO a signal;
+    finishing correctly at the cap (w = 0.25) still beats it."""
     tag = "curve reward"
 
-    def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, bmin=2048, cut_cost=0.1, prior_correct=False, **_):
-        super().__init__(cap, log_path=log_path, a=a, b=b, c=c, lam=0.0, lam_ramp=1, force_ok=0.0, cut_cost=cut_cost,
-                         prior_correct=prior_correct)
+    def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, bmin=2048, cut_cost=0.1, force_ok=0.0,
+                 prior_correct=False, **_):
+        super().__init__(cap, log_path=log_path, a=a, b=b, c=c, lam=0.0, lam_ramp=1, force_ok=force_ok,
+                         cut_cost=cut_cost, prior_correct=prior_correct)
         self.bmin, self.bmax = bmin, cap
 
     def weight(self, tokens: int) -> float:
@@ -277,4 +282,6 @@ class PhutballCurveReward(PhutballCostReward):
         if not r["trunc"]:
             return u[r["cat"]] * self.weight(r["len"]) if r["cat"] in u else -self.c
         fc = r.get("forced_cat")
-        return (u[fc] * self.weight(self.bmax) if fc in ("false_claim", "false_nowin") else 0.0) - self.cut_cost
+        if fc in ("false_claim", "false_nowin"): base = u[fc] * self.weight(self.bmax)
+        else: base = self.force_ok if fc == "correct" else 0.0
+        return base - self.cut_cost

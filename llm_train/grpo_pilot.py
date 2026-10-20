@@ -105,7 +105,10 @@ def main():
     ap.add_argument("--force-engine", choices=["hf", "vllm"], default="hf",
                     help="hf: the training model completes the forced answer (vLLM can sleep: less memory); "
                          "vllm: the colocated engine (needs it resident: OOM at 6k tokens on one A100)")
-    ap.add_argument("--force-batch", type=int, default=2)
+    ap.add_argument("--force-batch", type=int, default=2, help="forced answers per generate call (1 above an 8k cap)")
+    ap.add_argument("--temperature", type=float, default=1.0, help="rollout sampling temperature (run 1: 1.0)")
+    ap.add_argument("--top-p", type=float, default=1.0); ap.add_argument("--top-k", type=int, default=0,
+                    help="0: off. Qwen's thinking recommendation (and the validation eval): 0.6 / 0.95 / 20")
     ap.add_argument("--force-budgets", default="1",
                     help="fractions of the cap at which a cut-off rollout is forced, e.g. 0.25,0.5,1 (anytime credit)")
     ap.add_argument("--stage", choices=sorted(STAGES), default=None, help="curriculum stage (sets the puzzle mix)")
@@ -161,7 +164,8 @@ def main():
         learning_rate=a.lr, lr_scheduler_type="constant_with_warmup", warmup_steps=2, max_grad_norm=1.0,
         per_device_train_batch_size=a.micro, gradient_accumulation_steps=per_step // a.micro,
         num_generations=a.gens, max_prompt_length=1536, max_completion_length=a.cap,
-        temperature=1.0, top_p=1.0, beta=0.0, loss_type="dr_grpo", scale_rewards=False,
+        temperature=a.temperature, top_p=a.top_p, **({"top_k": a.top_k} if a.top_k else {}),
+        beta=0.0, loss_type="dr_grpo", scale_rewards=False,
         mask_truncated_completions=False,                               # truncation is penalised, not hidden
         use_vllm=True, vllm_mode="colocate", vllm_gpu_memory_utilization=a.vllm_mem,
         vllm_enable_sleep_mode=not (a.force_credit and a.force_engine == "vllm"),   # vLLM forcing needs it awake
@@ -179,7 +183,8 @@ def main():
     if a.reward == "curve":
         from llm_train.grpo_reward import PhutballCurveReward
         reward = PhutballCurveReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b, c=a.cost_c,
-                                     bmin=a.curve_min, cut_cost=a.cut_cost, prior_correct=a.prior_correct)
+                                     bmin=a.curve_min, cut_cost=a.cut_cost, force_ok=a.force_ok,
+                                     prior_correct=a.prior_correct)
         a.force_credit = a.force_credit or 1.0
     elif a.reward == "cost":
         reward = PhutballCostReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b,
@@ -229,11 +234,17 @@ def main():
                 model.eval(); tok.padding_side = "left"
                 pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
                 try:
+                    # generate on the underlying transformers model (the LoRA layers stay active): its forward declares
+                    # logits_to_keep, so the prefill computes the last position's logits only. Through the PEFT wrapper
+                    # (forward(*args, **kwargs)) generate computed full-vocabulary logits for every prompt position:
+                    # ~16 GB per 16k-token sequence (run 2 phase 1: "Tried to allocate 35.73 GiB").
+                    gen = model.get_base_model() if hasattr(model, "get_base_model") else model
+                    fb = 1 if a.cap > 8192 else a.force_batch
                     with torch.no_grad():
-                        for i in range(0, len(raws), a.force_batch):
-                            enc = tok(raws[i:i + a.force_batch], return_tensors="pt", padding=True,
+                        for i in range(0, len(raws), fb):
+                            enc = tok(raws[i:i + fb], return_tensors="pt", padding=True,
                                       add_special_tokens=False).to(model.device)
-                            g = model.generate(**enc, max_new_tokens=12, do_sample=False, use_cache=True, pad_token_id=pad)
+                            g = gen.generate(**enc, max_new_tokens=12, do_sample=False, use_cache=True, pad_token_id=pad)
                             outs += tok.batch_decode(g[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
                 finally:
                     tok.padding_side = side
