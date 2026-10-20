@@ -39,6 +39,11 @@ def main():
     a = ap.parse_args()
     R = {n: load(n) for n in a.names}; ref = a.names[0]
     ids = sorted(set.intersection(*(set(r) for r in R.values())))
+    shas = {i: {R[n][i]["prompt_sha"] for n in a.names if "prompt_sha" in R[n][i]} for i in ids}
+    bad = [i for i in ids if len(shas[i]) > 1]                 # same id, different prompt: a rebuilt suite
+    if bad:
+        print(f"WARNING: {len(bad)} items have different prompts across models (suite rebuilt between runs?); dropped")
+        ids = [i for i in ids if i not in set(bad)]
     groups = defaultdict(list)
     for i in ids:
         r = R[ref][i]; groups[(r["family"], "all")].append(i); groups[(r["family"], dial_key(r["dial"]))].append(i)

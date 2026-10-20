@@ -13,6 +13,7 @@ finished / forced accuracy, categories, median completion tokens).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import concurrent.futures as cf
 import json
 import re
@@ -114,7 +115,8 @@ def main():
         ans_part = reply.rsplit("</think>", 1)[1] if "</think>" in reply else (reply if reasoning else "")
         body = answer_line(ans_part)
         ok, cat = score(it, body)
-        return it, {"id": it["id"], "family": it["family"], "dial": it["dial"], "absent": it["absent"], "answer": body,
+        return it, {"id": it["id"], "prompt_sha": hashlib.sha1(it["prompt"].encode()).hexdigest()[:12],
+                    "family": it["family"], "dial": it["dial"], "absent": it["absent"], "answer": body,
                     "correct": ok, "category": cat, "finish_reason": out.get("finish_reason"),
                     "tokens": out.get("usage", {}).get("completion_tokens"), "reasoning": reasoning, "reply": reply,
                     "error": out.get("error")}

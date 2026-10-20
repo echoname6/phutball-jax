@@ -22,6 +22,8 @@ suite is a ladder of distance from the training task (phutball win puzzles, asci
              the released file has no ground truth for the trace or the source list, so only existence is scored).
 
   python -m llm_transfer.build --out llm_transfer/data/suite_v1.jsonl      (downloads BABILong / CogniLoad / CoRe once)
+  python -m llm_transfer.build --hard --out llm_transfer/data/suite_v2_hard.jsonl   (harder dials: boxes, pointer, path,
+                                                                                     ruler_vt; base saturated them in v1)
 """
 from __future__ import annotations
 
@@ -109,10 +111,13 @@ def build_bridge(per_bucket: int):
 
 # --- pointer chasing --------------------------------------------------------------------------------------------------
 def words(rng, n, k=6):
-    seen = set()
-    while len(seen) < n:
-        seen.add("".join(rng.choice(string.ascii_lowercase) for _ in range(k)))
-    return list(seen)
+    """n distinct random words in generation order (a list(set) here made pointer / path / ruler_vt items depend on the
+    process's hash seed: a rebuilt suite_v1 had different prompts under the same ids)."""
+    seen, out = set(), []
+    while len(out) < n:
+        w = "".join(rng.choice(string.ascii_lowercase) for _ in range(k))
+        if w not in seen: seen.add(w); out.append(w)
+    return out
 
 
 def build_pointer(rng, hops=(1, 2, 4, 6, 8), per=30, decoys=6):
@@ -159,7 +164,7 @@ def build_path(rng, lengths=(2, 3, 4, 6), per=30, n_nodes=24, extra_edges=18):
                 for a, b in edges:
                     if a == x and b not in reach: reach.add(b); frontier.append(b)
             exists = T in reach
-            el = [f"{a} -> {b}" for a, b in edges]; rng.shuffle(el)
+            el = [f"{a} -> {b}" for a, b in sorted(edges)]; rng.shuffle(el)
             out.append({"id": f"path-L{L}-{k}", "family": "path", "dial": {"length": L}, "kind": "path",
                         "prompt": "One-way roads between towns:\n" + "\n".join(el) +
                         f"\n\nQuestion: is there a route from {path[0]} to {T} along these one-way roads? If yes, give one "
@@ -172,22 +177,26 @@ def build_path(rng, lengths=(2, 3, 4, 6), per=30, n_nodes=24, extra_edges=18):
 # --- boxes (entity tracking with removals) -----------------------------------------------------------------------------
 ITEMS = ["apple", "bell", "coin", "drum", "egg", "flute", "glove", "hat", "ink", "jar", "key", "lamp", "map", "nut",
          "orb", "pen", "quill", "ring", "shoe", "toy"]
+ITEMS_HARD = ITEMS + ["acorn", "badge", "candle", "dice", "feather", "gem", "horn", "kite", "leaf", "medal", "needle",
+                      "pebble", "rope", "shell", "spoon", "stamp", "thimble", "token", "whistle", "yarn"]
 
 
-def build_boxes(rng, ops=(4, 8, 16, 24), per=30):
+def build_boxes(rng, ops=(4, 8, 16, 24), per=30, n_boxes=7, items=ITEMS, heavy_w=(1, 3, 1), p_nonempty=None):
+    """heavy_w: put / remove / move weights of the REMOVE-heavy half (v1's 1:3:1 drains the boxes over long sequences;
+    the hard suite uses 3:3:1). p_nonempty: ask about a non-empty box with this probability (None: any box, as v1)."""
     out = []
     for n in ops:
         for k in range(per):
             heavy = k % 2 == 0                                              # REMOVE-heavy half
-            boxes = {i: set(rng.sample(ITEMS, rng.randint(1, 3))) for i in range(1, 8)}
+            boxes = {i: set(rng.sample(items, rng.randint(1, 3))) for i in range(1, n_boxes + 1)}
             init = " ".join(f"Box {i} contains {' and '.join(sorted(v)) or 'nothing'}." for i, v in boxes.items())
             lines = []
             for _ in range(n):
                 full = [i for i in boxes if boxes[i]]
-                op = rng.choices(["put", "remove", "move"], weights=[1, 3, 1] if heavy else [2, 1, 2])[0]
+                op = rng.choices(["put", "remove", "move"], weights=list(heavy_w) if heavy else [2, 1, 2])[0]
                 if op != "put" and not full: op = "put"
                 if op == "put":
-                    i = rng.randint(1, 7); free = [x for x in ITEMS if not any(x in b for b in boxes.values())]
+                    i = rng.randint(1, n_boxes); free = [x for x in items if not any(x in b for b in boxes.values())]
                     if not free: continue
                     x = rng.choice(free); boxes[i].add(x); lines.append(f"Put the {x} into Box {i}.")
                 elif op == "remove":
@@ -196,7 +205,10 @@ def build_boxes(rng, ops=(4, 8, 16, 24), per=30):
                 else:
                     i = rng.choice(full); j = rng.choice([b for b in boxes if b != i]); x = rng.choice(sorted(boxes[i]))
                     boxes[i].discard(x); boxes[j].add(x); lines.append(f"Move the {x} from Box {i} to Box {j}.")
-            q = rng.randint(1, 7)
+            q = rng.randint(1, n_boxes)
+            if p_nonempty is not None:
+                full = [i for i in boxes if boxes[i]]; empty = [i for i in boxes if not boxes[i]]
+                q = rng.choice(full) if full and (rng.random() < p_nonempty or not empty) else rng.choice(empty or full)
             out.append({"id": f"boxes-n{n}-{k}", "family": "boxes", "dial": {"ops": n, "remove_heavy": heavy}, "kind": "set",
                         "prompt": init + "\n\n" + "\n".join(lines) + f"\n\nQuestion: what does Box {q} contain now? List the "
                         f"items, or NOTHING if it is empty." + END + "ANSWER: <item>, <item>, ...  (or ANSWER: NOTHING)",
@@ -208,20 +220,24 @@ def build_boxes(rng, ops=(4, 8, 16, 24), per=30):
 FILLER = ("The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. ")
 
 
-def build_ruler_vt(rng, hops=(2, 4, 8), lengths=(2000, 8000), per=20):
+def build_ruler_vt(rng, hops=(2, 4, 8), lengths=(2000, 8000), per=20, decoys=1):
     out = []
     for h in hops:
         for L in lengths:
             for k in range(per):
-                names = [n.upper() for n in words(rng, 2 * (h + 1) + 2, 5)]
-                val = str(rng.randint(10000, 99999)); dval = str(rng.randint(10000, 99999))
-                chain = names[:h + 1]; dec = names[h + 1:2 * (h + 1)]
+                names = [n.upper() for n in words(rng, (decoys + 1) * (h + 1) + 2, 5)]
+                val = str(rng.randint(10000, 99999))
+                chain = names[:h + 1]
                 stmts = [f"VAR {chain[0]} = {val}."] + [f"VAR {chain[i]} = VAR {chain[i - 1]}." for i in range(1, h + 1)]
-                dst = [f"VAR {dec[0]} = {dval}."] + [f"VAR {dec[i]} = VAR {dec[i - 1]}." for i in range(1, h + 1)]
+                chains = [stmts]
+                for d in range(decoys):                                     # decoy chains with other values
+                    dec = names[(d + 1) * (h + 1):(d + 2) * (h + 1)]; dval = str(rng.randint(10000, 99999))
+                    chains.append([f"VAR {dec[0]} = {dval}."] + [f"VAR {dec[i]} = VAR {dec[i - 1]}." for i in range(1, h + 1)])
                 n_fill = max(1, L // 23)                                    # ~23 tokens per filler block
-                slots = sorted(rng.sample(range(n_fill), len(stmts) + len(dst)))
-                tags = [0] * len(stmts) + [1] * len(dst); rng.shuffle(tags)    # interleave, each chain in its own order
-                cs, ds = iter(stmts), iter(dst); seq = [next(ds) if t else next(cs) for t in tags]
+                n_st = sum(len(c) for c in chains)
+                slots = sorted(rng.sample(range(n_fill), n_st))
+                tags = [t for t, c in enumerate(chains) for _ in c]; rng.shuffle(tags)   # interleave, each chain in order
+                its = [iter(c) for c in chains]; seq = [next(its[t]) for t in tags]
                 body, si = [], 0
                 for f in range(n_fill):
                     body.append(FILLER)
@@ -283,16 +299,36 @@ def build_core(rng, per_type=50):
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", type=Path, default=ROOT / "llm_transfer/data/suite_v1.jsonl")
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--small", action="store_true", help="a few per cell (tests)")
+    ap.add_argument("--hard", action="store_true", help="the hard suite (v2 dials) for the families v1 saturated")
     a = ap.parse_args(); rng = random.Random(a.seed); s = a.small
+    if a.hard: return write(a.out, build_hard(random.Random(1000 + a.seed), s))
     items = (build_bridge(3 if s else 25) + build_pointer(rng, per=4 if s else 30) + build_path(rng, per=4 if s else 30) +
              build_boxes(rng, per=4 if s else 30) + build_ruler_vt(rng, per=2 if s else 20) +
              build_babilong(rng, per=3 if s else 25) + build_cogniload(rng, per=3 if s else 40) +
              build_core(rng, per_type=6 if s else 50))
-    a.out.parent.mkdir(parents=True, exist_ok=True)
-    with open(a.out, "w") as f:
+    write(a.out, items)
+
+
+def build_hard(rng, small=False):
+    """v2 dials for the families the base model (thinking on, 6k tokens) saturated in v1: boxes 95.8% finished / 100%
+    forced (REMOVE-heavy 100% at 16-24 ops), ruler_vt 100 / 100, pointer 92.7 / 100, path 94.2 / 98.3. Same generators,
+    longer chains, more entities and more distractors; ids prefixed "hard-" so results never pair with v1's."""
+    s = small
+    items = (build_boxes(rng, ops=(32, 48, 64, 96), per=4 if s else 30, n_boxes=12, items=ITEMS_HARD,
+                         heavy_w=(3, 3, 1), p_nonempty=0.75) +
+             build_pointer(rng, hops=(12, 16, 24), per=4 if s else 30, decoys=8) +
+             build_path(rng, lengths=(6, 8, 10, 12), per=4 if s else 25, n_nodes=48, extra_edges=60) +
+             build_ruler_vt(rng, hops=(16, 32), lengths=(4000, 10000), per=2 if s else 20, decoys=3))
+    for it in items: it["id"] = "hard-" + it["id"]
+    return items
+
+
+def write(out, items):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
         for it in items: f.write(json.dumps(it) + "\n")
     c = Counter(it["family"] for it in items); ab = Counter(it["family"] for it in items if it["absent"])
-    print(f"{len(items)} items -> {a.out}"); print({k: f"{v} ({ab[k]} absent)" for k, v in c.items()})
+    print(f"{len(items)} items -> {out}"); print({k: f"{v} ({ab[k]} absent)" for k, v in c.items()})
 
 
 if __name__ == "__main__":
