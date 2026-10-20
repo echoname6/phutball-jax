@@ -22,6 +22,9 @@ suite is a ladder of distance from the training task (phutball win puzzles, asci
              the released file has no ground truth for the trace or the source list, so only existence is scored).
 
   python -m llm_transfer.build --out llm_transfer/data/suite_v1.jsonl      (downloads BABILong / CogniLoad / CoRe once)
+  python -m llm_transfer.build --ladder --out llm_transfer/data/suite_ladder.jsonl   (the bridge's 200 puzzles as
+      board: the training prompt, and bridge_xy: numbered lanes / tiers, directions spelled out; with the named-lane
+      bridge: a ladder of surfaces, same puzzles, same scorer)
   python -m llm_transfer.build --hard --out llm_transfer/data/suite_v2_hard.jsonl   (harder dials: boxes, pointer, path,
                                                                                      ruler_vt; base saturated them in v1)
 """
@@ -30,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import string
 import sys
 import urllib.request
@@ -95,7 +99,49 @@ def bridge_prompt(it: dict) -> str:
         f"exactly in one of these forms:\nANSWER: LEAPS <place> <place> ...\nANSWER: NONE")
 
 
-def build_bridge(per_bucket: int):
+def place_xy(i: int, s: State) -> str:
+    r, c = divmod(i, s.cols); return f"{c + 1}-{tier_of(r, s.rows)}"
+
+
+def parse_place_xy(t: str, s: State) -> int | None:
+    m = re.fullmatch(r"\(?(\d{1,2})\s*[-,]\s*(\d{1,2})\)?", t.strip().strip(",.;"))
+    if not m: return None
+    c, tier = int(m.group(1)) - 1, int(m.group(2)); r = s.rows - tier
+    return r * s.cols + c if 0 <= c < s.cols and 0 <= r < s.rows else None
+
+
+def bridge_xy_prompt(it: dict) -> str:
+    """The bridge with numbered coordinates and every direction spelled out: no grid, no name lookup (the named-lane
+    bridge makes the model recover adjacency from an arbitrary list of 15 words at every step)."""
+    s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
+    R, C = s.rows, s.cols; me = s.player
+    home = (R, R - 1) if me == 1 else (2, 1)
+    away = (2, 1) if me == 1 else (R, R - 1)
+    stones = [place_xy(i, s) for i, v in enumerate(s.board) if v == MAN and i != s.ball]
+    leaps = jump_landings(s.board, s.ball, s.rows, s.cols)
+    first = "; ".join(f"{place_xy(l, s)} (over {', '.join(place_xy(j, s) for j in jd)})" for l, jd in leaps) or "none"
+    return (
+        f"A field has {C} lanes numbered 1 (west) to {C} (east) and {R} tiers numbered 1 (south) to {R} (north). A place is "
+        f"written lane-tier: 3-7 is lane 3, tier 7. Some places hold a stone; one place holds the token.\n"
+        f"Directions: one step in a direction changes the lane by -1, 0 or +1 and the tier by -1, 0 or +1: north = tier +1; "
+        f"south = tier -1; east = lane +1; west = lane -1; north-east = lane +1 and tier +1; north-west = lane -1 and tier "
+        f"+1; south-east = lane +1 and tier -1; south-west = lane -1 and tier -1.\n"
+        f"Rules of a turn: the mover may LEAP the token in one of the 8 directions over one or more stones that lie on "
+        f"consecutive places in that direction (the first stone one step from the token, each further stone one more "
+        f"step), landing on the first place in that direction that holds no stone: a leap over k stones moves the token "
+        f"k + 1 steps. The landing place must be on the field (lanes 1-{C}, tiers 1-{R}). Every stone leapt over is "
+        f"removed. From the landing place the mover may leap again, in any direction, or stop. The mover wins the moment "
+        f"the token lands in its home tiers ({home[0]} and {home[1]}); landing in the opposing home tiers ({away[0]} and "
+        f"{away[1]}) loses at once.\n\nPosition: the token is at {place_xy(s.ball, s)}. Stones ({len(stones)}): "
+        f"{', '.join(stones)}.\nLeaps available from the token's place now: {first}.\n\n"
+        f"Question: can the mover win THIS turn by leaping? If yes, give one complete winning sequence of leaps as its "
+        f"landing places, in order. If no sequence of leaps wins this turn, say so.\nEnd your reply with one line, "
+        f"exactly in one of these forms:\nANSWER: LEAPS <place> <place> ...\nANSWER: NONE")
+
+
+def build_bridge(per_bucket: int, fmt: str = "named"):
+    """The same validation win puzzles in three surfaces: named (lanes named by words: the v1 bridge), xy (numbered
+    lanes and tiers, directions spelled out) and board (the training prompt: ASCII board + men list, phutball words)."""
     rows = [json.loads(l) for l in open(ROOT / "llm_train/puzzles/val_v3.jsonl")]
     out, n = [], Counter()
     for it in rows:
@@ -103,8 +149,14 @@ def build_bridge(per_bucket: int):
         b = it["meta"]["bucket"]
         if n[b] >= per_bucket: continue
         n[b] += 1
-        out.append({"id": f"bridge-{it['id']}", "family": "bridge", "dial": {"bucket": b, "J": it["meta"].get("J", 0)},
-                    "kind": "bridge", "prompt": bridge_prompt(it), "item": it, "absent": not it["answers"]["win"],
+        fam = {"named": "bridge", "xy": "bridge_xy", "board": "board"}[fmt]
+        if fmt == "board":
+            from llm_bench.text import prompt as board_prompt
+            text = board_prompt("win", State(it["rows"], it["cols"], it["board"], it["ball"], it["player"]), "ascii+men")
+        else:
+            text = bridge_prompt(it) if fmt == "named" else bridge_xy_prompt(it)
+        out.append({"id": f"{fam}-{it['id']}", "family": fam, "dial": {"bucket": b, "J": it["meta"].get("J", 0)},
+                    "kind": "bridge", "fmt": fmt, "prompt": text, "item": it, "absent": not it["answers"]["win"],
                     "source_id": it["id"]})
     return out
 
@@ -300,8 +352,10 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--out", type=Path, default=ROOT / "llm_transfer/data/suite_v1.jsonl")
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--small", action="store_true", help="a few per cell (tests)")
     ap.add_argument("--hard", action="store_true", help="the hard suite (v2 dials) for the families v1 saturated")
+    ap.add_argument("--ladder", action="store_true", help="the bridge's puzzles on the board and in numbered coordinates")
     a = ap.parse_args(); rng = random.Random(a.seed); s = a.small
     if a.hard: return write(a.out, build_hard(random.Random(1000 + a.seed), s))
+    if a.ladder: return write(a.out, build_bridge(3 if s else 25, "board") + build_bridge(3 if s else 25, "xy"))
     items = (build_bridge(3 if s else 25) + build_pointer(rng, per=4 if s else 30) + build_path(rng, per=4 if s else 30) +
              build_boxes(rng, per=4 if s else 30) + build_ruler_vt(rng, per=2 if s else 20) +
              build_babilong(rng, per=3 if s else 25) + build_cogniload(rng, per=3 if s else 40) +

@@ -27,8 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from expert.engine import State  # noqa: E402
 from llm_bench.run import FORCE, call  # noqa: E402
-from llm_bench.text import check_win_sequence, sq  # noqa: E402
-from llm_transfer.build import parse_place  # noqa: E402
+from llm_bench.text import check_win_sequence, parse_sq, sq  # noqa: E402
+from llm_transfer.build import parse_place, parse_place_xy  # noqa: E402
 
 ANS = re.compile(r"ANSWER:\s*(.*)", re.I)
 
@@ -62,8 +62,13 @@ def score(it: dict, body: str | None) -> tuple[bool, str]:
         return (True, "correct") if it["absent"] else (False, "false_absent")
     if k == "bridge":
         it2 = it["item"]; s = State(it2["rows"], it2["cols"], it2["board"], it2["ball"], it2["player"])
-        toks = split_list(re.sub(r"^leaps?\b", "", low))
-        idx = [parse_place(t, s) for t in toks]
+        fmt = it.get("fmt", "named")
+        if fmt == "board":                                    # the training format: ANSWER: JUMP h8 h6 ...
+            toks = re.findall(r"\b[a-z]\d{1,2}\b", re.sub(r"^jumps?\b", "", low))
+            idx = [parse_sq(t, s.rows, s.cols) for t in toks]
+        else:
+            toks = split_list(re.sub(r"^leaps?\b", "", low))
+            idx = [(parse_place_xy if fmt == "xy" else parse_place)(t, s) for t in toks]
         if not toks or any(i is None for i in idx): return False, "unparsed"
         ok, _ = check_win_sequence(s, [sq(i, s.cols) for i in idx])
         if ok: return True, "correct"
