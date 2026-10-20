@@ -349,6 +349,74 @@ def gate(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, 
         errs.append(f"{name} (forced) {tot_b}->{tot_n}")     # reported only: forced answers include the finished ones
     return True, head + "; " + ", ".join(errs)                # (a real collapse shows in the forced-accuracy guards)
 
+def util(r: dict) -> float:
+    """The reward's costs for a FINISHED answer: +1 correct, -COST_FALSE_NOWIN for NO WIN on a real win,
+    -COST_FALSE_CLAIM for any other wrong committed answer, 0 when there is no answer (cut off / not yet)."""
+    if r["correct"]: return 1.0
+    if r["outcome"] == "unparsed": return 0.0
+    return -COST_FALSE_NOWIN if false_nowin(r) else -COST_FALSE_CLAIM
+
+
+def load_curve(prefix: str, cuts: list[int]) -> dict:
+    """budget -> load_rows: <prefix>-at<B>.jsonl for the budgets below the eval cap (llm_bench --salvage --truncate-at
+    B), <prefix>.jsonl for the largest (the eval cap itself)."""
+    cuts = sorted(cuts)
+    return {B: load_rows(prefix if B == cuts[-1] else f"{prefix}-at{B}") for B in cuts}
+
+
+def curve_score(C: dict, ids) -> dict:
+    """item -> mean over budgets of util(answer finished within B): log-spaced budgets weigh each doubling equally, so
+    the same answer at half the tokens counts the same at every scale; wrong early answers still cost."""
+    return {i: sum(util(C[B][i]) for B in C) / len(C) for i in ids}
+
+
+def gate_curve(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, str]:
+    """Curve gate (v4): best / new / peak are load_curve() of the same validation items, one rollout per item at the
+    eval cap scored at every budget. Promote unless, paired over items against the best and against the peak,
+      1. the curve score (mean over budgets of the finished answer's utility) is clearly worse (z < -GATE_Z), or
+      2. the PEAK, forced accuracy at the largest budget, is clearly worse (z < -GATE_Z): faster but with a lower
+         ceiling is not an improvement, or
+      3. forced accuracy at the largest budget collapses on one family (z < -FORCED_Z).
+    The 6k gate (gate()) rewarded finishing within one budget and nothing else: a model that solved hard puzzles at 10k
+    scored the same as one that never solved them, and a 6k gate rejects a model that learned to spend 12k where it
+    pays. Every item counts at every budget, whichever ones a model finishes (the v3.3 / v3.4 confound)."""
+    if best is None: return True, "no previous model"
+    top = max(new); cuts = sorted(new)
+    ids = [i for i in new[top] if all(i in best[B] for B in cuts) and family(new[top][i])]
+    acc = lambda C, B: sum(C[B][i]["correct"] for i in ids) / len(ids)
+    curve = " ".join(f"{B // 1024}k {acc(best, B):.2f}->{acc(new, B):.2f}" for B in cuts)
+    head = f"finished by budget: {curve}"
+    sn = curve_score(new, ids); out = []
+    for ref, tag in ((best, "best"), (peak, "peak")):
+        if ref is None or (tag == "peak" and ref is best): continue
+        sub = [i for i in ids if all(i in ref[B] for B in cuts)]
+        sr = curve_score(ref, sub)
+        d = [sn[i] - sr[i] for i in sub]; mu = sum(d) / len(d)
+        sd = math.sqrt(sum((x - mu) ** 2 for x in d) / max(len(d) - 1, 1)) or 1e-9; z = mu / (sd / math.sqrt(len(d)))
+        a, b = sum(sr.values()) / len(sub), sum(sn[i] for i in sub) / len(sub)
+        out.append(f"curve score vs {tag} {a:+.3f} -> {b:+.3f} (z {z:+.2f})")
+        if z < -GATE_Z: return False, f"curve score clearly worse than the {tag} ({a:+.3f} -> {b:+.3f}, z {z:+.2f}); {head}"
+        pb, pc, pz = paired_z(ref[top], new[top], sub, lambda r: r.get("forced_correct", r["correct"]))
+        fa = lambda R: sum(R[top][i].get("forced_correct", R[top][i]["correct"]) for i in sub) / len(sub)
+        out.append(f"peak (forced at {top // 1024}k) vs {tag} {fa(ref):.3f} -> {fa(new):.3f} (+{pb}/-{pc}, z {pz:+.2f})")
+        if pz < -GATE_Z: return False, f"peak clearly lower than the {tag}'s (forced at {top // 1024}k {fa(ref):.3f} -> " \
+                                       f"{fa(new):.3f}, z {pz:+.2f}); {head}"
+    for fam in ("wins", "no-win", "placements"):
+        fi = [i for i in ids if family(new[top][i]) == fam]
+        fb, fc, fz = paired_z(best[top], new[top], fi, lambda r: r.get("forced_correct", r["correct"]))
+        if fz < -FORCED_Z: return False, f"forced accuracy at {top // 1024}k on {fam} collapsed (+{fb}/-{fc}, z {fz:+.2f}); {head}"
+    pos = [i for i in ids if family(new[top][i]) == "wins"]
+    for B in (cuts[0], cuts[-1]):
+        kb, kn = sum(false_nowin(best[B][i]) for i in pos), sum(false_nowin(new[B][i]) for i in pos)
+        out.append(f"false NO WIN finished by {B // 1024}k {kb}->{kn}")       # reported only
+    return True, head + "; " + ", ".join(out)
+
+
+def curve_mean(C: dict) -> float:
+    top = max(C); ids = [i for i in C[top] if family(C[top][i]) and all(i in C[B] for B in C)]
+    s = curve_score(C, ids); return sum(s.values()) / len(s)
+
+
 def main():
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
     a0 = sub.add_parser("screen"); a0.add_argument("--state", required=True); a0.add_argument("--pool", required=True)
@@ -369,6 +437,8 @@ def main():
     a3 = sub.add_parser("gate"); a3.add_argument("--state", required=True); a3.add_argument("--round", type=int, required=True)
     a3.add_argument("--new", required=True); a3.add_argument("--adapter", required=True)
     a3.add_argument("--init-best", default=None); a3.add_argument("--init-adapter", default=None)
+    a3.add_argument("--curve", default=None, help="budgets, e.g. 2048,4096,8192,16384: the curve gate (gate_curve) on "
+                    "<new>-at<B> files (llm_bench --salvage --truncate-at B) and <new> itself at the largest budget")
     a5 = sub.add_parser("regate", help="replay every round's gate under the current rule and set the best")
     a5.add_argument("--state", required=True); a5.add_argument("--eval-dir", required=True)
     a5.add_argument("--out-dir", required=True, help="the run folder (round adapters at <out-dir>/rR/adapter/final)")
@@ -391,6 +461,19 @@ def main():
     elif a.cmd == "gate":
         if st.d["best"] is None and a.init_best:
             st.d["best"], st.d["best_eval"] = a.init_adapter, a.init_best
+        if a.curve:                                                     # v4: the curve gate
+            cuts = [int(c) for c in a.curve.split(",")]
+            best_c = load_curve(st.d["best_eval"], cuts) if st.d["best_eval"] else None
+            peak_eval = st.d.get("peak_eval") or st.d["best_eval"]
+            peak_c = (best_c if peak_eval == st.d["best_eval"] else load_curve(peak_eval, cuts)) if peak_eval else None
+            new_c = load_curve(a.new, cuts); ok, why = gate_curve(best_c, new_c, peak_c)
+            if ok:
+                st.d["best"], st.d["best_eval"] = a.adapter, a.new
+                if peak_c is None or curve_mean(new_c) > curve_mean(peak_c): st.d["peak_eval"] = a.new
+            st.d["log"].append({"round": a.round, "event": "gate", "rule": "curve", "promoted": ok, "reason": why,
+                                "best": st.d["best"], "peak_eval": st.d.get("peak_eval")})
+            st.save(); print(("PROMOTED: " if ok else "kept previous best: ") + why); print("best:", st.d["best"])
+            return
         best_rows = load_rows(st.d["best_eval"]) if st.d["best_eval"] else None
         peak_eval = st.d.get("peak_eval") or st.d["best_eval"]
         peak_rows = (best_rows if peak_eval == st.d["best_eval"] else load_rows(peak_eval)) if peak_eval else None

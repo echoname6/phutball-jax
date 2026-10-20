@@ -220,3 +220,25 @@ puzzles get finished (p10 newly finishes hard puzzles, which carry more errors),
 gates errors through utility, the reward's own costs per item (+1 correct, -1 false claim / wrong move, -1.5 false NO WIN,
 0 cut off), paired against the best and the peak (z < -1.5 rejects); finished accuracy (vs best and peak) and the
 per-family forced-accuracy collapse guards stay; error counts are reported, not gated. llm_train/test_gate: 8/8.
+
+**Gated GRPO p11-p14.** p11 0.718 (a tie; false win claims 48 -> 27 finished), p12 **0.773** (z +3.65 over the best,
++3.33 over the peak; 4-jump backward traps finished 38% -> 51%), p13 0.765 (a tie; false claims 38 -> 21), p14 **0.794**
+(z +2.04; near-miss negatives finished 68% -> 81%, but forced false NO WIN on real wins 48 -> 65 and 4-jump backward
+traps forced 69% -> 62%). p13's draw was 29% no-win puzzles (9.4% of validation): targeting shifted the base rate the
+policy learned, and p14 gave up sooner on the hardest wins.
+
+**Transfer budget sweep (llm_transfer.sweep).** At the 6k cap every model was cut off on 92-100% of the transfer bridge's
+3-4 jump backward traps. One 24k rollout per item, scored at 2k-24k (bridge, forced): base 28/47/63/70/86/87/87, r14
+24/51/65/68/74/76/76, p11 31/55/74/84/88/90/90, p12 34/64/76/82/88/88/88. GRPO's transfer on the bridge is efficiency
+and commitment (finished at 8k: base 0%, p12 54%), not a higher ceiling than the untrained model; expert iteration
+lowered the long-budget ceiling (87 -> 76) and GRPO repaired it.
+
+**Run 2 recipe (grpo_gated_v2_colab.ipynb).** (1) Curve gate (gate v4, `curriculum_pp gate --curve`): one validation
+rollout per item at 16k scored at 2k / 4k / 8k / 16k; promote unless the curve score (mean over budgets of the finished
+answer's utility), the peak (forced accuracy at 16k) or one family's forced accuracy at 16k is clearly worse, paired
+against the best and the peak. A 6k gate rewards finishing within one budget only. (2) `grpo_targets --headroom 0.5`:
+bucket weight = gap + 0.5 x 4q(1-q) (the gap alone starved prevent, 27% / 30%). (3) `grpo_pilot --prior-correct`:
+rewards weighted by validation share / draw share of the bucket (Dr. GRPO without reward scaling: the advantage scales by
+the weight), so targeting picks where the steps go without changing the base rates. test_gate: 16/16 (8 curve cases:
+faster at the same peak promotes; slower, a lower ceiling, a hidden ceiling loss among cut-off items, or faster by
+committing to wrong answers rejects).

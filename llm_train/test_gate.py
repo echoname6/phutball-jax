@@ -6,9 +6,10 @@ finished errors, and both counts move with the finishing rate alone (gated GRPO 
 """
 from __future__ import annotations
 
+import math
 import random
 
-from llm_train.curriculum_pp import gate
+from llm_train.curriculum_pp import gate, gate_curve
 
 
 def rows(seed, cut, fnw, bad_chain=0.01, neg_claim=0.03, n_win=700, n_neg=100, forced_ok=0.75):
@@ -50,13 +51,61 @@ CASES = [   # (description, best kwargs, new kwargs, should promote)
 ]
 
 
+CUTS = (2048, 4096, 8192, 16384)
+
+
+def curve(seed, speed=1.0, p_ok=0.88, peak=None, nowin_err=0.3, n_win=700, n_neg=100):
+    """load_curve()-shaped rows: each item finishes at a lognormal token count (median 5k / speed; ~25% never within
+    16k at speed 1). One latent u per item: its finished answer is right if u < p_ok (errors: false NO WIN with share
+    nowin_err of the wrong win answers, else a broken chain); if it never finishes, forced at 16k it is right if
+    u < peak (default p_ok: the same answers whether finished or forced), and forced at a smaller budget right with a
+    share that grows with the budget."""
+    peak = p_ok if peak is None else peak
+    rng = random.Random(seed); C = {B: {} for B in CUTS}
+    for i in range(n_win + n_neg):
+        win = i < n_win; t = 5000 / speed * math.exp(rng.gauss(0, 0.9))
+        u = rng.random(); ok = u < p_ok; err = "missed win (said NO WIN)" if (win and rng.random() < nowin_err) else \
+            ("the sequence ends without reaching the goal" if win else "claimed a win: the sequence ends without reaching the goal")
+        u_force = u
+        for B in CUTS:
+            r = {"id": i, "task": "win", "answers": {"win": win}}
+            if t <= B:
+                r.update(correct=ok, outcome=("found a win" if win else "correct NO WIN") if ok else err)
+                r.update(forced_correct=r["correct"], forced_outcome=r["outcome"])
+            else:
+                fq = peak * (0.55 + 0.45 * math.log2(B / 2048) / 3)               # forced accuracy grows with budget
+                r.update(correct=False, outcome="unparsed", forced_correct=u_force < fq,
+                         forced_outcome="found a win" if u_force < fq else "missed win (said NO WIN)")
+            C[B][i] = r
+    return C
+
+
+CURVE_CASES = [   # (description, best kwargs, new kwargs, should promote)
+    ("curve: same model, new seed", dict(), dict(), True),
+    ("curve: same answers, ~2x faster (same peak)", dict(), dict(speed=2.0), True),
+    ("curve: same answers, 2x slower", dict(), dict(speed=0.5), False),
+    ("curve: faster but a lower ceiling (right answers 0.88 -> 0.76)", dict(), dict(speed=1.6, p_ok=0.76), False),
+    ("curve: same speed, higher ceiling (right answers 0.88 -> 0.94)", dict(), dict(p_ok=0.94), True),
+    ("curve: faster; the ~15% still cut off at 16k forced worse (0.88 -> 0.70): ceiling -2 points, within noise",
+     dict(), dict(speed=1.3, peak=0.70), True),
+    ("curve: same speed, the ~25% cut off at 16k forced much worse (0.88 -> 0.25): a hidden ceiling loss", dict(),
+     dict(peak=0.25), False),
+    ("curve: faster by committing to wrong answers (accuracy 0.85 -> 0.65)", dict(), dict(speed=2.0, p_ok=0.65), False),
+]
+
+
 def main():
     fails = 0
     for k, (desc, b, n, want) in enumerate(CASES):
         ok, why = gate(rows(100 + k, **b), rows(200 + k, **n))
         tag = "ok  " if ok == want else "FAIL"; fails += ok != want
         print(f"{tag} {'promote' if want else 'reject ':7s} | {desc}\n       {why[:200]}")
-    print(f"{len(CASES) - fails}/{len(CASES)} cases as expected"); raise SystemExit(1 if fails else 0)
+    for k, (desc, b, n, want) in enumerate(CURVE_CASES):
+        ok, why = gate_curve(curve(300 + k, **b), curve(400 + k, **n))
+        tag = "ok  " if ok == want else "FAIL"; fails += ok != want
+        print(f"{tag} {'promote' if want else 'reject ':7s} | {desc}\n       {why[:300]}")
+    n = len(CASES) + len(CURVE_CASES)
+    print(f"{n - fails}/{n} cases as expected"); raise SystemExit(1 if fails else 0)
 
 
 if __name__ == "__main__":
