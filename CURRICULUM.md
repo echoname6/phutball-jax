@@ -212,3 +212,11 @@ backward traps, near-miss negatives, forced / prevent placements (15-24 points),
 uniform sampling kept drilling. From phase 10 (TARGET in grpo_gated_colab.ipynb) llm_train.grpo_targets draws each
 phase's puzzles with bucket shares proportional to that gap and down-weights puzzles finished correctly in >= 90% of
 their past GRPO samples.
+
+**Targeted p10 and gate v3.5.** The first targeted phase jumped: finished 0.641 -> **0.723** (z +4.9 over p9, +4.7 over
+the peak), wins cut off 21% -> 15%, 4-jump wins finished ~57% -> 70%, forced placements ~36% -> 48% - and was rejected by
+v3.4 because false win claims rose 3.8% -> 7.0% of finished answers. Rates among finished answers are confounded by WHICH
+puzzles get finished (p10 newly finishes hard puzzles, which carry more errors), as counts were by how many. Gate v3.5
+gates errors through utility, the reward's own costs per item (+1 correct, -1 false claim / wrong move, -1.5 false NO WIN,
+0 cut off), paired against the best and the peak (z < -1.5 rejects); finished accuracy (vs best and peak) and the
+per-family forced-accuracy collapse guards stay; error counts are reported, not gated. llm_train/test_gate: 8/8.

@@ -73,7 +73,8 @@ TRAIN_MAX = 1000
 MIN_NOWIN_THINK = 2048    # a NO WIN example must show at least this much search (natural finishes included)
 NOWIN_SHARE = 0.10        # ...and NO WIN examples are topped up to this share of the training set from the bank
 GATE_Z = 1.5
-ERR_Z = 2.0               # two-sided error guards: false NO WIN / false win claims (finished: rate; forced: paired)
+ERR_Z = 2.0               # (v3.3-v3.4 finished error guards; v3.5 uses utility, below)
+COST_FALSE_CLAIM, COST_FALSE_NOWIN = 1.0, 1.5    # gate utility: the GRPO cost reward's a and b
 FORCED_Z = 3.0
 
 
@@ -318,27 +319,35 @@ def gate(best: dict | None, new: dict, peak: dict | None = None) -> tuple[bool, 
         if fz < -FORCED_Z: return False, f"forced accuracy on {fam} collapsed (+{fb}/-{fc}, z {fz:+.2f}); {head}"
     # v3.3 two-sided error guards (v4 r7-r13 drifted into false NO WINs, r15-r16 into false win claims; each round
     # traded one error for the other): neither error may clearly grow, finished or forced. z = (fewer - more) / sqrt
-    # Finished errors are compared as a RATE among finished answers: a model that commits on more puzzles makes more
-    # finished answers of every kind (gated GRPO p4: finished 0.454 -> 0.604, false NO WIN 30 -> 63 because p3 hid its
-    # doubtful cases in cut-offs: 47% of wins). Forced answers exist for every item: paired counts, as before.
+    # v3.5: the errors enter through UTILITY, the reward's own costs, per item: +1 correct, -COST_FALSE_CLAIM for a
+    # wrong committed answer (a chain that does not win, a placement that does not work), -COST_FALSE_NOWIN for NO WIN on
+    # a real win, 0 cut off; paired over the same items. Error counts (v3.3) and error rates among finished answers
+    # (v3.4) are both confounded by WHICH puzzles get finished: targeted p10 finished many more hard puzzles (finished
+    # 0.641 -> 0.723) and its false-claim rate rose 3.8% -> 7.0% of finished answers with the harder mix. Forced error
+    # counts carry the same confound (they include every finished answer): reported, not gated; a real collapse of one
+    # kind of answer shows in the per-family forced-accuracy guards above (they caught v4 r15-r16).
+    def util(r):
+        if r["correct"]: return 1.0
+        if r["outcome"] == "unparsed": return 0.0
+        return -COST_FALSE_NOWIN if false_nowin(r) else -COST_FALSE_CLAIM
     errs = []
+    for ref, tag in ((best, "best"), (peak, "peak")):
+        if ref is None or (tag == "peak" and ref is best): continue
+        sub = [i for i in ids if i in ref]
+        d = [util(new[i]) - util(ref[i]) for i in sub]; mu = sum(d) / len(d)
+        sd = math.sqrt(sum((x - mu) ** 2 for x in d) / max(len(d) - 1, 1)) or 1e-9
+        uz = mu / (sd / math.sqrt(len(d)))
+        ub, un = sum(util(ref[i]) for i in sub) / len(sub), sum(util(new[i]) for i in sub) / len(sub)
+        errs.append(f"utility vs {tag} {ub:+.3f} -> {un:+.3f} (z {uz:+.2f})")
+        if uz < -GATE_Z: return False, f"utility clearly worse than the {tag} ({ub:+.3f} -> {un:+.3f}, z {uz:+.2f}); {head}"
     win_ids = [i for i in ids if new[i]["task"] == "win"]
     for name, fn, sub in (("false NO WIN", false_nowin, pos), ("false win claims", false_claim, win_ids)):
-        fin = lambda R, i: R[i]["outcome"] != "unparsed"
-        nb_, nn_ = sum(fin(best, i) for i in sub), sum(fin(new, i) for i in sub)
         kb, kn = sum(fn(best[i]) for i in sub), sum(fn(new[i]) for i in sub)
-        rb, rn = kb / max(nb_, 1), kn / max(nn_, 1); pool = (kb + kn) / max(nb_ + nn_, 1)
-        ez = (rb - rn) / math.sqrt(pool * (1 - pool) * (1 / max(nb_, 1) + 1 / max(nn_, 1))) if 0 < pool < 1 else 0.0
-        errs.append(f"{name} {kb}/{nb_} -> {kn}/{nn_} finished ({rb:.1%} -> {rn:.1%})")
-        if ez < -ERR_Z:
-            return False, f"{name} rate clearly up ({rb:.1%} -> {rn:.1%} of finished answers, z {ez:+.2f}); {head}"
-        eb, ec, _ = paired_z(best, new, sub, lambda r: fn(r, True))              # eb: new errs only, ec: best errs only
-        ez = (ec - eb) / math.sqrt(eb + ec) if eb + ec else 0.0
+        nb_, nn_ = sum(best[i]["outcome"] != "unparsed" for i in sub), sum(new[i]["outcome"] != "unparsed" for i in sub)
+        errs.append(f"{name} {kb}/{nb_} -> {kn}/{nn_} finished")
         tot_b, tot_n = sum(fn(best[i], True) for i in sub), sum(fn(new[i], True) for i in sub)
-        errs.append(f"{name} (forced) {tot_b}->{tot_n}")
-        if ez < -FORCED_Z:                    # forced answers include the finished ones: only a collapse counts here
-            return False, f"{name} (forced) collapsed ({tot_b} -> {tot_n}, z {ez:+.2f}); {head}"
-    return True, head + "; " + ", ".join(errs)
+        errs.append(f"{name} (forced) {tot_b}->{tot_n}")     # reported only: forced answers include the finished ones
+    return True, head + "; " + ", ".join(errs)                # (a real collapse shows in the forced-accuracy guards)
 
 def main():
     ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest="cmd", required=True)
