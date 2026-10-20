@@ -52,7 +52,7 @@ def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4, hint: 
         it = r["item"]; s = State(it["rows"], it["cols"], it["board"], it["ball"], it["player"])
         text = prompt(it["task"], s, fmt) + (BUDGET_HINT.format(n=hint) if hint else "")
         out.append({"prompt": [{"role": "user", "content": text}], "item": json.dumps(it),
-                    "task": it["task"], "subtask": r["subtask"]})
+                    "task": it["task"], "subtask": r["subtask"], "w_prior": float(r.get("w_prior", 1.0))})
     return out
 
 
@@ -126,6 +126,9 @@ def main():
     ap.add_argument("--lam-ramp", type=int, default=50, help="cost: reward calls over which lam ramps up from 0")
     ap.add_argument("--force-ok", type=float, default=0.5, help="cost: reward for a correct answer forced at the cap")
     ap.add_argument("--cut-cost", type=float, default=0.0, help="cost: extra penalty for any rollout cut off at the cap")
+    ap.add_argument("--prior-correct", action=argparse.BooleanOptionalAction, default=True,
+                    help="cost: multiply each rollout's reward by its puzzle's w_prior (grpo_targets: validation share / "
+                         "draw share of its bucket), so a targeted draw does not shift the policy's base rates")
     ap.add_argument("--prompt-format", default="ascii", choices=["ascii", "ascii+men"],
                     help="must match the adapter's training (the v4 curriculum used ascii+men)")
     ap.add_argument("--smoke", action="store_true")
@@ -172,7 +175,8 @@ def main():
 
     if a.reward == "cost":
         reward = PhutballCostReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), a=a.cost_a, b=a.cost_b,
-                                    c=a.cost_c, lam=a.lam, lam_ramp=a.lam_ramp, force_ok=a.force_ok, cut_cost=a.cut_cost)
+                                    c=a.cost_c, lam=a.lam, lam_ramp=a.lam_ramp, force_ok=a.force_ok, cut_cost=a.cut_cost,
+                                    prior_correct=a.prior_correct)
         a.force_credit = a.force_credit or 1.0                   # forcing must be on: cut-off rollouts are judged
     else:
         reward = PhutballReward(cap=a.cap, log_path=str(a.out / "rollouts.jsonl"), force_credit=a.force_credit,

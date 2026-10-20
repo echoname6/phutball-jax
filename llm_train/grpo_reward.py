@@ -176,10 +176,10 @@ class PhutballCostReward(PhutballReward):
     unsure, keep searching."""
 
     def __init__(self, cap, log_path=None, a=1.0, b=1.5, c=0.25, lam=3e-5, lam_ramp=50, force_ok=0.5, budgets=(1.0,),
-                 cut_cost=0.0):
+                 cut_cost=0.0, prior_correct=False):
         super().__init__(cap, log_path=log_path, eff=0.0, trunc=0.0, force_credit=1.0, budgets=budgets)
         self.a, self.b, self.c, self.lam, self.lam_ramp, self.force_ok = a, b, c, lam, lam_ramp, force_ok
-        self.cut_cost = cut_cost
+        self.cut_cost = cut_cost; self.prior_correct = prior_correct
 
     def force(self, prompts, texts):
         raws = [self.template(p) + t + FORCE_TAIL_NF for p, t in zip(prompts, texts)]
@@ -235,4 +235,6 @@ class PhutballCostReward(PhutballReward):
             with open(self.log_path, "a") as f:
                 for r, t in zip(rows, texts):
                     f.write(json.dumps({"call": self.calls, "time": time.time(), **r, "text": t}) + "\n")
+        w = kw.get("w_prior") if self.prior_correct else None   # importance weight: the advantage scales by it
+        if w is not None: return [r["reward"] * float(x) for r, x in zip(rows, w)]
         return [r["reward"] for r in rows]
