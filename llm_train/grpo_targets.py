@@ -39,9 +39,29 @@ KEY_TO_BUCKET = {"win: positive, 1-jump": "win1", "win: positive, 2-jump": "win2
 FLOOR = 0.03
 
 
-def bucket_weights(prefix: str, headroom: float = 0.0) -> tuple[dict, dict]:
-    """(bucket weight, bucket share of the validation set)."""
-    fin = json.load(open(f"{prefix}.summary.json")); frc = json.load(open(f"{prefix}-forced.summary.json"))
+def summary_key(r: dict) -> str:
+    """llm_bench.run.summarize's group key of a result row."""
+    if r["task"] == "win":
+        kind = "backward-trap, " if r["meta"].get("family") == "back" else "positive, "
+        return f"win: {kind + str(r['meta']['difficulty']) + '-jump' if r['answers']['win'] else 'near-miss negative'}"
+    return f"{r['task']} placement"
+
+
+def summaries_at(prefix: str, budget: int) -> tuple[dict, dict]:
+    """(finished, forced) summaries at a budget, from <prefix>-at<budget>.jsonl (llm_bench --salvage --truncate-at):
+    the gap at the TRAINING cap when the validation run itself is longer (the curve gate evaluates at 16k)."""
+    g = defaultdict(list)
+    for l in open(f"{prefix}-at{budget}.jsonl"):
+        r = json.loads(l); g[summary_key(r)].append(r)
+    fin = {k: {"accuracy": sum(r["correct"] for r in v) / len(v), "n": len(v)} for k, v in g.items()}
+    frc = {k: {"accuracy": sum(r.get("forced_correct", r["correct"]) for r in v) / len(v), "n": len(v)} for k, v in g.items()}
+    return fin, frc
+
+
+def bucket_weights(prefix: str, headroom: float = 0.0, at: int = 0) -> tuple[dict, dict]:
+    """(bucket weight, bucket share of the validation set); at: measure at that budget (default: the run's own cap)."""
+    if at: fin, frc = summaries_at(prefix, at)
+    else: fin = json.load(open(f"{prefix}.summary.json")); frc = json.load(open(f"{prefix}-forced.summary.json"))
     keys = [(k, b) for k, b in KEY_TO_BUCKET.items() if k in fin and k in frc]
     w = {}
     for k, b in keys:
@@ -66,9 +86,11 @@ def main():
     ap.add_argument("--rollouts", default=""); ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--out", required=True)
     ap.add_argument("--headroom", type=float, default=0.5, help="weight of 4 q (1 - q) on top of the gap (0: gap only)")
+    ap.add_argument("--at", type=int, default=0, help="measure the gap at this budget (<best-eval>-at<B>.jsonl): the "
+                    "training cap, when validation runs longer (curve gate)")
     a = ap.parse_args(); rng = random.Random(a.seed)
     rows = [json.loads(l) for l in open(a.puzzles)]
-    bw, vshare = bucket_weights(a.best_eval, a.headroom); hist = history(a.rollouts) if a.rollouts else {}
+    bw, vshare = bucket_weights(a.best_eval, a.headroom, a.at); hist = history(a.rollouts) if a.rollouts else {}
     count = Counter(r.get("bucket") for r in rows); w = []
     for r in rows:                                                   # bucket share ~ its gap, whatever its size
         b = r.get("bucket"); p = hist.get(r["id"])
@@ -79,7 +101,7 @@ def main():
     wp = {b: min(4.0, max(0.25, vshare.get(b, 0) / (share[b] / a.n))) if share[b] and vshare.get(b) else 1.0 for b in share}
     with open(a.out, "w") as f:
         for r in pick: f.write(json.dumps({**r, "w_prior": round(wp[r.get("bucket")], 4)}) + "\n")
-    label = "forced - finished" + (f" + {a.headroom:g} x 4q(1-q)" if a.headroom else "")
+    label = "forced - finished" + (f" + {a.headroom:g} x 4q(1-q)" if a.headroom else "") + (f", at {a.at}" if a.at else "")
     print(f"bucket weight ({label}) | puzzles available | share of this phase's draw | validation share -> w_prior")
     for b in sorted(bw, key=lambda b: -bw[b]):
         print(f"  {b:8s} {bw[b]:5.2f} | {have[b]:4d} | {share[b] / a.n:5.1%} | {vshare.get(b, 0):5.1%} -> {wp.get(b, 1.0):4.2f}")
