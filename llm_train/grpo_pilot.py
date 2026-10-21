@@ -237,6 +237,8 @@ def main():
             body = getattr(gen, "model", None); head = gen.get_output_embeddings() if hasattr(gen, "get_output_embeddings") else None
             mode = {"m": "keep" if keep_ok else ("body" if body is not None and head is not None else None)}
 
+            FORCE_CHUNK = 1024
+
             def step(ids, past, pos):
                 """Last-position logits only. 'keep': forward(logits_to_keep=1); 'body': the decoder body's hidden states
                 and the output layer on the last position (never a full-length logits tensor, whatever forward does)."""
@@ -248,7 +250,8 @@ def main():
                                               f"switching to body + output layer", flush=True)
                     del out
                     if body is None or head is None: raise RuntimeError("no decoder body / output layer to fall back on")
-                    if past is not None: raise RuntimeError("logits_to_keep ignored mid-decode")
+                    if past is not None and pos[0] != 0: raise RuntimeError("logits_to_keep ignored mid-decode")
+                    past = None
                 out = body(**kw)
                 return head(out.last_hidden_state[:, -1]), out.past_key_values
 
@@ -256,8 +259,10 @@ def main():
                 """12 greedy tokens after ids (1 x L), last-position logits only, never generate(): on Colab, generate()
                 on this model computed full-vocabulary logits for every prompt position (~18 GB per 16k-token trace;
                 run 2 phase 1, through the PEFT wrapper and on get_base_model() alike)."""
-                L = ids.shape[1]; dev = ids.device
-                logits, past = step(ids, None, torch.arange(L, device=dev))
+                L = ids.shape[1]; dev = ids.device; past = None
+                for i in range(0, L, FORCE_CHUNK):                 # chunked prefill: bounded working memory (run 2: a
+                    j = min(L, i + FORCE_CHUNK)                    # one-pass 16k prefill needed 4.5 GB with ~2 GB free)
+                    logits, past = step(ids[:, i:j], past, torch.arange(i, j, device=dev))
                 toks = []
                 for k in range(12):
                     t = int(logits.argmax(-1))
@@ -271,7 +276,7 @@ def main():
                 """Forced answers from the current policy (LoRA on), one trace at a time."""
                 if mode["m"] is None: raise RuntimeError(f"{type(gen).__name__}: no logits_to_keep and no body / output layer")
                 outs, was_training = [], model.training
-                model.eval()
+                model.eval(); torch.cuda.empty_cache()
                 try:
                     with torch.no_grad():
                         for raw in raws:
