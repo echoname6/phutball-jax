@@ -228,29 +228,61 @@ def main():
         if a.force_engine == "hf" and tok is not None:
             model = trainer.model
 
+            import inspect
+            gen = model.get_base_model() if hasattr(model, "get_base_model") else model
+            keep_ok = "logits_to_keep" in inspect.signature(type(gen).forward).parameters
+            eos = {t for t in (tok.eos_token_id, tok.convert_tokens_to_ids("<|im_end|>")) if isinstance(t, int)}
+            nl = set(tok.encode("\n", add_special_tokens=False))
+
+            body = getattr(gen, "model", None); head = gen.get_output_embeddings() if hasattr(gen, "get_output_embeddings") else None
+            mode = {"m": "keep" if keep_ok else ("body" if body is not None and head is not None else None)}
+
+            def step(ids, past, pos):
+                """Last-position logits only. 'keep': forward(logits_to_keep=1); 'body': the decoder body's hidden states
+                and the output layer on the last position (never a full-length logits tensor, whatever forward does)."""
+                kw = dict(input_ids=ids, past_key_values=past, use_cache=True, cache_position=pos)
+                if mode["m"] == "keep":
+                    out = gen(**kw, logits_to_keep=1)
+                    if out.logits.shape[1] == 1: return out.logits[:, -1], out.past_key_values
+                    mode["m"] = "body"; print(f"forcing: logits_to_keep ignored (logits {tuple(out.logits.shape)}); "
+                                              f"switching to body + output layer", flush=True)
+                    del out
+                    if body is None or head is None: raise RuntimeError("no decoder body / output layer to fall back on")
+                    if past is not None: raise RuntimeError("logits_to_keep ignored mid-decode")
+                out = body(**kw)
+                return head(out.last_hidden_state[:, -1]), out.past_key_values
+
+            def greedy_last(ids):
+                """12 greedy tokens after ids (1 x L), last-position logits only, never generate(): on Colab, generate()
+                on this model computed full-vocabulary logits for every prompt position (~18 GB per 16k-token trace;
+                run 2 phase 1, through the PEFT wrapper and on get_base_model() alike)."""
+                L = ids.shape[1]; dev = ids.device
+                logits, past = step(ids, None, torch.arange(L, device=dev))
+                toks = []
+                for k in range(12):
+                    t = int(logits.argmax(-1))
+                    if t in eos: break
+                    toks.append(t)
+                    if t in nl and len(toks) > 1: break
+                    logits, past = step(torch.tensor([[t]], device=dev), past, torch.tensor([L + k], device=dev))
+                return tok.decode(toks, skip_special_tokens=True)
+
             def hf_force(raws):
-                """Greedy 12-token completions from the current policy (LoRA on), left-padded small batches."""
-                outs, was_training, side = [], model.training, tok.padding_side
-                model.eval(); tok.padding_side = "left"
-                pad = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+                """Forced answers from the current policy (LoRA on), one trace at a time."""
+                if mode["m"] is None: raise RuntimeError(f"{type(gen).__name__}: no logits_to_keep and no body / output layer")
+                outs, was_training = [], model.training
+                model.eval()
                 try:
-                    # generate on the underlying transformers model (the LoRA layers stay active): its forward declares
-                    # logits_to_keep, so the prefill computes the last position's logits only. Through the PEFT wrapper
-                    # (forward(*args, **kwargs)) generate computed full-vocabulary logits for every prompt position:
-                    # ~16 GB per 16k-token sequence (run 2 phase 1: "Tried to allocate 35.73 GiB").
-                    gen = model.get_base_model() if hasattr(model, "get_base_model") else model
-                    fb = 1 if a.cap > 8192 else a.force_batch
                     with torch.no_grad():
-                        for i in range(0, len(raws), fb):
-                            enc = tok(raws[i:i + fb], return_tensors="pt", padding=True,
-                                      add_special_tokens=False).to(model.device)
-                            g = gen.generate(**enc, max_new_tokens=12, do_sample=False, use_cache=True, pad_token_id=pad)
-                            outs += tok.batch_decode(g[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                        for raw in raws:
+                            ids = tok(raw, return_tensors="pt", add_special_tokens=False)["input_ids"].to(model.device)
+                            outs.append(greedy_last(ids))
                 finally:
-                    tok.padding_side = side
                     if was_training: model.train()
                     torch.cuda.empty_cache()
                 return outs
+            print(f"budget forcing: {type(gen).__name__}, logits_to_keep in forward: {keep_ok}, "
+                  f"mode {mode['m']} (body {type(body).__name__ if body is not None else None})", flush=True)
             reward.forcer = hf_force
             reward.decode = lambda ids: tok.decode(ids, skip_special_tokens=False)
             reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,

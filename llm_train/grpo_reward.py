@@ -226,7 +226,11 @@ class PhutballCostReward(PhutballReward):
                     it = json.loads(item[i]) if isinstance(item[i], str) else item[i]
                     forced[i] = (ans, *self.judge(it, ans))
             except Exception as e:                                   # noqa: BLE001  (never kill a training step)
+                self.force_failures = getattr(self, "force_failures", 0) + 1
                 print("budget forcing failed:", repr(e)[:300], flush=True)
+                if self.force_failures >= 3:                          # stop paying for a failing forcer every step
+                    print("budget forcing OFF for the rest of this run (3 failures): cut-off rollouts score as "
+                          "NOT FOUND", flush=True); self.forcer = None
         for r in rows:
             if r["trunc"]:
                 ans, cat, ok = forced.get(r["i"], ("", "unparsed", False))
