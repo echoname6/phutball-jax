@@ -108,7 +108,13 @@ def main():
     ap.add_argument("--force-batch", type=int, default=2, help="forced answers per generate call (1 above an 8k cap)")
     ap.add_argument("--temperature", type=float, default=1.0, help="rollout sampling temperature (run 1: 1.0)")
     ap.add_argument("--top-p", type=float, default=1.0); ap.add_argument("--top-k", type=int, default=0,
-                    help="0: off. Qwen's thinking recommendation (and the validation eval): 0.6 / 0.95 / 20")
+                    help="0: off. Keep top-p 1 / top-k off with vLLM importance sampling: vLLM reports logprobs renormalised "
+                         "over the kept tokens, the training model scores the full softmax, and the ratio collapses")
+    ap.add_argument("--is-mode", default=None, choices=["token_truncate", "token_mask", "sequence_truncate", "sequence_mask"],
+                    help="TRL vllm_importance_sampling_mode (default: TRL's; recent TRL: sequence_mask). Run 2: token_truncate. "
+                         "A sequence-level ratio is exp(sum over ~15k completion tokens of the log-prob gap): with top-k 20 / "
+                         "top-p 0.95 it was ~1e-18 and the LoRA did not train (run 2 phase 1: max |lora_B| 9e-18 after 5 "
+                         "steps); even with matched sampling, bf16 noise summed over 16k tokens masks or zeroes sequences")
     ap.add_argument("--force-budgets", default="1",
                     help="fractions of the cap at which a cut-off rollout is forced, e.g. 0.25,0.5,1 (anytime credit)")
     ap.add_argument("--stage", choices=sorted(STAGES), default=None, help="curriculum stage (sets the puzzle mix)")
@@ -165,6 +171,7 @@ def main():
         per_device_train_batch_size=a.micro, gradient_accumulation_steps=per_step // a.micro,
         num_generations=a.gens, max_prompt_length=1536, max_completion_length=a.cap,
         temperature=a.temperature, top_p=a.top_p, **({"top_k": a.top_k} if a.top_k else {}),
+        **({"vllm_importance_sampling_mode": a.is_mode} if a.is_mode else {}),
         beta=0.0, loss_type="dr_grpo", scale_rewards=False,
         mask_truncated_completions=False,                               # truncation is penalised, not hidden
         use_vllm=True, vllm_mode="colocate", vllm_gpu_memory_utilization=a.vllm_mem,
@@ -202,6 +209,10 @@ def main():
             el = time.time() - self.t0
             print(f"[step {state.global_step}] {el / 60:.1f} min elapsed, {el / max(state.global_step, 1) / 60:.1f} min/step",
                   flush=True)
+            mb = max((float(p.detach().abs().max()) for n, p in kw["model"].named_parameters() if "lora_B" in n), default=0.0)
+            print(f"  [lora] step {state.global_step}: max |lora_B| {mb:.2e}" +
+                  ("   <- NOT TRAINING (a healthy fresh LoRA reaches ~1e-4 within a few steps)"
+                   if state.global_step >= 3 and mb < 1e-6 and not a.init_adapter else ""), flush=True)
             with open(a.out / "steps.log", "a") as f:
                 f.write(json.dumps({"step": state.global_step, "elapsed_s": round(el), "reward": reward.history[-1:]}) + "\n")
             done = None
