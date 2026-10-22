@@ -56,6 +56,12 @@ def load_puzzles(path: Path, seed: int, mix: dict | None, max_j: int = 4, hint: 
     return out
 
 
+# Forced-answer length. A square is 2 tokens with a one-digit row (" h8") and 3 with a two-digit row (" h10"), so a
+# 4-jump chain is 10-14 tokens and longer chains ~17-19: at the earlier 12, most correct 4-jump answers were cut
+# mid-chain and scored as false claims (run 1 and run 2 phases 1-2: cut-off rollouts on the hardest puzzles penalised).
+FORCE_TOKENS = 32
+
+
 def build_config(GRPOConfig, want: dict):
     """Keep the options this TRL version knows; print the rest (TRL renames options between releases)."""
     fields = {f.name: f for f in dataclasses.fields(GRPOConfig)}
@@ -267,7 +273,7 @@ def main():
                 return head(out.last_hidden_state[:, -1]), out.past_key_values
 
             def greedy_last(ids):
-                """12 greedy tokens after ids (1 x L), last-position logits only, never generate(): on Colab, generate()
+                """FORCE_TOKENS greedy tokens after ids (1 x L), last-position logits only, never generate(): on Colab, generate()
                 on this model computed full-vocabulary logits for every prompt position (~18 GB per 16k-token trace;
                 run 2 phase 1, through the PEFT wrapper and on get_base_model() alike)."""
                 L = ids.shape[1]; dev = ids.device; past = None
@@ -275,7 +281,7 @@ def main():
                     j = min(L, i + FORCE_CHUNK)                    # one-pass 16k prefill needed 4.5 GB with ~2 GB free)
                     logits, past = step(ids[:, i:j], past, torch.arange(i, j, device=dev))
                 toks = []
-                for k in range(12):
+                for k in range(FORCE_TOKENS):
                     t = int(logits.argmax(-1))
                     if t in eos: break
                     toks.append(t)
@@ -308,7 +314,7 @@ def main():
             print("WARNING: no vLLM engine / tokenizer found: budget forcing OFF", flush=True); reward.force_credit = 0
         else:
             from vllm import SamplingParams
-            sp = SamplingParams(max_tokens=12, temperature=0.0)
+            sp = SamplingParams(max_tokens=FORCE_TOKENS, temperature=0.0)
             reward.forcer = lambda raws: [o.outputs[0].text for o in llm.generate(raws, sp, use_tqdm=False)]
             reward.decode = lambda ids: tok.decode(ids, skip_special_tokens=False)
             reward.template = lambda msgs: tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True,

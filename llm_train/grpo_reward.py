@@ -5,7 +5,8 @@
                                                                 (shorter than its correct siblings: up to +EFF)
   truncated (hit the token cap): -TRUNC + FORCE_CREDIT * 1[budget-forced answer verified]
          budget forcing: the cut-off thinking + "Time is up ... </think> ANSWER:" is completed by the same vLLM engine
-         (12 tokens, greedy), so a cut-off search that was heading to the right answer still beats one that was not.
+         (32 tokens, greedy; was 12, which cut long jump chains), so a cut-off search that was heading to the right
+         answer still beats one that was not.
          Order: finished correct (1) > cut off, forced correct (0.25) > finished wrong (0) > cut off, forced wrong (-0.5).
   --force-budgets 0.25,0.5,1 ("anytime" credit): the cut-off thinking is forced at several prefixes (fractions of the
          cap) and the credit is FORCE_CREDIT * (share of those prefixes whose forced answer verifies), so reaching the
