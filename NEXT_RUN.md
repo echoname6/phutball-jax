@@ -60,6 +60,40 @@ Three GRPO steps plus checks that would each have caught one of run 2's silent f
 - Train in the xy coordinate format as well (every model is most accurate there on the ladder).
 - Hints (first jump given, then removed) for puzzles never solved even when forced.
 
+## Interpretability: where the gains live, and when the answer becomes "known" (Qwen3.5-9B first, Beam later)
+
+Question: which circuitry did RL grow, and which did it repurpose? Assets: the change is a LoRA (low rank, switchable
+per layer), and puzzles give exact minimal pairs (move one man: a jump appears, a win disappears). Order:
+
+1. **LoRA anatomy + per-layer ablation** (cheap, causal): update norms per layer / module, top singular directions of
+   each delta; switch the LoRA off one layer at a time and measure what is lost: commitment (finished at 16k), search
+   speed (forced at 4k), ceiling (forced at 16k). Localises the gains before anything else.
+2. **J-lens readout of the answer squares across the thinking trace** (Gurnee et al., "Verbalizable Representations
+   Form a Global Workspace in Language Models", arXiv:2607.15495; readout analysis arXiv:2608.25347). The Jacobian lens
+   gives, per vocabulary token, the residual-stream direction that makes the model more likely to say that token later
+   (the "J-space", a global workspace that carries silent intermediate reasoning). Here: is the winning landing square
+   already "poised to be said" before the model writes it? Base vs run-2 checkpoints:
+   - in J-space earlier -> search efficiency as a mechanism;
+   - in J-space but the model keeps thinking -> the commitment gap;
+   - present after RL on puzzles where base never has it -> the ceiling gain, from inside.
+   Validation: the J-lens onset should track the behavioural forced-accuracy-by-budget curves.
+   Practical: squares are multi-token (" h", "1", "0"): read out the column-letter token or score whole squares;
+   restrict the Jacobian to the ~30-40 square tokens (and NO / WIN) to keep it affordable; compute with autograd on
+   the open weights. Qwen3.5 is a hybrid (linear + full attention): residual-stream methods are unaffected.
+   Note the paper's "counterfactual reflection training" (train what the model would say if interrupted) is
+   conceptually close to our forced answers.
+3. **Causal tests**: activation patching / interchange interventions (distributed alignment search) on the found
+   directions with minimal-pair puzzles ("a win exists" swapped in or out); steering with the answer / "found it"
+   direction to see whether the model commits earlier.
+4. **Crosscoders (model diffing base vs RL)** at the 2-3 layers that step 1 flags: features unique to the RL model
+   (grown) vs shared features whose weights / role changed (repurposed). Most expensive (tens of millions of tokens of
+   activations per layer from both models).
+
+**Beam (Reflection AI, 501B MoE, 23B active, open weights) only after this works on the 9B model**: the J-lens needs
+weights and gradients, so it cannot run through an inference API; it would need the weights hosted on a multi-GPU node
+(~1 TB in bf16, ~250 GB in 4-bit), and MoE routing adds a layer (which experts carry the answer). The API-only
+experiment for Beam remains the budget sweep (forced vs finished gap), which decides whether a Beam fine-tune is worth it.
+
 ## Writeup framing
 - The curve reward follows anytime-reasoning work (AnytimeReasoner, arXiv:2505.13438; S-GRPO, arXiv:2505.07686;
   Elastic Reasoning, arXiv:2505.05315); cite them. Ours: an exact expectation over a continuous unknown deadline from
